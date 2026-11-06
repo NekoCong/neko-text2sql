@@ -80,26 +80,28 @@ if ! systemctl restart docker; then
 fi
 
 # --- 4. Host firewall ---------------------------------------------------------------------------
-log "Allowing only SSH (22) and HTTP (80) through the host firewall"
+log "Allowing SSH (22), HTTP (80) and MinIO S3 (9000) through the host firewall"
 warn "If SSH is not on port 22 on this host, add that port BEFORE enabling the firewall,"
 warn "otherwise ufw's default-deny policy will lock you out."
 if command -v ufw >/dev/null 2>&1; then
     ufw allow 22/tcp >/dev/null 2>&1 || true
     ufw allow 80/tcp >/dev/null 2>&1 || true
+    # 9000 serves presigned original-document URLs opened by the browser. The bucket stays private.
+    ufw allow 9000/tcp >/dev/null 2>&1 || true
     ufw --force enable >/dev/null 2>&1 || true
 else
     warn "ufw is not installed; make sure the cloud security group is the only thing filtering traffic."
 fi
-warn "Also check the cloud security group: it must allow only 22 and 80."
-warn "MySQL and the observability ports are bound to 127.0.0.1 on purpose. Reach them with:"
-warn "  ssh -L 3000:127.0.0.1:3000 -L 3306:127.0.0.1:3306 -L 9090:127.0.0.1:9090 <user>@<host>"
+warn "Also check the cloud security group: it must allow 22, 80 and 9000 only."
+warn "MySQL, pgvector, the MinIO console and the observability ports are bound to 127.0.0.1 on purpose. Reach them with:"
+warn "  ssh -L 3000:127.0.0.1:3000 -L 3306:127.0.0.1:3306 -L 5433:127.0.0.1:5433 -L 9001:127.0.0.1:9001 -L 9090:127.0.0.1:9090 <user>@<host>"
 
 # --- 5. Configuration ---------------------------------------------------------------------------
 log "Checking $ENV_FILE"
 [[ -f "$ENV_FILE" ]] || fail "Missing $ENV_FILE. Copy deploy/.env.example to deploy/.env and fill it in."
 
 missing=()
-for key in MYSQL_ROOT_PASSWORD TEXT2SQL_JWT_SECRET; do
+for key in MYSQL_ROOT_PASSWORD TEXT2SQL_JWT_SECRET KNOWLEDGE_PGVECTOR_PASSWORD MINIO_ROOT_PASSWORD; do
     if ! grep -Eq "^${key}=.+" "$ENV_FILE"; then
         missing+=("$key")
     fi
