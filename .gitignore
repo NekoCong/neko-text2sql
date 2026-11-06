@@ -37,3 +37,4 @@ logs/
 # ── Agent / tooling state ───────────────────────────────────
 .omo/
 .codegraph/
+.opencode/

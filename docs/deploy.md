@@ -25,10 +25,17 @@
 
 | 服务 | 镜像 | 端口 | 对公网 |
 | --- | --- | --- | --- |
-| `frontend` | `nginx:alpine` | `80` | ✅ 唯一入口 |
+| `frontend` | `nginx:alpine` | `80` | ✅ 页面入口 |
 | `backend` | `eclipse-temurin:25-jre-alpine` | `8080`（仅容器网络） | ❌ |
 | `mysql` | `mysql:8.4` | `127.0.0.1:3306` | ❌ |
-| `otel-lgtm` | `grafana/otel-lgtm:latest` | `127.0.0.1:3000/4317/4318/9090` | ❌ |
+| `pgvector` | `pgvector/pgvector:pg16` | `127.0.0.1:5433` | ❌ |
+| `minio` | `minio/minio` | `9000`（S3 API）、`127.0.0.1:9001`（控制台） | ⚠️ 仅 9000 |
+| `otel-lgtm` | `grafana/otel-lgtm:0.22.0` | `127.0.0.1:3000/4317/4318/9090` | ❌ |
+
+> **为什么 MinIO 的 9000 要对公网开放**：原文预览用的是**预签名 URL**，签名覆盖 host，
+> 浏览器拿到的必须是可以直连的地址。桶本身私有，匿名列举/读取都会被拒绝，只有 10 分钟有效期的
+> 预签名 GET 能访问。控制台（9001）仍只绑 `127.0.0.1`。
+> 如果不想开放 9000，可把 `KNOWLEDGE_MINIO_PUBLIC_ENDPOINT` 指向一个已反代 MinIO 的域名/端口。
 
 前端镜像里**没有写死任何 IP**：`src/api/http.ts` 的 `baseURL` 是 `/api`，由 nginx 同源反代。
 所以实例换 IP、换域名都不需要重新构建。
@@ -61,6 +68,8 @@
 | JRE 运行 | `JRE_IMAGE` | `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/eclipse-temurin:25-jre-alpine` |
 | Node 构建 | `NODE_IMAGE` | `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/node:22-alpine` |
 | Nginx 运行 | `NGINX_IMAGE` | `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/library/nginx:alpine` |
+| 向量库 | `PGVECTOR_IMAGE` | `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/pgvector/pgvector:pg16` |
+| 对象存储 | `MINIO_IMAGE` | `swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io/minio/minio:RELEASE.2025-07-23T15-54-02Z` |
 
 ⚠️ 两个**实测得出**的坑，不要凭"规律"去猜：
 
@@ -91,8 +100,9 @@
 
 - `22/tcp`（SSH）
 - `80/tcp`（HTTP）
+- `9000/tcp`（MinIO S3 API，预签名原文预览需要；见 §1 的说明）
 
-**不要**放行 `3306`、`3000`、`4317`、`4318`、`9090`、`2375`、`2376`。
+**不要**放行 `3306`、`5433`、`3000`、`3001`、`4317`、`4318`、`9090`、`2375`、`2376`。
 
 需要 Grafana / 直连 MySQL 时用 SSH 隧道：
 
@@ -137,8 +147,12 @@ cd /root/text2sql-demo
 cp deploy/.env.example deploy/.env
 # 生成一个强 JWT 密钥：
 openssl rand -base64 48
-# 编辑 deploy/.env，至少填好 MYSQL_ROOT_PASSWORD 和 TEXT2SQL_JWT_SECRET
-# DASHSCOPE_API_KEY 可留空（留空则登录/会话管理可用，但 LLM 问答不可用）
+# 编辑 deploy/.env，至少填好：
+#   MYSQL_ROOT_PASSWORD / TEXT2SQL_JWT_SECRET
+#   KNOWLEDGE_PGVECTOR_PASSWORD / MINIO_ROOT_PASSWORD
+#   KNOWLEDGE_MINIO_PUBLIC_ENDPOINT=http://<服务器公网IP>:9000
+# DASHSCOPE_API_KEY 可留空（留空则登录/会话管理可用、知识库走词法检索，但 LLM 问答不可用）
+# MINERU_TOKEN 可留空（留空则 PDF/图片解析报可读错误，Office/文本/网页仍可用）
 
 # 3) 一条命令拉起全部
 sudo bash deploy/bootstrap.sh
@@ -171,6 +185,12 @@ sudo ss -lntp
 # 后端存活
 curl -s http://127.0.0.1/api/text2sql/health          # → OK
 
+# 知识库依赖
+docker compose -f deploy/docker-compose.prod.yml ps   # pgvector / minio 应为 healthy
+docker compose -f deploy/docker-compose.prod.yml exec -T pgvector \
+  psql -U postgres -d text2sql -c "select extversion from pg_extension where extname='vector'"
+curl -sI http://127.0.0.1:9000/minio/health/live | head -1   # → HTTP/1.1 200 OK
+
 # 前端
 curl -sI http://127.0.0.1/ | head -1                  # → HTTP/1.1 200 OK
 
@@ -189,6 +209,9 @@ curl -s -X POST http://127.0.0.1/api/auth/login \
 4. 用 `student01` 提问「全校平均分」→ 只基于本人数据回答，并说明数据范围
 5. 退出，`counselor01/counselor123` → 可查询 1 班与 2 班数据，看不到 3 班
 6. 管理员打开「数据源权限」页 → 勾选/撤销学生或辅导员的 `campus` 授权，下一次请求立即生效
+7. 管理员打开「知识库」页（顶部导航）→ 元数据分栏点「元数据同步」（应出现 5 条表条目）→
+   业务/智能体分栏上传一个 docx 或导入一个网页 → 状态变为「就绪」→ 用「检索调试」查看候选表与
+   引用 → 回到对话提问，回答下方出现引用角标，点击可打开原文/文本快照并高亮命中位置
 
 ---
 
@@ -204,13 +227,15 @@ cp deploy/.env.example deploy/.env   # 重新填密钥
 sudo bash deploy/bootstrap.sh
 ```
 
-关于数据：**MySQL 数据不持久化，会被一起丢掉**。这是有意为之：
+关于数据：**MySQL、pgvector 与 MinIO 的数据都不持久化，会被一起丢掉**。这是有意为之：
 
 - 应用库的所有数据都由 `db/app-schema.sql` + `db/app-data.sql` 在 MySQL 容器**首次初始化**时重建
 - 演示目标库（`campus`）在**同一个 MySQL 实例**里，是独立的 schema，首次连接时由
   `createDatabaseIfNotExist=true` 自动创建；后端每次启动都会用 `db/schema.sql` + `db/data.sql`
   重建并重灌它（`text2sql.datasources.items[].seed: true`），所以演示数据永远是已知状态
 - 连接参数使用 `CAMPUS_DB_JDBC_URL` / `CAMPUS_DB_USERNAME` / `CAMPUS_DB_PASSWORD`
+- 知识库的元数据条目可在恢复后重新「元数据同步」生成；上传的文档与网页快照需要重新上传
+  （演示场景可接受，真要保留就把 `pgvector-data` / `minio-data` 挂到独立云盘）
 - 所以恢复后立刻就是可演示状态，不需要备份恢复流程
 
 如果以后需要保留真实数据，再引入独立云盘挂载 `/var/lib/mysql`，或定期 `mysqldump`。
@@ -258,7 +283,7 @@ Docker 构建不受影响（镜像里自带 JDK 25）。
 | 文件 | 作用 |
 | --- | --- |
 | `deploy/bootstrap.sh` | 幂等的服务器初始化脚本 |
-| `deploy/docker-compose.prod.yml` | 全栈编排（MySQL + otel + backend + frontend） |
+| `deploy/docker-compose.prod.yml` | 全栈编排（MySQL + pgvector + MinIO + otel + backend + frontend） |
 | `deploy/.env.example` | 密钥 + 镜像地址模板；`deploy/.env` 已 git-ignore |
 | `text2sql-backend/Dockerfile` | 多阶段：`maven:3.9-eclipse-temurin-25` 构建 → `eclipse-temurin:25-jre-alpine` 运行（非 root） |
 | `text2sql-frontend/Dockerfile` | `node:22-alpine` 构建 → `nginx:alpine` 托管 |

@@ -52,6 +52,52 @@ services:
       - "127.0.0.1:4318:4318"   # OTLP HTTP
       - "127.0.0.1:9090:9090"   # Prometheus
 
+  # Vector database for the three knowledge collections (metadata / business / agent).
+  pgvector:
+    image: ${PGVECTOR_IMAGE:-pgvector/pgvector:pg16}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${KNOWLEDGE_PGVECTOR_PASSWORD:?set KNOWLEDGE_PGVECTOR_PASSWORD in deploy/.env}
+      POSTGRES_DB: ${KNOWLEDGE_PGVECTOR_DB:-text2sql}
+    ports:
+      # Localhost only: `ssh -L 5433:127.0.0.1:5433 <user>@<host>` for a SQL client.
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+      # Applied on an empty data directory; the backend also runs the same DDL (idempotently) on
+      # startup, so an already-initialised volume still gets new tables/indexes.
+      - ../text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d $$POSTGRES_DB --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  # Private object storage for knowledge originals, parse artifacts and URL snapshots.
+  # Port 9000 is published because presigned download URLs are opened by the browser, and the
+  # signature covers the host — it must be the same address the browser uses. The bucket itself is
+  # private: only short-lived presigned GET URLs work.
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio:RELEASE.2025-07-23T15-54-02Z}
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in deploy/.env}
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"             # S3 API used by presigned preview URLs
+      - "127.0.0.1:9001:9001"   # web console, localhost only (SSH tunnel)
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   backend:
     build:
       context: ../text2sql-backend
@@ -61,6 +107,10 @@ services:
     restart: unless-stopped
     depends_on:
       mysql:
+        condition: service_healthy
+      pgvector:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     environment:
       # NOTE: do NOT append sslMode=DISABLED. MySQL 8.4 authenticates the root user with
@@ -77,6 +127,20 @@ services:
       CAMPUS_DB_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD in deploy/.env}
       OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://otel-lgtm:4318/v1/traces
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: http://otel-lgtm:4318/v1/metrics
+      # --- Persistent three-type knowledge base ---
+      KNOWLEDGE_ENABLED: ${KNOWLEDGE_ENABLED:-true}
+      KNOWLEDGE_PGVECTOR_URL: jdbc:postgresql://pgvector:5432/${KNOWLEDGE_PGVECTOR_DB:-text2sql}
+      KNOWLEDGE_PGVECTOR_USERNAME: postgres
+      KNOWLEDGE_PGVECTOR_PASSWORD: ${KNOWLEDGE_PGVECTOR_PASSWORD:?set KNOWLEDGE_PGVECTOR_PASSWORD in deploy/.env}
+      KNOWLEDGE_MINIO_ENDPOINT: http://minio:9000
+      # Public address the browser uses for presigned preview URLs (e.g. http://1.2.3.4:9000).
+      KNOWLEDGE_MINIO_PUBLIC_ENDPOINT: ${KNOWLEDGE_MINIO_PUBLIC_ENDPOINT:-}
+      KNOWLEDGE_MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      KNOWLEDGE_MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in deploy/.env}
+      # PDF/image layout parsing (page + bbox). Empty means PDF/image imports fail with a clear reason.
+      MINERU_TOKEN: ${MINERU_TOKEN:-}
+      # Semantic retrieval needs an embedding model; without it the knowledge base uses lexical recall.
+      TEXT2SQL_RAG_ENABLED: ${TEXT2SQL_RAG_ENABLED:-false}
     expose:
       - "8080"
 
@@ -94,3 +158,5 @@ services:
 
 volumes:
   mysql-data:
+  pgvector-data:
+  minio-data:
