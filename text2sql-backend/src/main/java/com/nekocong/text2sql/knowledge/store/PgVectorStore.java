@@ -48,7 +48,7 @@ public class PgVectorStore implements VectorStore {
 
     private static final String HIT_FROM =
             " FROM knowledge_chunk c JOIN knowledge_item i ON i.id = c.item_id "
-                    + "WHERE i.status = 'READY' AND c.embedding IS NOT NULL";
+                    + "WHERE i.status = 'READY'";
 
     private static final RowMapper<VectorHit> HIT_MAPPER = (rs, rowNum) -> new VectorHit(
             rs.getString("id"),
@@ -167,6 +167,7 @@ public class PgVectorStore implements VectorStore {
         String sql = HIT_SELECT
                 + "1 - (c.embedding <=> ?::vector) AS score"
                 + HIT_FROM
+                + " AND c.embedding IS NOT NULL"
                 + filterClause(filter)
                 + " ORDER BY c.embedding <=> ?::vector LIMIT ?";
         PreparedStatementCreator creator = connection -> {
