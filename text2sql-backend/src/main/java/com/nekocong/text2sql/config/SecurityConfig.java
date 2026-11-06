@@ -75,6 +75,14 @@ public class SecurityConfig {
                                         .permitAll()
                                         .pathMatchers("/api/admin/**")
                                         .hasRole("ADMIN")
+                                        // The three knowledge collections, their documents and the
+                                        // retrieval debug endpoints are administrator-only.
+                                        // The legacy in-memory API stays open to any authenticated
+                                        // caller for backwards compatibility.
+                                        .pathMatchers("/api/text2sql/knowledge/legacy/**")
+                                        .authenticated()
+                                        .pathMatchers("/api/text2sql/knowledge/**")
+                                        .hasRole("ADMIN")
                                         .pathMatchers(
                                                 HttpMethod.POST,
                                                 "/api/text2sql/datasources",

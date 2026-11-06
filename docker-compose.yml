@@ -1,21 +1,25 @@
-# Local all-in-one OpenTelemetry backend for the Text2SQL demo.
-#
-# grafana/otel-lgtm bundles an OTLP collector + Prometheus + Tempo + Loki + Grafana
-# in a single container, so no separate collector config is needed.
+# Local all-in-one stack for the Text2SQL demo.
 #
 #   Grafana UI : http://localhost:3000   (anonymous admin access, no login)
 #   OTLP HTTP  : http://localhost:4318   (v1/traces, v1/metrics -> matches application.yaml)
 #   OTLP gRPC  : localhost:4317
 #   Prometheus : http://localhost:9090   (exposed for debugging)
 #
-# Also provides MySQL for the application database (users / conversations / model configs).
 #   MySQL      : localhost:3306          (root / root, database `text2sql`)
+#   pgvector   : localhost:5433          (postgres / postgres, database `text2sql`)
+#   MinIO API  : http://localhost:9000   (minioadmin / minioadmin)
+#   MinIO UI   : http://localhost:9001
+#
+# Images default to the Huawei Cloud SWR mirror for mainland-China networks. Override the prefix to
+# pull from Docker Hub instead:
+#   $env:REGISTRY_PREFIX = ""            # PowerShell (empty prefix -> official images)
+#   REGISTRY_PREFIX= docker compose up -d # bash
 #
 # Start:  docker compose up -d
 # Stop:   docker compose down
 services:
   otel-lgtm:
-    image: grafana/otel-lgtm:latest
+    image: "${REGISTRY_PREFIX:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io}/grafana/otel-lgtm:latest"
     container_name: text2sql-otel-lgtm
     ports:
       - "3000:3000"   # Grafana UI
@@ -25,7 +29,7 @@ services:
     restart: unless-stopped
 
   mysql:
-    image: mysql:8.4
+    image: "${REGISTRY_PREFIX:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io}/mysql:8.4"
     container_name: text2sql-mysql
     environment:
       MYSQL_ROOT_PASSWORD: root
@@ -48,5 +52,48 @@ services:
       retries: 12
     restart: unless-stopped
 
+  # Vector database for the three knowledge collections. Its data directory is independent of MySQL,
+  # and the schema (with the `vector` extension and the HNSW index) is applied on first start.
+  pgvector:
+    image: "${REGISTRY_PREFIX:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io}/pgvector/pgvector:pg16"
+    container_name: text2sql-pgvector
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: text2sql
+    ports:
+      - "5433:5432"
+    volumes:
+      - text2sql-pgvector-data:/var/lib/postgresql/data
+      - ./text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d text2sql"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  # Private object storage for knowledge originals, parse artifacts and URL snapshots.
+  minio:
+    image: "${REGISTRY_PREFIX:-swr.cn-north-4.myhuaweicloud.com/ddn-k8s/docker.io}/minio/minio:RELEASE.2025-07-23T15-54-02Z"
+    container_name: text2sql-minio
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports:
+      - "9000:9000"   # S3 API (presigned preview URLs target this)
+      - "9001:9001"   # web console
+    volumes:
+      - text2sql-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
 volumes:
   text2sql-mysql-data:
+  text2sql-pgvector-data:
+  text2sql-minio-data:

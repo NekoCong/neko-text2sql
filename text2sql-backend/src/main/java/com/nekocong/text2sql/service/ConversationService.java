@@ -89,6 +89,7 @@ public class ConversationService {
                         null,
                         null,
                         null,
+                        null,
                         System.currentTimeMillis()));
     }
 
@@ -104,6 +105,27 @@ public class ConversationService {
      */
     public Mono<Void> appendAssistantMessage(
             String conversationId, String content, String sql, String chartJson, String rowsJson) {
+        return appendAssistantMessage(conversationId, content, sql, chartJson, rowsJson, null);
+    }
+
+    /**
+     * Appends an assistant message carrying original-source citations.
+     *
+     * @param conversationId the conversation id
+     * @param content the text content
+     * @param sql the generated SQL
+     * @param chartJson the chart spec JSON
+     * @param rowsJson the result rows JSON
+     * @param citationsJson the citations as JSON, or {@code null}
+     * @return a completion signal
+     */
+    public Mono<Void> appendAssistantMessage(
+            String conversationId,
+            String content,
+            String sql,
+            String chartJson,
+            String rowsJson,
+            String citationsJson) {
         return messages.insert(
                 new ConversationMessage(
                         UUID.randomUUID().toString(),
@@ -113,6 +135,7 @@ public class ConversationService {
                         sql,
                         chartJson,
                         rowsJson,
+                        citationsJson,
                         System.currentTimeMillis()));
     }
 

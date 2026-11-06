@@ -215,6 +215,7 @@ watch(
         <el-menu-item v-if="auth.user?.role === 'admin'" index="/admin/datasource-access">
           数据源权限
         </el-menu-item>
+        <el-menu-item v-if="auth.user?.role === 'admin'" index="/knowledge">知识库</el-menu-item>
       </el-menu>
 
       <el-dropdown class="layout__user" trigger="click" @command="onUserCommand">

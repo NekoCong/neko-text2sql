@@ -1,5 +1,6 @@
 import { http } from './http'
 import { readToken } from '@/utils/authStorage'
+import type { Citation } from './knowledge'
 import type {
   ChartSpec,
   ConversationEvent,
@@ -124,6 +125,13 @@ export function streamText2Sql(
     }
   })
 
+  source.addEventListener('citations', (event) => {
+    const citations = parseEventData<Citation[]>((event as MessageEvent<string>).data)
+    if (Array.isArray(citations)) {
+      handlers.onCitations?.(citations)
+    }
+  })
+
   source.addEventListener('delta', (event) => {
     handlers.onDelta((event as MessageEvent<string>).data)
   })
@@ -190,6 +198,13 @@ export function streamAgent(
     const payload = parseEventData<SqlEvent>((event as MessageEvent<string>).data)
     if (typeof payload !== 'string') {
       handlers.onSql?.(payload)
+    }
+  })
+
+  source.addEventListener('citations', (event) => {
+    const citations = parseEventData<Citation[]>((event as MessageEvent<string>).data)
+    if (Array.isArray(citations)) {
+      handlers.onCitations?.(citations)
     }
   })
 

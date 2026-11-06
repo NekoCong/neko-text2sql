@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nekocong.text2sql.conversation.Conversation;
 import com.nekocong.text2sql.controller.dto.ChatRequest;
 import com.nekocong.text2sql.nl2sql.ChartEvent;
+import com.nekocong.text2sql.nl2sql.CitationEvent;
 import com.nekocong.text2sql.nl2sql.RowsEvent;
 import com.nekocong.text2sql.nl2sql.SqlEvent;
 import com.nekocong.text2sql.nl2sql.StepEvent;
@@ -96,6 +97,7 @@ public class Text2SqlController {
         AtomicReference<SqlEvent> sqlRef = new AtomicReference<>();
         AtomicReference<RowsEvent> rowsRef = new AtomicReference<>();
         AtomicReference<ChartEvent> chartRef = new AtomicReference<>();
+        AtomicReference<CitationEvent> citationRef = new AtomicReference<>();
 
         return scopes
                 .resolve(userId, jwt.getClaimAsString(Roles.CLAIM))
@@ -119,6 +121,8 @@ public class Text2SqlController {
                                                                                     rowsRef.set(rows);
                                                                                 } else if (event instanceof ChartEvent chart) {
                                                                                     chartRef.set(chart);
+                                                                                } else if (event instanceof CitationEvent citations) {
+                                                                                    citationRef.set(citations);
                                                                                 }
                                                                             })
                                                                     .map(this::toSse);
@@ -126,7 +130,12 @@ public class Text2SqlController {
                                                             // Deferred so the captured sql/rows/chart are read *after* the
                                                             // stream has emitted them (otherwise the assistant row is saved
                                                             // empty, and reloading the conversation shows blank answers).
-                                                            Mono.defer(() -> persistAssistant(convo.id(), sqlRef, rowsRef, chartRef))
+                                                            Mono.defer(() -> persistAssistant(
+                                                                            convo.id(),
+                                                                            sqlRef,
+                                                                            rowsRef,
+                                                                            chartRef,
+                                                                            citationRef))
                                                                     .thenReturn(sse("done", "[DONE]"));
                                                     return Flux.concat(head, body, tail);
                                                 }))
@@ -204,14 +213,18 @@ public class Text2SqlController {
             String conversationId,
             AtomicReference<SqlEvent> sqlRef,
             AtomicReference<RowsEvent> rowsRef,
-            AtomicReference<ChartEvent> chartRef) {
+            AtomicReference<ChartEvent> chartRef,
+            AtomicReference<CitationEvent> citationRef) {
         SqlEvent sql = sqlRef.get();
         String content = (sql != null && sql.explanation() != null) ? sql.explanation() : "";
         String sqlText = sql == null ? null : sql.sql();
         String chartJson = chartRef.get() == null ? null : json(chartRef.get().chart());
         String rowsJson = rowsRef.get() == null ? null : json(rowsRef.get().result());
+        String citationsJson =
+                citationRef.get() == null ? null : json(citationRef.get().citations());
         return conversations
-                .appendAssistantMessage(conversationId, content, sqlText, chartJson, rowsJson)
+                .appendAssistantMessage(
+                        conversationId, content, sqlText, chartJson, rowsJson, citationsJson)
                 .then(conversations.touchConversation(conversationId));
     }
 
@@ -227,6 +240,9 @@ public class Text2SqlController {
         }
         if (event instanceof ChartEvent chart) {
             return sse("chart", json(chart.chart()));
+        }
+        if (event instanceof CitationEvent citations) {
+            return sse("citations", json(citations.citations()));
         }
         return sse("message", "");
     }

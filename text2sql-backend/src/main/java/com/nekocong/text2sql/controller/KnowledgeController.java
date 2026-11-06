@@ -20,13 +20,14 @@ import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 
 /**
- * Knowledge-base API: ingest documents, list them, delete them, and search.
+ * Legacy in-memory knowledge-base API: ingest documents, list them, delete them, and search.
  *
- * <p>Semantic when an embedding model is configured ({@code text2sql.rag.enabled=true}); otherwise
- * lexical. Ingestion/search run on a bounded-elastic scheduler when embedding.
+ * <p>Superseded by {@link com.nekocong.text2sql.knowledge.api.KnowledgeAdminController} (the
+ * persistent three-type knowledge base). Kept under {@code /legacy} so the old contract keeps
+ * working while no client depends on the new paths.
  */
 @RestController
-@RequestMapping("/api/text2sql/knowledge")
+@RequestMapping("/api/text2sql/knowledge/legacy")
 public class KnowledgeController {
 
     private final KnowledgeService knowledge;

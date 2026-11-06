@@ -30,7 +30,7 @@ class KnowledgeControllerTest {
     @Test
     void ingestsSearchesAndDeletes() {
         client.post()
-                .uri("/api/text2sql/knowledge/documents")
+                .uri("/api/text2sql/knowledge/legacy/documents")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(
@@ -46,7 +46,7 @@ class KnowledgeControllerTest {
                 .isNumber();
 
         client.post()
-                .uri("/api/text2sql/knowledge/search")
+                .uri("/api/text2sql/knowledge/legacy/search")
                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(Map.of("namespace", "it-kb-ctrl", "query", "订单总金额", "topK", 3))
@@ -61,7 +61,7 @@ class KnowledgeControllerTest {
                 .uri(
                         uriBuilder ->
                                 uriBuilder
-                                        .path("/api/text2sql/knowledge/documents")
+                                        .path("/api/text2sql/knowledge/legacy/documents")
                                         .queryParam("namespace", "it-kb-ctrl")
                                         .queryParam("name", "guide")
                                         .build())

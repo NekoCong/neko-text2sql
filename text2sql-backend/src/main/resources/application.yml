@@ -72,11 +72,48 @@ text2sql:
     top-k: 4
     score-threshold: 0.0
 
-  # --- In-memory knowledge base (document ingest + retrieval) ---
-  # Semantic when rag.enabled=true (needs an embedding key); lexical otherwise.
+  # --- Persistent three-type knowledge base (PostgreSQL/pgvector + MinIO) ---
+  # Disabled by default: the demo and the H2 test suite need no PostgreSQL, MinIO, MinerU token or
+  # embedding key. Enable it (with the pgvector/MinIO services from docker-compose.yml) to switch
+  # schema grounding to retrieval + citations. One flag is the rollback switch.
   knowledge:
+    enabled: "${KNOWLEDGE_ENABLED:false}"
     chunk-size: 800
     top-k: 5
+    candidate-tables: 8
+    llm-select-threshold: 6
+    llm-select-enabled: true
+    llm-select-timeout-ms: 8000
+    # Without an embedding model the retrieval degrades to deterministic lexical matching.
+    lexical-fallback: true
+    pgvector:
+      url: "${KNOWLEDGE_PGVECTOR_URL:jdbc:postgresql://localhost:5433/text2sql}"
+      username: "${KNOWLEDGE_PGVECTOR_USERNAME:postgres}"
+      password: "${KNOWLEDGE_PGVECTOR_PASSWORD:postgres}"
+      pool-size: 4
+    minio:
+      endpoint: "${KNOWLEDGE_MINIO_ENDPOINT:http://localhost:9000}"
+      # Public address used only to sign preview URLs (browser-reachable). Empty = same as endpoint.
+      public-endpoint: "${KNOWLEDGE_MINIO_PUBLIC_ENDPOINT:}"
+      access-key: "${KNOWLEDGE_MINIO_ACCESS_KEY:minioadmin}"
+      secret-key: "${KNOWLEDGE_MINIO_SECRET_KEY:minioadmin}"
+      bucket: "${KNOWLEDGE_MINIO_BUCKET:text2sql-knowledge}"
+      presign-ttl-seconds: 600
+    parser:
+      pdf-engine: "${KNOWLEDGE_PDF_ENGINE:mineru}"
+      image-engine: "${KNOWLEDGE_IMAGE_ENGINE:mineru}"
+      max-file-size-mb: 200
+      max-pages: 200
+    mineru:
+      token: "${MINERU_TOKEN:}"
+      base-url: "${MINERU_BASE_URL:https://mineru.net}"
+      model-version: "${MINERU_MODEL_VERSION:vlm}"
+      ocr: true
+      formula: true
+      table: true
+      poll-timeout-seconds: 180
+      poll-interval-seconds: 3
+      max-concurrency: 2
 
   agent:
     name: Text2SqlAgent

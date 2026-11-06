@@ -18,6 +18,9 @@
     <properties>
         <java.version>25</java.version>
         <agentscope.version>2.0.4</agentscope.version>
+        <tika.version>3.2.3</tika.version>
+        <minio.version>8.6.0</minio.version>
+        <pgvector.version>0.1.6</pgvector.version>
     </properties>
 
     <dependencies>
@@ -151,6 +154,37 @@
             <groupId>com.mysql</groupId>
             <artifactId>mysql-connector-j</artifactId>
             <scope>runtime</scope>
+        </dependency>
+
+        <!-- PostgreSQL + pgvector: the knowledge/vector database (separate from the MySQL app DB). -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.pgvector</groupId>
+            <artifactId>pgvector</artifactId>
+            <version>${pgvector.version}</version>
+        </dependency>
+
+        <!-- MinIO / S3-compatible object storage for original documents and derived parse output. -->
+        <dependency>
+            <groupId>io.minio</groupId>
+            <artifactId>minio</artifactId>
+            <version>${minio.version}</version>
+        </dependency>
+
+        <!-- Apache Tika: text extraction for Office/HTML/text documents (no external service). -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-core</artifactId>
+            <version>${tika.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parsers-standard-package</artifactId>
+            <version>${tika.version}</version>
         </dependency>
 
         <!-- SQL AST parsing for row-level permission injection (DataScopeRewriter). -->

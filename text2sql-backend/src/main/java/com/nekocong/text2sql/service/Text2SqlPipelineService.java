@@ -3,8 +3,11 @@ package com.nekocong.text2sql.service;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
 import com.nekocong.text2sql.gbi.ChartInference;
+import com.nekocong.text2sql.knowledge.schema.CitationAwareSchemaProvider;
+import com.nekocong.text2sql.knowledge.schema.SchemaRetrieval;
 import com.nekocong.text2sql.modelconfig.ModelResolver;
 import com.nekocong.text2sql.nl2sql.ChartEvent;
+import com.nekocong.text2sql.nl2sql.CitationEvent;
 import com.nekocong.text2sql.nl2sql.ExecutionListener;
 import com.nekocong.text2sql.nl2sql.RowsEvent;
 import com.nekocong.text2sql.nl2sql.SqlEvent;
@@ -18,6 +21,8 @@ import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.sql.DataScopeRewriter;
 import com.nekocong.text2sql.sql.SqlExecutor;
 import com.nekocong.text2sql.sql.SqlSafetyValidator;
+import java.util.List;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
@@ -44,6 +49,9 @@ public class Text2SqlPipelineService {
     private final DatasourceAccessGuard datasourceGuard;
     private final SqlExecutor sqlExecutor;
     private final ChartInference chartInference;
+
+    /** Optional: absent when the knowledge base is disabled (and in unit tests). */
+    private ObjectProvider<CitationAwareSchemaProvider> citationProviders;
 
     /**
      * Creates the pipeline.
@@ -79,6 +87,17 @@ public class Text2SqlPipelineService {
     }
 
     /**
+     * Injects the optional citation-aware schema provider without widening the constructor contract
+     * every test constructs.
+     *
+     * @param providers the provider, resolved lazily so the knowledge base can be disabled
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setCitationProviders(ObjectProvider<CitationAwareSchemaProvider> providers) {
+        this.citationProviders = providers;
+    }
+
+    /**
      * Runs the pipeline and returns the complete result.
      *
      * @param scope the caller's data scope
@@ -105,8 +124,13 @@ public class Text2SqlPipelineService {
                 () -> {
                     String id = resolveId(scope, datasourceId);
                     String dialect = dialectOf(id);
-                    return Mono.zip(schema(id, scope, question), modelResolver.resolve(scope.userId()))
-                            .flatMap(pair -> generationService.generate(pair.getT2(), dialect, pair.getT1(), question, callerContext(scope)))
+                    return Mono.zip(retrieval(id, scope, question), modelResolver.resolve(scope.userId()))
+                            .flatMap(pair -> generationService.generate(
+                                    pair.getT2(),
+                                    dialect,
+                                    pair.getT1().schema(),
+                                    question,
+                                    callerContext(scope)))
                             .flatMap(generation -> execute(id, dialect, generation, scope, listener));
                 })
                 .doOnError(error -> listener.onFailure(null, errorMessage(error)));
@@ -168,16 +192,17 @@ public class Text2SqlPipelineService {
                     String dialect = dialectOf(id);
                     return Flux.concat(
                                     Flux.just(new StepEvent("introspect", "读取数据源表结构")),
-                                    Mono.zip(schema(id, scope, question), modelResolver.resolve(scope.userId()))
+                                    Mono.zip(retrieval(id, scope, question), modelResolver.resolve(scope.userId()))
                                             .flatMapMany(
                                                     pair ->
                                                             Flux.concat(
+                                                                    citationEvents(pair.getT1()),
                                                                     Flux.just(new StepEvent("generate", "调用模型生成 SQL")),
                                                                     generationService
                                                                             .generate(
                                                                                     pair.getT2(),
                                                                                     dialect,
-                                                                                    pair.getT1(),
+                                                                                    pair.getT1().schema(),
                                                                                     question,
                                                                                     callerContext(scope))
                                                                             .flatMapMany(
@@ -277,9 +302,28 @@ public class Text2SqlPipelineService {
                 + "。问题中的“我管理的班/本班”指这些班级，用 class_id IN (...) 过滤。";
     }
 
-    private Mono<String> schema(String id, DataScope scope, String question) {
-        return Mono.fromCallable(() -> schemaProvider.renderForPrompt(id, scope, question))
+    /**
+     * Retrieves the schema together with its citation evidence. When the knowledge base is disabled
+     * there is no citation-aware provider, so the plain {@link SchemaProvider} is used and the
+     * citation list stays empty.
+     */
+    private Mono<SchemaRetrieval> retrieval(String id, DataScope scope, String question) {
+        CitationAwareSchemaProvider provider =
+                citationProviders == null ? null : citationProviders.getIfAvailable();
+        if (provider == null) {
+            return Mono.fromCallable(() -> schemaProvider.renderForPrompt(id, scope, question))
+                    .subscribeOn(Schedulers.boundedElastic())
+                    .map(schema -> new SchemaRetrieval(schema, List.of(), null));
+        }
+        return Mono.fromCallable(() -> provider.retrieveForPrompt(id, scope, question))
                 .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    private static Flux<Text2SqlEvent> citationEvents(SchemaRetrieval retrieval) {
+        if (retrieval == null || retrieval.citations() == null || retrieval.citations().isEmpty()) {
+            return Flux.empty();
+        }
+        return Flux.just(new CitationEvent(retrieval.citations()));
     }
 
     private String resolveId(DataScope scope, String datasourceId) {

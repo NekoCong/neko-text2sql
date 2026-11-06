@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS message (
     sql_text        TEXT,
     chart_json      TEXT,
     rows_json       TEXT,
+    citations_json  TEXT,
     created_at      BIGINT      NOT NULL
 );
 

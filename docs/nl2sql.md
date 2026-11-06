@@ -135,8 +135,22 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 - **Schema RAG**（`text2sql.rag.enabled=true`）：`RagSchemaProvider` 用 AgentScope `EmbeddingModel`
   （DashScope `text-embedding-v3`）对表摘要向量化并缓存，按问题取 top-k，再**扩展外键邻居**（连接可达性），
   最后在字符预算内渲染 DDL。任何异常或全部低于阈值时**回退全量 schema**，绝不因检索失败阻断 NL2SQL。
-- **知识库**：`KnowledgeService`（`/api/text2sql/knowledge/*`）文档入库 → 分块 →（有 embedding 则向量化）→ 检索；
-  无 embedding 时按词法重叠 + 子串匹配回退，因此离线也可用、可测。
+- **三类持久化知识库**（`text2sql.knowledge.enabled=true`）：
+  - **元数据**（按数据源）由 `MetadataSyncService` 内省后每表一条，`item_key = METADATA:{ds}:{table}` 幂等 upsert；
+  - **业务知识**（数据源或全局）与**智能体知识**（按 Agent）支持文本条目、文档上传与网页导入；
+  - 向量与分块存 PostgreSQL + `pgvector`（`knowledge_chunk`，HNSW 余弦索引），原文/解析产物存 MinIO 私有桶；
+  - 入库在事务提交后异步执行，状态机 `PENDING → PARSING → EMBEDDING → READY/FAILED`，失败保留阶段，
+    重试从最便宜的阶段继续（`EMBED` 失败不会重跑 MinerU）；
+  - 解析：Tika 处理 Office/文本/HTML/URL；MinerU 精准 API 处理 PDF/图片，产出页码与 0–1000 归一化 bbox；
+  - 分块**页内合并、不跨页**，因此每个 chunk 只有一个 `page_no`、bbox 并集、字符区间与 quote；
+  - 检索链：术语改写 → 业务/智能体双路召回 → 表级召回与列跟随 → 外键补一跳（再次白名单过滤）→
+    可选 LLM 精选 → 预算内渲染 DDL；任一路失败不阻断其他路，最终失败回退全量 schema 并记录原因；
+  - `KnowledgeSchemaProvider`（`@Primary`）同时实现 `SchemaProvider` 与 `CitationAwareSchemaProvider`，
+    流水线通过 `ObjectProvider` 可选注入后者，以 SSE `citations` 事件下发引用；引用随助手消息持久化
+    （`message.citations_json`），刷新会话后仍可打开原文。
+  - 前端 `/knowledge` 管理页 + `CitationDrawer`：PDF 用 `pdfjs-dist`（动态加载）渲染并按
+    `bbox/1000 × viewport` 叠加高亮框；图片按百分比定位；Office/网页用文本快照 + `<mark>`，偏移失配时回退 `quote` 匹配。
+- **旧内存知识库**：`KnowledgeService`（`/api/text2sql/knowledge/legacy/*`）保留为兼容别名。
 - **多智能体**：`HarnessAgentFactory#subagentDeclarations` 声明 `schema_explorer` / `sql_runner` /
   `report_writer` 三个子代理（`text2sql.agent.subagents-enabled`），父代理经 AgentScope 子代理机制委派
   （planner/executor/reporter 分工）。
@@ -153,7 +167,13 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 - `Text2SqlControllerTest` — Web 层 `/health` 与 `/datasources`。
 - `DataSourceManagementIntegrationTest` — 数据源注册/替换/删除/连接测试。
 - `RagSchemaProviderTest` — RAG 选表 + 外键邻居扩展 + 失败回退（内置确定性伪 embedding）。
-- `KnowledgeServiceTest` — 知识库入库/检索/删除（词法回退路径）。
+- `KnowledgeServiceTest` — 旧内存知识库入库/检索/删除（词法回退路径）。
+- `KnowledgePropertiesBindingTest` — `text2sql.knowledge.*` 绑定（含 `MINERU_TOKEN`）与默认关闭。
+- `ChunkingServiceTest` — 页内合并/不跨页、bbox 并集、字符区间可切回原文、缺坐标报错。
+- `KnowledgeSearchServiceTest` — 双路召回、引用装配、表级白名单裁剪、全量 schema 回退。
+- `TikaDocumentParserTest` / `MinerUDocumentParserTest` — 文本切块字符区间、MinerU fixture 的
+  `page_idx+1`/bbox 映射、`full.md` 与 `content.json` 产物。
+- `DocumentParserSelectorTest` / `HttpMinerUClientTest` — 引擎选择与 MinerU 未配置 Token 的可读错误。
 - `ChartInferenceTest` — GBI 图表推断。
 - `HarnessAgentFactorySubagentsTest` — 多智能体子代理声明。
 - `AuthControllerTest` — 注册/登录/当前用户 + 受保护接口 401（真实 JWT）。

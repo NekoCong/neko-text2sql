@@ -3,8 +3,11 @@ import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { DocumentCopy, Plus, Promotion, VideoPlay } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { conversationErrorMessage } from '@/api/conversations'
+import type { Citation } from '@/api/knowledge'
 import { useChatStore } from '@/stores/chat'
 import { useConversationStore } from '@/stores/conversation'
+import CitationBadge from '@/components/CitationBadge.vue'
+import CitationDrawer from '@/components/CitationDrawer.vue'
 import ResultChart from '@/components/ResultChart.vue'
 import type {
   ChartSpec,
@@ -25,6 +28,36 @@ const scrollRef = ref<HTMLElement | null>(null)
 const loadingHistory = ref(false)
 /** Conversation the live stream attached; keeps its `activeId` watcher idle. */
 const streamedConversationId = ref<string | null>(null)
+
+/** Citation preview state shared by every answer in the transcript. */
+const citationDrawerVisible = ref(false)
+const activeCitation = ref<Citation | null>(null)
+const activeCitationList = ref<Citation[]>([])
+
+/**
+ * Opens the original-document preview for one badge of an answer.
+ *
+ * @param message the answer owning the citations
+ * @param index zero-based citation index
+ */
+function openMessageCitation(message: ChatMessage, index: number): void {
+  const citations = message.citations ?? []
+  const citation = citations[index]
+  if (!citation) {
+    return
+  }
+  activeCitationList.value = citations
+  activeCitation.value = citation
+  citationDrawerVisible.value = true
+}
+
+/** Switches to another citation of the same answer (drawer footer navigation). */
+function onCitationNavigate(index: number): void {
+  const citation = activeCitationList.value[index]
+  if (citation) {
+    activeCitation.value = citation
+  }
+}
 
 const examples = [
   '1班和2班的数学平均分分别是多少',
@@ -64,6 +97,28 @@ watch(
 )
 
 /**
+ * Normalises persisted citations: the backend may store them as an array or as a
+ * JSON-encoded string, and older rows have none at all.
+ *
+ * @param value raw `citations` field of a history message
+ * @returns the citation list, or an empty array
+ */
+function parseCitations(value: unknown): Citation[] {
+  if (Array.isArray(value)) {
+    return value as Citation[]
+  }
+  if (typeof value === 'string' && value.trim().length > 0) {
+    try {
+      const parsed: unknown = JSON.parse(value)
+      return Array.isArray(parsed) ? (parsed as Citation[]) : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+/**
  * Maps a stored history message onto the live chat message shape.
  *
  * @param message persisted message
@@ -83,6 +138,10 @@ function toChatMessage(message: HistoryMessage): ChatMessage {
   }
   if (message.chart && typeof message.chart.type === 'string') {
     mapped.chart = message.chart
+  }
+  const citations = parseCitations(message.citations)
+  if (citations.length > 0) {
+    mapped.citations = citations
   }
   return mapped
 }
@@ -218,7 +277,7 @@ watch(
     chat.messages
       .map(
         (message) =>
-          `${message.content.length}:${message.steps?.length ?? 0}:${message.sql?.length ?? 0}:${message.explanation?.length ?? 0}:${message.rows ? 'r' : ''}`,
+          `${message.content.length}:${message.steps?.length ?? 0}:${message.sql?.length ?? 0}:${message.explanation?.length ?? 0}:${message.rows ? 'r' : ''}:${message.citations?.length ?? 0}`,
       )
       .join(','),
   () => {
@@ -360,6 +419,14 @@ watch(
               <p v-else class="msg__text">{{ segment.value }}</p>
             </template>
 
+            <div v-if="message.citations?.length" class="msg__citations">
+              <span class="msg__citations-label">引用</span>
+              <CitationBadge
+                :citations="message.citations"
+                @open="(index) => openMessageCitation(message, index)"
+              />
+            </div>
+
             <div v-if="message.sql" class="sql">
               <div class="sql__bar">
                 <span class="sql__label">SQL</span>
@@ -458,6 +525,13 @@ watch(
         </div>
       </footer>
     </section>
+
+    <CitationDrawer
+      v-model="citationDrawerVisible"
+      :citation="activeCitation"
+      :citations="activeCitationList"
+      @navigate="onCitationNavigate"
+    />
   </div>
 </template>
 
@@ -776,6 +850,21 @@ watch(
   font-size: var(--ac-text-body);
   line-height: var(--ac-line-height);
   border-left: 3px solid var(--el-color-primary-light-7);
+}
+
+/* Citation badges sit directly under the answer text; no empty area otherwise. */
+.msg__citations {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--ac-space-4);
+  margin: 0 0 var(--ac-space-12);
+}
+
+.msg__citations-label {
+  color: var(--ac-muted);
+  font-size: var(--ac-text-meta);
+  line-height: 1.4;
 }
 
 .msg__cursor {

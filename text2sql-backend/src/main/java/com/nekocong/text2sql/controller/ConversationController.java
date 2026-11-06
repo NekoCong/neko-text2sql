@@ -137,6 +137,7 @@ public class ConversationController {
                 message.sql(),
                 parse(message.chartJson()),
                 parse(message.rowsJson()),
+                parse(message.citationsJson()),
                 message.createdAt());
     }
 

@@ -103,6 +103,9 @@ export const useChatStore = defineStore('chat', () => {
           assistant.scopeApplied = payload.scopeApplied === true
           assistant.rowCount = payload.rowCount
         },
+        onCitations: (citations) => {
+          messages.value[assistantIndex].citations = citations
+        },
         onDone: () => {
           messages.value[assistantIndex].streaming = false
           streaming.value = false
@@ -144,6 +147,9 @@ export const useChatStore = defineStore('chat', () => {
       },
       onChart: (chart) => {
         messages.value[assistantIndex].chart = chart
+      },
+      onCitations: (citations) => {
+        messages.value[assistantIndex].citations = citations
       },
       onDone: () => {
         messages.value[assistantIndex].streaming = false

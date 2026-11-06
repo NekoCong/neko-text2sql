@@ -1,3 +1,5 @@
+import type { Citation } from '@/api/knowledge'
+
 /** The authenticated user surfaced by the auth endpoints. */
 export interface AuthUser {
   id: string
@@ -141,6 +143,8 @@ export interface ChatMessage {
   scopeApplied?: boolean
   /** Rows produced by the agent's query (the agent stream has no result table). */
   rowCount?: number
+  /** Document citations backing the answer; empty/absent means no citation area. */
+  citations?: Citation[]
 }
 
 /** Payload of the `conversation` SSE event: the conversation the exchange persisted to. */
@@ -158,6 +162,8 @@ export interface SseHandlers {
   onSql?: (payload: SqlEvent) => void
   onRows?: (result: QueryResult) => void
   onChart?: (chart: ChartSpec) => void
+  /** Citations attached to the answer, emitted once the retrieval step is done. */
+  onCitations?: (citations: Citation[]) => void
   onDone?: () => void
   onError?: (message: string) => void
 }
@@ -191,6 +197,8 @@ export interface HistoryMessage {
   sql: string | null
   chart: ChartSpec | null
   rows: QueryResult | null
+  /** Document citations; persisted either as an array or as a JSON string. */
+  citations?: Citation[] | string | null
   /** Epoch millis. */
   createdAt: number
 }

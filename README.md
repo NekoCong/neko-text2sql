@@ -107,6 +107,7 @@ mvn spring-boot:run
 | `sql`  | 流水线 `{datasourceId, dialect, sql, explanation}`；Agent `{datasourceId, sql, rowCount, scopeApplied}` | **已应用数据权限后**实际执行的 SQL |
 | `rows` | `{columns, rows, rowCount, truncated, elapsedMs}` | 结果集（行以列名为键的对象数组） |
 | `chart`| `{type, xField, yField, title}` | GBI 图表推断（`BAR`/`LINE`/`PIE`/`NONE`） |
+| `citations` | `Citation[]` | 本次回答使用的文档原文引用（页码/坐标/字符区间/预签名预览地址）；无文档引用时不发 |
 | `delta`| 文本 | 仅 Agent 模式 |
 | `done` | `[DONE]` | 流结束 |
 | `error`| 文本或 `{message}` | 错误信息（含权限拒绝原因） |
@@ -190,14 +191,78 @@ text2sql:
 
 > 启用后需提供 `DASHSCOPE_API_KEY`（或 `text2sql.rag.api-key`）。异常时自动回退全量 schema。
 
-### 知识库 `text2sql.knowledge.*`
+### 知识库 `text2sql.knowledge.*`（默认关闭）
+
+持久化三类知识库：**元数据**（按数据源，由内省同步生成）、**业务知识**（数据源或全局）、
+**智能体知识**（按 Agent）。向量存 PostgreSQL + `pgvector`，原文与解析产物存 MinIO，解析产物与
+引用位置一起落库，因此检索命中可回溯到原文具体位置。
+
+启动依赖（`docker-compose.yml` 已包含，镜像默认走华为云 SWR）：
+
+```bash
+# Windows PowerShell：切回官方镜像源
+$env:REGISTRY_PREFIX = ""
+# bash
+REGISTRY_PREFIX= docker compose up -d
+
+docker compose up -d pgvector minio     # 5433 / 9000+9001
+docker compose ps                       # 等健康检查通过
+```
 
 | 键 | 说明 | 默认 |
 |----|------|------|
-| `chunk-size` | 分块字符上限 | `800` |
-| `top-k` | 检索返回块数 | `5` |
+| `enabled` | 知识库总开关（`KNOWLEDGE_ENABLED`）；`false` 时回退全量 schema | `false` |
+| `chunk-size` / `top-k` / `candidate-tables` | 分块长度、召回块数、候选表数 | `800` / `5` / `8` |
+| `llm-select-enabled` / `llm-select-threshold` | 候选表超过阈值时由 LLM 精选，失败回退规则集 | `true` / `6` |
+| `lexical-fallback` | 无 embedding 时允许确定性词法召回 | `true` |
+| `pgvector.url` / `username` / `password` / `pool-size` | 向量库连接（`KNOWLEDGE_PGVECTOR_*`） | `jdbc:postgresql://localhost:5433/text2sql` |
+| `minio.endpoint` / `access-key` / `secret-key` / `bucket` | 对象存储（`KNOWLEDGE_MINIO_*`），桶为私有 | `http://localhost:9000` / `text2sql-knowledge` |
+| `minio.presign-ttl-seconds` | 原文预览预签名有效期（秒） | `600` |
+| `parser.pdf-engine` / `image-engine` | PDF/图片解析引擎：`mineru`（带页码+坐标）或 `tika`（纯文本） | `mineru` |
+| `parser.max-file-size-mb` / `max-pages` | 上传大小与页数上限 | `200` / `200` |
+| `mineru.token` | MinerU Token（`MINERU_TOKEN`）；为空时 PDF/图片解析直接报可读错误 | 空 |
+| `mineru.model-version` / `poll-timeout-seconds` / `max-concurrency` | 精准解析模型、轮询预算、并发上限 | `vlm` / `180` / `2` |
 
-> 有 embedding 时走语义检索，否则词法回退（离线可用）。
+启用方式（三选一即可，MinerU 与 embedding 都是可选的）：
+
+```bash
+# 1) 只开持久化与词法检索（无需任何 API Key）
+set KNOWLEDGE_ENABLED=true
+
+# 2) 再加语义检索（复用 text2sql.rag.* 的 embedding 配置）
+set TEXT2SQL_RAG_ENABLED=true
+set DASHSCOPE_API_KEY=sk-...
+
+# 3) 再加 PDF/图片版面解析
+set MINERU_TOKEN=...
+```
+
+解析路径：docx/pptx/xlsx/txt/md/csv/html/URL 走 Tika；PDF/图片走 MinerU 精准 API
+（`file-urls/batch` → PUT → 轮询 → `full_zip_url`），产出 `full.md`、规范化 `content.json`
+与图片，`page_idx+1` 作为 1-based 页码，bbox 保持 0–1000 归一化。
+
+管理员界面：`/knowledge`（顶部导航「知识库」，`meta.admin` 守卫）。页面提供三类分栏、条目 CRUD、
+元数据同步、文档上传/网页导入、解析状态与失败重试、术语映射、检索调试，以及原文预览高亮。
+
+管理接口（全部要求管理员）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET/POST/PUT/DELETE | `/api/text2sql/knowledge/items[/{id}]` | 条目列表/详情/新增/编辑/删除 |
+| POST | `/api/text2sql/knowledge/items/{id}/retry` | 按失败阶段重试 |
+| POST | `/api/text2sql/knowledge/metadata/sync?datasourceId=` | 同步数据源元数据 |
+| GET/POST/DELETE | `/api/text2sql/knowledge/term-mappings[/{id}]` | 业务俗语 → 表/字段映射 |
+| POST | `/api/text2sql/knowledge/documents` | multipart 上传（`file` + `knowledgeType` 等） |
+| POST | `/api/text2sql/knowledge/documents/url` | 网页导入（保存快照） |
+| GET | `/api/text2sql/knowledge/documents` | 文档列表与解析状态 |
+| POST | `/api/text2sql/knowledge/documents/{id}/reparse?engine=` | 换引擎重新解析 |
+| GET | `/api/text2sql/citations/{documentId}/preview-url` | 签发原文预签名地址（回答中引用可用，含范围校验） |
+| GET | `/api/text2sql/citations/{documentId}/content` | 规范化文本快照（字符区间高亮用） |
+| POST | `/api/text2sql/knowledge/search` `/search/debug` | 检索与检索调试（含 trace） |
+
+> 旧的进程内知识库接口迁到 `/api/text2sql/knowledge/legacy/*`，行为不变。
+> **回滚**：`KNOWLEDGE_ENABLED=false` 即恢复全量 schema（`FullSchemaProvider`），
+> 无需改代码或删数据；pgvector/MinIO 容器可单独停掉，检索会记录回退原因而不阻断生成。
 
 ### 应用库 / 安全
 

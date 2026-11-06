@@ -1,0 +1,27 @@
+[
+  {
+    "type": "title",
+    "text": "第一页标题",
+    "page_idx": 0,
+    "bbox": [100, 100, 900, 150]
+  },
+  {
+    "type": "text",
+    "text": "第一页正文。",
+    "page_idx": 0,
+    "bbox": [100, 200, 900, 300]
+  },
+  {
+    "type": "table",
+    "table_body": "<table><tr><td>A</td><td>B</td></tr></table>",
+    "page_idx": 1,
+    "bbox": [50, 100, 950, 400]
+  },
+  {
+    "type": "image",
+    "img_path": "images/pic.png",
+    "img_caption": ["图一"],
+    "page_idx": 1,
+    "bbox": [100, 500, 900, 800]
+  }
+]

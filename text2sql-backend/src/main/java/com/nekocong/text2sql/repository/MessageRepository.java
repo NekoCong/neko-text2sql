@@ -32,7 +32,7 @@ public class MessageRepository {
      */
     public Flux<ConversationMessage> listByConversation(String conversationId) {
         return client.sql(
-                        "SELECT id, conversation_id, role, content, sql_text, chart_json, rows_json, created_at "
+                        "SELECT id, conversation_id, role, content, sql_text, chart_json, rows_json, citations_json, created_at "
                                 + "FROM message WHERE conversation_id = :conversationId ORDER BY created_at ASC, id ASC")
                 .bind("conversationId", conversationId)
                 .map((row, meta) -> map(row))
@@ -48,8 +48,8 @@ public class MessageRepository {
     public Mono<Void> insert(ConversationMessage message) {
         GenericExecuteSpec spec =
                 client.sql(
-                                "INSERT INTO message (id, conversation_id, role, content, sql_text, chart_json, rows_json, created_at) "
-                                        + "VALUES (:id, :conversationId, :role, :content, :sqlText, :chartJson, :rowsJson, :createdAt)")
+                                "INSERT INTO message (id, conversation_id, role, content, sql_text, chart_json, rows_json, citations_json, created_at) "
+                                        + "VALUES (:id, :conversationId, :role, :content, :sqlText, :chartJson, :rowsJson, :citationsJson, :createdAt)")
                         .bind("id", message.id())
                         .bind("conversationId", message.conversationId())
                         .bind("role", message.role())
@@ -58,6 +58,7 @@ public class MessageRepository {
         spec = bindNullable(spec, "sqlText", message.sql());
         spec = bindNullable(spec, "chartJson", message.chartJson());
         spec = bindNullable(spec, "rowsJson", message.rowsJson());
+        spec = bindNullable(spec, "citationsJson", message.citationsJson());
         return spec.then();
     }
 
@@ -86,6 +87,7 @@ public class MessageRepository {
                 row.get("sql_text", String.class),
                 row.get("chart_json", String.class),
                 row.get("rows_json", String.class),
+                row.get("citations_json", String.class),
                 row.get("created_at", Long.class));
     }
 }
