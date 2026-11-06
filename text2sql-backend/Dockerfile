@@ -15,11 +15,14 @@ ARG JRE_IMAGE=eclipse-temurin:25-jre-alpine
 # --- Build stage --------------------------------------------------------------------------------
 FROM ${MAVEN_IMAGE} AS build
 WORKDIR /workspace
+# Resolve artifacts through the mirror (see the settings file) and keep the local repository in a
+# BuildKit cache, so a rebuild does not re-download Spring/Tika (~200 MB). Tests are not compiled
+# or run in the image build; they run locally with ./mvnw test.
+COPY docker-maven-settings.xml /root/.m2/settings.xml
 COPY pom.xml ./
 COPY src ./src
-# Tests need no external services (they run on H2), but they are skipped here so an image build
-# never depends on the test suite; run them locally with ./mvnw test.
-RUN mvn -B -DskipTests package
+RUN --mount=type=cache,target=/root/.m2/repository \
+    mvn -B -s /root/.m2/settings.xml -Dmaven.test.skip=true package
 
 # --- Runtime stage ------------------------------------------------------------------------------
 FROM ${JRE_IMAGE}
