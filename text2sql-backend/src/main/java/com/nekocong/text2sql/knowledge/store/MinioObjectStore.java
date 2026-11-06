@@ -35,6 +35,9 @@ public class MinioObjectStore implements ObjectStore {
 
     private static final String DEFAULT_CONTENT_TYPE = "application/octet-stream";
 
+    /** MinIO ignores the region, but pinning it keeps presigning a purely local operation. */
+    private static final String DEFAULT_REGION = "us-east-1";
+
     private final MinioClient client;
 
     /** Signs download URLs with the public endpoint when one is configured. */
@@ -60,7 +63,7 @@ public class MinioObjectStore implements ObjectStore {
         if (configuredBucket == null || configuredBucket.isBlank()) {
             throw new ObjectStoreException("对象存储 bucket 未配置");
         }
-        MinioClient.Builder builder = MinioClient.builder().endpoint(endpoint);
+        MinioClient.Builder builder = MinioClient.builder().endpoint(endpoint).region(DEFAULT_REGION);
         if (accessKey != null && !accessKey.isBlank()) {
             if (secretKey == null || secretKey.isBlank()) {
                 throw new ObjectStoreException("对象存储 secretKey 未配置");
@@ -72,7 +75,11 @@ public class MinioObjectStore implements ObjectStore {
         if (publicEndpoint == null || publicEndpoint.isBlank() || publicEndpoint.equals(endpoint)) {
             this.presignClient = client;
         } else {
-            MinioClient.Builder presignBuilder = MinioClient.builder().endpoint(publicEndpoint);
+            // The region must be pinned: without it the SDK may query the endpoint to discover the
+            // bucket region, and the public address is not necessarily reachable from the container
+            // (hairpin NAT). Presigning itself is pure computation.
+            MinioClient.Builder presignBuilder =
+                    MinioClient.builder().endpoint(publicEndpoint).region(DEFAULT_REGION);
             if (accessKey != null && !accessKey.isBlank()) {
                 presignBuilder.credentials(accessKey, secretKey);
             }
@@ -216,7 +223,7 @@ public class MinioObjectStore implements ObjectStore {
                     .expiry(seconds, TimeUnit.SECONDS)
                     .build());
         } catch (Exception e) {
-            throw new ObjectStoreException("生成预览地址失败：" + key, e);
+            throw new ObjectStoreException("生成预览地址失败：" + key + "（" + readable(e) + "）", e);
         }
     }
 
