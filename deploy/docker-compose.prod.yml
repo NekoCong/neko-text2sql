@@ -69,7 +69,8 @@ services:
       # startup, so an already-initialised volume still gets new tables/indexes.
       - ../text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d $$POSTGRES_DB --silent"]
+      # pg_isready has no --silent flag on PostgreSQL 16; the exit code is what matters.
+      test: ["CMD-SHELL", "pg_isready -U postgres -d $$POSTGRES_DB"]
       interval: 10s
       timeout: 5s
       retries: 12
