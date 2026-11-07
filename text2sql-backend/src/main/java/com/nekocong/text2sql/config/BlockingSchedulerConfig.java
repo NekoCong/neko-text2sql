@@ -23,6 +23,9 @@ import reactor.core.scheduler.Schedulers;
 @Configuration
 public class BlockingSchedulerConfig {
 
+    private static final org.slf4j.Logger log =
+            org.slf4j.LoggerFactory.getLogger(BlockingSchedulerConfig.class);
+
     /** Bean name injected wherever blocking work is offloaded. */
     public static final String BLOCKING_SCHEDULER = "blockingScheduler";
 
@@ -35,6 +38,7 @@ public class BlockingSchedulerConfig {
     Scheduler blockingScheduler() {
         ExecutorService executor = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("blocking-", 0).factory());
+        log.info("阻塞任务调度器已启用：每个任务一个虚拟线程（bean={}）", BLOCKING_SCHEDULER);
         return Schedulers.fromExecutorService(executor);
     }
 }
