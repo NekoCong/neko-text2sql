@@ -138,14 +138,18 @@ public class HttpMinerUClient implements MinerUClient {
             throw new ParseException("MinerU 未返回有效的 batch_id 或上传链接");
         }
 
+        // Do NOT set Content-Type here. MinerU returns an Aliyun OSS presigned URL whose V1
+        // signature covers the Content-Type header (signed as empty); sending
+        // application/octet-stream makes OSS answer 403 SignatureDoesNotMatch.
         HttpRequest uploadRequest = HttpRequest.newBuilder(URI.create(uploadUrl))
                 .timeout(REQUEST_TIMEOUT)
-                .header("Content-Type", "application/octet-stream")
                 .PUT(HttpRequest.BodyPublishers.ofByteArray(context.bytes()))
                 .build();
-        HttpResponse<Void> uploadResponse = send(uploadRequest, HttpResponse.BodyHandlers.discarding());
+        HttpResponse<byte[]> uploadResponse =
+                send(uploadRequest, HttpResponse.BodyHandlers.ofByteArray());
         if (!isSuccessful(uploadResponse.statusCode())) {
-            throw new ParseException("上传文件到 MinerU 失败（HTTP " + uploadResponse.statusCode() + "）");
+            throw new ParseException("上传文件到 MinerU 失败（HTTP "
+                    + uploadResponse.statusCode() + "）: " + snippet(uploadResponse.body()));
         }
 
         String zipUrl = awaitResult(baseUrl, batchId, timeoutSeconds);
