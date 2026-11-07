@@ -256,6 +256,7 @@ set MINERU_TOKEN=...
 | POST | `/api/text2sql/knowledge/documents/url` | 网页导入（保存快照） |
 | GET | `/api/text2sql/knowledge/documents` | 文档列表与解析状态 |
 | POST | `/api/text2sql/knowledge/documents/{id}/reparse?engine=` | 换引擎重新解析 |
+| GET | `/api/text2sql/citations/{documentId}/file` | 同源下载原文（带 Bearer、含范围校验，前端预览用） |
 | GET | `/api/text2sql/citations/{documentId}/preview-url` | 签发原文预签名地址（回答中引用可用，含范围校验） |
 | GET | `/api/text2sql/citations/{documentId}/content` | 规范化文本快照（字符区间高亮用） |
 | POST | `/api/text2sql/knowledge/search` `/search/debug` | 检索与检索调试（含 trace） |

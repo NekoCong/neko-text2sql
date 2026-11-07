@@ -9,7 +9,7 @@ import {
   ZoomOut,
 } from '@element-plus/icons-vue'
 import type { PDFDocumentProxy, PDFPageProxy, PageViewport, RenderTask } from 'pdfjs-dist'
-import { getDocumentContent, getDocumentPreviewUrl } from '@/api/knowledge'
+import { getDocumentContent, getDocumentFile } from '@/api/knowledge'
 import type { Citation } from '@/api/knowledge'
 
 /**
@@ -52,11 +52,11 @@ interface BoxPercent {
   height: string
 }
 
-const resolvedUrl = ref<string | null>(null)
-const resolvedExpiry = ref<string | null>(null)
-const resolvingUrl = ref(false)
+const documentUrl = ref<string | null>(null)
+const fileLoading = ref(false)
 const unavailable = ref(false)
 const unavailableReason = ref('')
+const fallbackReason = ref('')
 const showHighlight = ref(true)
 
 const content = ref<{ plainText: string; pageCount: number | null } | null>(null)
@@ -74,6 +74,13 @@ const canvasRef = ref<HTMLCanvasElement | null>(null)
 const stageRef = ref<HTMLElement | null>(null)
 const markRef = ref<HTMLElement | null>(null)
 
+/** When PDF rendering fails irrecoverably the drawer shows the text snapshot instead. */
+const forcedText = ref(false)
+/** Original bytes kept for retries: pdf.js transfers (detaches) the buffer it is given. */
+let pdfBytes: Uint8Array | null = null
+/** Lazily created blob URL used by the image element and the download link. */
+let documentObjectUrl: string | null = null
+
 /** Live pdf.js document; destroyed on close so the worker is released. */
 let pdfDocument: PDFDocumentProxy | null = null
 let renderTask: RenderTask | null = null
@@ -86,6 +93,9 @@ const visible = computed({
 })
 
 const mode = computed<PreviewMode>(() => {
+  if (forcedText.value) {
+    return 'text'
+  }
   const mime = props.citation?.mimeType?.toLowerCase() ?? ''
   if (mime === 'application/pdf' || mime.endsWith('/pdf')) {
     return 'pdf'
@@ -191,15 +201,6 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value))
 }
 
-/** True when a stored preview URL is past its expiry. */
-function isExpired(value?: string | null): boolean {
-  if (!value) {
-    return false
-  }
-  const time = new Date(value).getTime()
-  return !Number.isNaN(time) && time <= Date.now()
-}
-
 /** Human-readable timestamp; falls back to the raw value when unparseable. */
 function formatTime(value?: string | null): string {
   if (!value) {
@@ -239,48 +240,117 @@ function teardown(): void {
   resetPdf()
   content.value = null
   imageBox.value = null
-  resolvedUrl.value = null
-  resolvedExpiry.value = null
+  releaseDocumentUrl()
+  pdfBytes = null
   imageFailed.value = false
   unavailable.value = false
   unavailableReason.value = ''
-  resolvingUrl.value = false
+  fallbackReason.value = ''
+  forcedText.value = false
+  fileLoading.value = false
   pdfRendering.value = false
   contentLoading.value = false
 }
 
-/** Resolves a fresh short-lived preview URL when the citation did not carry one. */
-async function resolveUrl(citation: Citation, current: number): Promise<void> {
-  resolvingUrl.value = true
-  try {
-    const result = await getDocumentPreviewUrl(citation.documentId)
-    if (current !== session) {
-      return
+/** Revokes the blob URL backing the image and the download link. */
+function releaseDocumentUrl(): void {
+  if (documentObjectUrl) {
+    URL.revokeObjectURL(documentObjectUrl)
+    documentObjectUrl = null
+  }
+  documentUrl.value = null
+}
+
+/** Installs the two Promise helpers pdf.js 5 relies on (Chrome < 125 / older Safari). */
+function installPromisePolyfills(): void {
+  const target = Promise as unknown as Record<string, unknown>
+  if (typeof target.withResolvers !== 'function') {
+    target.withResolvers = function <T>() {
+      let resolve!: (value: T | PromiseLike<T>) => void
+      let reject!: (reason?: unknown) => void
+      const promise = new Promise<T>((res, rej) => {
+        resolve = res
+        reject = rej
+      })
+      return { promise, resolve, reject }
     }
-    resolvedUrl.value = result.url
-    resolvedExpiry.value = result.expiresAt
-  } catch {
-    if (current === session) {
-      unavailableReason.value = '预览地址获取失败，可能已过期或原文已被移除'
-    }
-  } finally {
-    if (current === session) {
-      resolvingUrl.value = false
+  }
+  if (typeof target.try !== 'function') {
+    target.try = function <T>(
+      fn: (...args: unknown[]) => T | PromiseLike<T>,
+      ...args: unknown[]
+    ): Promise<T> {
+      return new Promise<T>((resolve) => resolve(fn(...args)))
     }
   }
 }
 
-/** Loads and rasterises the cited page. */
-async function loadPdf(url: string, citation: Citation, current: number): Promise<void> {
+/**
+ * Loads pdf.js and its module worker exactly once.
+ *
+ * `workerPort` is preferred over `workerSrc`: Vite emits and hosts the worker itself, so the
+ * preview no longer depends on nginx serving a `.mjs` file with the right MIME type (and on a
+ * poisoned browser cache from an older deployment).
+ */
+let pdfjsPromise: Promise<typeof import('pdfjs-dist')> | null = null
+function loadPdfjs(): Promise<typeof import('pdfjs-dist')> {
+  if (!pdfjsPromise) {
+    pdfjsPromise = (async () => {
+      installPromisePolyfills()
+      const [pdfjs, worker] = await Promise.all([
+        import('pdfjs-dist'),
+        import('pdfjs-dist/build/pdf.worker.min.mjs?worker'),
+      ])
+      if (!pdfjs.GlobalWorkerOptions.workerPort) {
+        pdfjs.GlobalWorkerOptions.workerPort = new worker.default()
+      }
+      return pdfjs
+    })()
+  }
+  return pdfjsPromise
+}
+
+/** Fetches the original bytes once per open; the same-origin endpoint carries the JWT. */
+async function loadFile(citation: Citation, current: number): Promise<Blob | null> {
+  fileLoading.value = true
+  try {
+    const blob = await getDocumentFile(citation.documentId)
+    if (current !== session) {
+      return null
+    }
+    if (!documentObjectUrl) {
+      documentObjectUrl = URL.createObjectURL(blob)
+      documentUrl.value = documentObjectUrl
+    }
+    return blob
+  } catch (error) {
+    console.error('[citation] file fetch failed', error)
+    if (current === session) {
+      markUnavailable('原文获取失败，可能是文件已移除或服务暂不可用')
+    }
+    return null
+  } finally {
+    if (current === session) {
+      fileLoading.value = false
+    }
+  }
+}
+
+/** Loads and rasterises the cited page from the bytes (no URL, no CORS, no expiry). */
+async function loadPdf(citation: Citation, current: number): Promise<void> {
+  if (!pdfBytes) {
+    const blob = await loadFile(citation, current)
+    if (!blob || current !== session) {
+      return
+    }
+    pdfBytes = new Uint8Array(await blob.arrayBuffer())
+  }
   pdfRendering.value = true
   try {
-    // Both imports stay lazy: pdf.js (~1 MB) only enters the bundle that the drawer
-    // needs, never the chat first paint.
-    const pdfjs = await import('pdfjs-dist')
-    const worker = await import('pdfjs-dist/build/pdf.worker.min.mjs?url')
-    pdfjs.GlobalWorkerOptions.workerSrc = worker.default
-
-    const document = await pdfjs.getDocument({ url }).promise
+    const pdfjs = await loadPdfjs()
+    // `getDocument` transfers the buffer to the worker (it is detached afterwards), so pass a
+    // copy and keep the original for the retry button.
+    const document = await pdfjs.getDocument({ data: pdfBytes.slice() }).promise
     if (current !== session) {
       await document.destroy()
       return
@@ -290,17 +360,26 @@ async function loadPdf(url: string, citation: Citation, current: number): Promis
     pdfPage.value = clamp(citation.pageNo ?? 1, 1, document.numPages)
     await renderPage(current)
   } catch (error) {
-    // Keep the real cause in the console: the UI copy is deliberately generic, but a MIME or
-    // worker problem is otherwise indistinguishable from an expired URL.
     console.error('[citation] pdf preview failed', error)
     if (current === session) {
-      markUnavailable('PDF 加载失败，可能是预览地址已过期或文件已移除')
+      await fallbackToText(citation, current, 'PDF 渲染失败，已切换为文本视图')
     }
   } finally {
     if (current === session) {
       pdfRendering.value = false
     }
   }
+}
+
+/** Guarantees something readable when pdf.js cannot run (old browser, worker failure, ...). */
+async function fallbackToText(
+  citation: Citation,
+  current: number,
+  reason: string,
+): Promise<void> {
+  forcedText.value = true
+  fallbackReason.value = reason
+  await loadText(citation, current)
 }
 
 /** Renders the current page and re-aligns the highlight box. */
@@ -420,7 +499,7 @@ function computeImageBox(bbox: number[] | null): BoxPercent | null {
 }
 
 /** (Re)initialises the preview for the current citation. */
-async function start(forceRefreshUrl = false): Promise<void> {
+async function start(): Promise<void> {
   const current = ++session
   resetPdf()
   content.value = null
@@ -428,9 +507,14 @@ async function start(forceRefreshUrl = false): Promise<void> {
   imageFailed.value = false
   unavailable.value = false
   unavailableReason.value = ''
+  fallbackReason.value = ''
+  forcedText.value = false
   showHighlight.value = true
   zoom.value = 1
   pdfPage.value = 1
+  // A retry starts from fresh bytes: the browser may have cached a failed response.
+  pdfBytes = null
+  releaseDocumentUrl()
 
   const citation = props.citation
   if (!citation) {
@@ -438,34 +522,21 @@ async function start(forceRefreshUrl = false): Promise<void> {
     return
   }
 
-  const cachedUrl =
-    !forceRefreshUrl && !isExpired(citation.previewExpiresAt) ? citation.previewUrl : null
-  resolvedUrl.value = cachedUrl ?? null
-  resolvedExpiry.value = cachedUrl ? (citation.previewExpiresAt ?? null) : null
-
   if (mode.value === 'text') {
     await loadText(citation, current)
     return
   }
 
-  if (!resolvedUrl.value) {
-    await resolveUrl(citation, current)
-    if (current !== session) {
+  if (mode.value === 'image') {
+    const blob = await loadFile(citation, current)
+    if (!blob || current !== session) {
       return
     }
-  }
-
-  if (!resolvedUrl.value) {
-    markUnavailable('原文地址暂不可用，可能已过期或原文已被移除')
+    imageBox.value = computeImageBox(citation.bbox ?? null)
     return
   }
 
-  if (mode.value === 'pdf') {
-    await loadPdf(resolvedUrl.value, citation, current)
-    return
-  }
-
-  imageBox.value = computeImageBox(citation.bbox ?? null)
+  await loadPdf(citation, current)
 }
 
 /** Image load failure: keep the quote and offer retry instead of a broken frame. */
@@ -493,7 +564,7 @@ function zoomBy(delta: number): void {
 }
 
 function retry(): void {
-  void start(true)
+  void start()
 }
 
 function navigate(delta: number): void {
@@ -535,9 +606,6 @@ watch(
         <span v-if="citation.pageNo" class="citation__meta-item">第 {{ citation.pageNo }} 页</span>
         <span v-if="citation.sourceType === 'URL' && citation.fetchedAt" class="citation__meta-item">
           快照抓取于 {{ formatTime(citation.fetchedAt) }}
-        </span>
-        <span v-if="resolvedExpiry" class="citation__meta-item">
-          预览有效期至 {{ formatTime(resolvedExpiry) }}
         </span>
         <span class="citation__meta-spacer" />
         <span v-if="citationList.length > 1" class="citation__nav">
@@ -613,7 +681,7 @@ watch(
         </el-alert>
       </div>
 
-      <div v-else-if="mode === 'pdf'" ref="stageRef" v-loading="pdfRendering" class="citation__stage">
+      <div v-else-if="mode === 'pdf'" ref="stageRef" v-loading="pdfRendering || fileLoading" class="citation__stage">
         <div class="citation__canvas-wrap">
           <canvas ref="canvasRef" class="citation__canvas" />
           <div
@@ -626,13 +694,13 @@ watch(
 
       <div
         v-else-if="mode === 'image'"
-        v-loading="resolvingUrl"
+        v-loading="fileLoading"
         class="citation__stage citation__stage--image"
       >
         <div class="citation__image-wrap">
           <img
-            v-if="resolvedUrl"
-            :src="resolvedUrl"
+            v-if="documentUrl"
+            :src="documentUrl"
             :alt="citation.filename"
             class="citation__image"
             @error="onImageError"
@@ -645,7 +713,15 @@ watch(
         </div>
       </div>
 
-      <div v-else v-loading="contentLoading" class="citation__text">
+      <div v-else class="citation__text" v-loading="contentLoading">
+        <el-alert
+          v-if="fallbackReason"
+          class="citation__fallback"
+          type="info"
+          :closable="false"
+          show-icon
+          :title="fallbackReason"
+        />
         <div class="citation__text-body"><template v-if="highlight">{{ highlight.before }}<mark ref="markRef" class="citation__mark">{{ highlight.mark }}</mark>{{ highlight.after }}</template></div>
       </div>
 
@@ -661,15 +737,16 @@ watch(
       <div class="citation__footer">
         <el-button
           :icon="Refresh"
-          :loading="resolvingUrl || pdfRendering || contentLoading"
+          :loading="fileLoading || pdfRendering || contentLoading"
           @click="retry"
         >
           重试
         </el-button>
         <a
-          v-if="resolvedUrl"
+          v-if="documentUrl"
           class="citation__download"
-          :href="resolvedUrl"
+          :href="documentUrl"
+          :download="citation?.filename"
           target="_blank"
           rel="noopener noreferrer"
         >
@@ -840,6 +917,10 @@ watch(
 
 .citation__unavailable {
   min-height: 200px;
+}
+
+.citation__fallback {
+  margin-bottom: var(--ac-space-12);
 }
 
 .citation__alert-text {

@@ -122,6 +122,36 @@ public class KnowledgePreviewService {
         }
     }
 
+    /**
+     * Reads the original bytes of a document, after checking the caller may see it. The browser
+     * fetches this from the same origin with its bearer token, so the preview never depends on a
+     * presigned URL, CORS configuration or an externally reachable object store.
+     *
+     * @param documentId the document id
+     * @param scope the caller's data scope
+     * @return the bytes and their media type
+     * @throws NoSuchElementException when the document does not exist
+     */
+    public FileContent file(String documentId, DataScope scope) {
+        KnowledgeDocument document = requireDocument(documentId);
+        requireVisible(document, scope);
+        byte[] bytes = objectStore.get(document.objectKey());
+        String contentType = document.mimeType() == null || document.mimeType().isBlank()
+                ? "application/octet-stream"
+                : document.mimeType();
+        return new FileContent(bytes, contentType, document.filename());
+    }
+
+    /**
+     * An original document's bytes.
+     *
+     * @param bytes the payload
+     * @param contentType the media type
+     * @param filename the original filename
+     */
+    public record FileContent(byte[] bytes, String contentType, String filename) {
+    }
+
     private DocumentContentView readContent(KnowledgeDocument document) {
         String prefix = document.derivedPrefix() == null
                 ? "derived/" + document.id()

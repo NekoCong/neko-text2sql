@@ -78,6 +78,48 @@ public class KnowledgeCitationController {
     }
 
     /**
+     * Streams the original document to an authenticated caller (same origin as the SPA).
+     *
+     * <p>This is the preview path used by the citation drawer: no presigned URL, no CORS and no
+     * short-lived link to expire while a page is open.
+     *
+     * @param documentId the document id
+     * @param jwt the bearer token
+     * @return the bytes with their media type
+     */
+    @GetMapping("/{documentId}/file")
+    public Mono<org.springframework.http.ResponseEntity<byte[]>> file(
+            @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
+        return scopes
+                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .flatMap(scope -> Mono.fromCallable(() -> preview.file(documentId, scope))
+                        .subscribeOn(blockingScheduler)
+                        .onErrorMap(
+                                NoSuchElementException.class,
+                                ex -> new ResponseStatusException(
+                                        HttpStatus.NOT_FOUND, ex.getMessage()))
+                        .onErrorMap(
+                                ObjectStoreException.class,
+                                ex -> new ResponseStatusException(
+                                        HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage()))
+                        .map(content -> org.springframework.http.ResponseEntity.ok()
+                                .contentType(org.springframework.http.MediaType.parseMediaType(
+                                        content.contentType()))
+                                .contentLength(content.bytes().length)
+                                .header(
+                                        org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,
+                                        contentDisposition(content.filename()))
+                                .body(content.bytes())));
+    }
+
+    private static String contentDisposition(String filename) {
+        String name = filename == null || filename.isBlank() ? "document" : filename;
+        String encoded = java.net.URLEncoder.encode(name, java.nio.charset.StandardCharsets.UTF_8)
+                .replace("+", "%20");
+        return "inline; filename*=UTF-8''" + encoded;
+    }
+
+    /**
      * Returns the normalized text snapshot of a cited document.
      *
      * @param documentId the document id

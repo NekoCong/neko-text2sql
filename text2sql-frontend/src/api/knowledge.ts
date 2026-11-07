@@ -343,6 +343,22 @@ export async function getDocumentPreviewUrl(id: string): Promise<PreviewUrlResul
   return data
 }
 
+/**
+ * Downloads a document's original bytes through the API (same origin, bearer token).
+ *
+ * Preferred over the presigned URL for rendering: no CORS, no expiry and no need to expose the
+ * object store to the browser.
+ *
+ * @param id document id
+ * @returns the file payload
+ */
+export async function getDocumentFile(id: string): Promise<Blob> {
+  const { data } = await http.get<Blob>(`${CITATION_BASE}/${encodeURIComponent(id)}/file`, {
+    responseType: 'blob',
+  })
+  return data
+}
+
 /** Reads the normalised parse result of a document (text preview). */
 export async function getDocumentContent(id: string): Promise<KnowledgeDocumentContent> {
   const { data } = await http.get<KnowledgeDocumentContent>(
