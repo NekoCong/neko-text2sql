@@ -289,7 +289,10 @@ async function loadPdf(url: string, citation: Citation, current: number): Promis
     pdfPageCount.value = document.numPages
     pdfPage.value = clamp(citation.pageNo ?? 1, 1, document.numPages)
     await renderPage(current)
-  } catch {
+  } catch (error) {
+    // Keep the real cause in the console: the UI copy is deliberately generic, but a MIME or
+    // worker problem is otherwise indistinguishable from an expired URL.
+    console.error('[citation] pdf preview failed', error)
     if (current === session) {
       markUnavailable('PDF 加载失败，可能是预览地址已过期或文件已移除')
     }
