@@ -257,7 +257,7 @@ sudo bash deploy/bootstrap.sh
 | 页面能开但接口 502 | backend 未就绪或崩了 | `docker compose -f deploy/docker-compose.prod.yml logs --tail=200 backend` |
 | 提问时 SSE 中途断流 | nginx 缓冲/超时 | `nginx.conf` 里已设 `proxy_buffering off; proxy_read_timeout 3600s;`，确认容器用的是仓库里的这份配置 |
 | 种子数据没进库 | MySQL 卷已存在，init 脚本不会再跑 | `docker compose -f deploy/docker-compose.prod.yml down -v` 再 up（**会删库**） |
-| 改了 `app-schema.sql` 但表结构没变 | 同上：init 脚本只在空库时执行 | 手工 `ALTER TABLE`，或 `down -v` 重建 |
+| 改了 `app-schema.sql` 但表结构没变 | init 脚本只在空库时执行 | 新列/索引同时写进 `deploy/app-migrate.sql`（幂等，`bootstrap.sh` 每次部署都会执行）；或 `down -v` 重建 |
 | `docker pull` 卡住 / `TIMEOUT` / `no such host` | Docker Hub 在大陆被封（见 §1.1） | 确认 `deploy/.env` 里 6 个 `*_IMAGE` 变量都指向华为云 SWR 且不为空 |
 | 构建报 `docker.io/library/maven:... : not found` | 给 maven 加了 `library/` 前缀 | maven 用 `.../docker.io/maven:...`（不带 library），见 §1.1 |
 | `docker compose` 不存在 | 只装了 `docker.io` 没装插件 | `apt-get install -y docker-compose-v2` |

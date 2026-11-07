@@ -120,6 +120,13 @@ log "Building and starting the stack (first build downloads Maven/Node dependenc
 cd "$REPO_DIR"
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build --remove-orphans
 
+# --- 6b. Migrate an existing volume ------------------------------------------------------------
+# MySQL only runs the init scripts on an empty data directory, so a container recreated on an old
+# volume would keep its old columns. app-migrate.sql is idempotent and safe to run every time.
+log "Applying idempotent application-database migrations"
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
+    sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" < /docker-entrypoint-initdb.d/03-app-migrate.sql'
+
 # --- 7. Wait for it to serve --------------------------------------------------------------------
 log "Waiting for the backend to answer"
 healthy=0

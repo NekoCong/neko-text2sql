@@ -33,6 +33,9 @@ services:
       # preemptible instance that is exactly what happens on every fresh boot.
       - ../text2sql-backend/src/main/resources/db/app-schema.sql:/docker-entrypoint-initdb.d/01-app-schema.sql:ro
       - ../text2sql-backend/src/main/resources/db/app-data.sql:/docker-entrypoint-initdb.d/02-app-data.sql:ro
+      # Idempotent migrations for volumes created before a column was added. Also executed by
+      # deploy/bootstrap.sh on every deploy, because init scripts only run on empty volumes.
+      - ./app-migrate.sql:/docker-entrypoint-initdb.d/03-app-migrate.sql:ro
     healthcheck:
       # $$ escapes to a literal $ inside the container, where MYSQL_ROOT_PASSWORD is already set,
       # so the password is not duplicated into the compose file's environment.
