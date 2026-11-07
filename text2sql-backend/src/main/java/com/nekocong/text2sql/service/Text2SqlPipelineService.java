@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.service;
 
+import com.nekocong.text2sql.config.BlockingSchedulerConfig;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
 import com.nekocong.text2sql.gbi.ChartInference;
@@ -26,6 +27,7 @@ import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
 import reactor.core.scheduler.Schedulers;
 
 /**
@@ -49,6 +51,9 @@ public class Text2SqlPipelineService {
     private final DatasourceAccessGuard datasourceGuard;
     private final SqlExecutor sqlExecutor;
     private final ChartInference chartInference;
+
+    /** Blocking work (schema introspection, retrieval) never runs on the event loop. */
+    private Scheduler blockingScheduler = Schedulers.boundedElastic();
 
     /** Optional: absent when the knowledge base is disabled (and in unit tests). */
     private ObjectProvider<CitationAwareSchemaProvider> citationProviders;
@@ -95,6 +100,21 @@ public class Text2SqlPipelineService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     void setCitationProviders(ObjectProvider<CitationAwareSchemaProvider> providers) {
         this.citationProviders = providers;
+    }
+
+    /**
+     * Injects the virtual-thread scheduler used for blocking schema work. Absent in plain unit
+     * tests, where the bounded-elastic default is used instead.
+     *
+     * @param scheduler the blocking scheduler
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    void setBlockingScheduler(
+            @org.springframework.beans.factory.annotation.Qualifier(BlockingSchedulerConfig.BLOCKING_SCHEDULER)
+                    Scheduler scheduler) {
+        if (scheduler != null) {
+            this.blockingScheduler = scheduler;
+        }
     }
 
     /**
@@ -312,11 +332,11 @@ public class Text2SqlPipelineService {
                 citationProviders == null ? null : citationProviders.getIfAvailable();
         if (provider == null) {
             return Mono.fromCallable(() -> schemaProvider.renderForPrompt(id, scope, question))
-                    .subscribeOn(Schedulers.boundedElastic())
+                    .subscribeOn(blockingScheduler)
                     .map(schema -> new SchemaRetrieval(schema, List.of(), null));
         }
         return Mono.fromCallable(() -> provider.retrieveForPrompt(id, scope, question))
-                .subscribeOn(Schedulers.boundedElastic());
+                .subscribeOn(blockingScheduler);
     }
 
     private static Flux<Text2SqlEvent> citationEvents(SchemaRetrieval retrieval) {

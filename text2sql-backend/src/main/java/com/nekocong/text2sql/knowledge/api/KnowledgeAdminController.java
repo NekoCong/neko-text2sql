@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.knowledge.api;
 
+import com.nekocong.text2sql.config.BlockingSchedulerConfig;
 import com.nekocong.text2sql.knowledge.KnowledgeDocument;
 import com.nekocong.text2sql.knowledge.KnowledgeItem;
 import com.nekocong.text2sql.knowledge.KnowledgeStatus;
@@ -21,6 +22,7 @@ import java.util.NoSuchElementException;
 import java.util.function.Supplier;
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -38,7 +40,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+import reactor.core.scheduler.Scheduler;
 
 /**
  * Admin API for the three knowledge collections: items, metadata sync, term mappings and document
@@ -57,6 +59,7 @@ public class KnowledgeAdminController {
     private final KnowledgeIngestionService ingestion;
     private final MetadataSyncService metadataSync;
     private final KnowledgeRepository repository;
+    private final Scheduler blockingScheduler;
 
     /**
      * Creates the controller.
@@ -64,14 +67,17 @@ public class KnowledgeAdminController {
      * @param ingestion the ingestion service
      * @param metadataSync the metadata sync service
      * @param repository the knowledge repository
+     * @param blockingScheduler the virtual-thread scheduler for blocking work
      */
     public KnowledgeAdminController(
             KnowledgeIngestionService ingestion,
             MetadataSyncService metadataSync,
-            KnowledgeRepository repository) {
+            KnowledgeRepository repository,
+            @Qualifier(BlockingSchedulerConfig.BLOCKING_SCHEDULER) Scheduler blockingScheduler) {
         this.ingestion = ingestion;
         this.metadataSync = metadataSync;
         this.repository = repository;
+        this.blockingScheduler = blockingScheduler;
     }
 
     /**
@@ -338,7 +344,7 @@ public class KnowledgeAdminController {
 
     private <T> Mono<T> guarded(Supplier<T> action) {
         return Mono.fromCallable(action::get)
-                .subscribeOn(Schedulers.boundedElastic())
+                .subscribeOn(blockingScheduler)
                 .onErrorMap(
                         NoSuchElementException.class,
                         ex -> new ResponseStatusException(HttpStatus.NOT_FOUND, ex.getMessage()))
@@ -357,7 +363,7 @@ public class KnowledgeAdminController {
 
     private Mono<Void> guardedVoid(Runnable action) {
         return Mono.fromRunnable(action)
-                .subscribeOn(Schedulers.boundedElastic())
+                .subscribeOn(blockingScheduler)
                 .then()
                 .onErrorMap(
                         NoSuchElementException.class,

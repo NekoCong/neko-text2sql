@@ -183,3 +183,18 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 > 所有测试运行在 `test` profile（H2 应用库），无需 MySQL。测试通过真实 `/api/auth/register`+`/login` 取 JWT 后再访问受保护接口。
 
 > 需要 Key 才能实机验证的部分：真实 SQL 生成（`SqlGenerationService`）、embedding 语义检索（`text2sql.rag.enabled=true`）、Agent 与子代理的实际编排。
+
+## 11. 线程模型（阻塞工作与虚拟线程）
+
+- **事件循环不跑阻塞代码**：控制器与流水线只做编排，任何 JDBC / MinIO / 解析调用都在调度器上执行。
+- **应用库**（用户、会话、消息）走 **R2DBC**，全链路非阻塞。
+- **目标数据源**（任意 JDBC 数据源的内省与查询）、**知识库 JDBC**、**MinIO SDK**、**Tika/MinerU 解析**天然是阻塞的：
+  - 请求路径上的这类工作统一调度到 `blockingScheduler`（`config/BlockingSchedulerConfig`）——
+    **每个任务一个虚拟线程**（Java 25），不再占用 `boundedElastic`（池大小上限为 10×CPU）。
+  - 入库流水线使用独立的 `knowledgeExecutor`（有界线程池），避免大文件解析挤占请求路径。
+- **为什么 pgvector 仍是 JDBC**：`org.postgresql:r2dbc-postgresql` 自 1.0.3 起原生支持 `vector`
+  （`Vector.of(float...)`、`row.get("embedding", Vector.class)`，Codec 通过 SPI 自动注册），技术上可迁。
+  但同一条检索链还要做目标库 JDBC 内省和 MinIO 预签名，二者无法响应式化，因此单迁 pgvector
+  只会多维护一套双栈、并不能让链路变成纯响应式。保留 JDBC + 虚拟线程是当前性价比最高的选择；
+  若以后出现实测瓶颈，再单独迁移向量检索（接口已隔离在 `VectorStore`）。
+- **测试**：`BlockingSchedulerConfigTest` 断言阻塞任务确实跑在虚拟线程上。

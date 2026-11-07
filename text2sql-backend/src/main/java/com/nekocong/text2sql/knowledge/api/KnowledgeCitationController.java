@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.knowledge.api;
 
+import com.nekocong.text2sql.config.BlockingSchedulerConfig;
 import com.nekocong.text2sql.knowledge.api.dto.DocumentContentView;
 import com.nekocong.text2sql.knowledge.api.dto.PreviewUrlView;
 import com.nekocong.text2sql.knowledge.service.KnowledgePreviewService;
@@ -7,6 +8,7 @@ import com.nekocong.text2sql.knowledge.store.ObjectStoreException;
 import com.nekocong.text2sql.security.DataScopeResolver;
 import com.nekocong.text2sql.security.Roles;
 import java.util.NoSuchElementException;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -17,7 +19,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
-import reactor.core.scheduler.Schedulers;
+import reactor.core.scheduler.Scheduler;
 
 /**
  * Original-source preview for citation badges.
@@ -33,17 +35,22 @@ public class KnowledgeCitationController {
 
     private final KnowledgePreviewService preview;
     private final DataScopeResolver scopes;
+    private final Scheduler blockingScheduler;
 
     /**
      * Creates the controller.
      *
      * @param preview the preview service
      * @param scopes resolves the caller's data scope
+     * @param blockingScheduler the virtual-thread scheduler for blocking MinIO reads
      */
     public KnowledgeCitationController(
-            KnowledgePreviewService preview, DataScopeResolver scopes) {
+            KnowledgePreviewService preview,
+            DataScopeResolver scopes,
+            @Qualifier(BlockingSchedulerConfig.BLOCKING_SCHEDULER) Scheduler blockingScheduler) {
         this.preview = preview;
         this.scopes = scopes;
+        this.blockingScheduler = blockingScheduler;
     }
 
     /**
@@ -59,7 +66,7 @@ public class KnowledgeCitationController {
         return scopes
                 .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
                 .flatMap(scope -> Mono.fromCallable(() -> preview.previewUrl(documentId, scope))
-                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribeOn(blockingScheduler)
                         .onErrorMap(
                                 NoSuchElementException.class,
                                 ex -> new ResponseStatusException(
@@ -83,7 +90,7 @@ public class KnowledgeCitationController {
         return scopes
                 .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
                 .flatMap(scope -> Mono.fromCallable(() -> preview.content(documentId, scope))
-                        .subscribeOn(Schedulers.boundedElastic())
+                        .subscribeOn(blockingScheduler)
                         .onErrorMap(
                                 NoSuchElementException.class,
                                 ex -> new ResponseStatusException(
