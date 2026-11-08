@@ -177,6 +177,16 @@ class AuthServiceTest {
         }
 
         @Override
+        public Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId) {
+            return Mono.empty();
+        }
+
+        @Override
+        public Mono<Void> revokeDatasourceByCode(String roleCode, String datasourceId) {
+            return Mono.empty();
+        }
+
+        @Override
         public Mono<AccountStatus> account(String userId) {
             return Mono.empty();
         }

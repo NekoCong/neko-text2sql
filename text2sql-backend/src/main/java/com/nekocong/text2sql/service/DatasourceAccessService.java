@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.service;
 
+import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.controller.dto.DatasourceAccessMatrix;
 import com.nekocong.text2sql.controller.dto.DatasourceAccessView;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
@@ -27,16 +28,20 @@ public class DatasourceAccessService {
     private static final List<String> GRANTABLE_ROLES = List.of(Roles.STUDENT, Roles.COUNSELOR);
 
     private final AccessRepository access;
+    private final AccessControlRepository accessControl;
     private final DataSourceRegistry registry;
 
     /**
      * Creates the service.
      *
-     * @param access the access repository
+     * @param access the legacy access repository
+     * @param accessControl the configurable access-control repository
      * @param registry the datasource registry
      */
-    public DatasourceAccessService(AccessRepository access, DataSourceRegistry registry) {
+    public DatasourceAccessService(
+            AccessRepository access, AccessControlRepository accessControl, DataSourceRegistry registry) {
         this.access = access;
+        this.accessControl = accessControl;
         this.registry = registry;
     }
 
@@ -59,7 +64,9 @@ public class DatasourceAccessService {
     public Mono<DatasourceAccessMatrix> grant(String role, String datasourceId) {
         String canonical = requireRole(role);
         requireDatasource(datasourceId);
-        return access.grant(canonical, datasourceId).then(matrix());
+        return access.grant(canonical, datasourceId)
+                .then(accessControl.grantDatasourceByCode(canonical, datasourceId))
+                .then(matrix());
     }
 
     /**
@@ -72,7 +79,9 @@ public class DatasourceAccessService {
     public Mono<DatasourceAccessMatrix> revoke(String role, String datasourceId) {
         String canonical = requireRole(role);
         requireDatasource(datasourceId);
-        return access.revoke(canonical, datasourceId).then(matrix());
+        return access.revoke(canonical, datasourceId)
+                .then(accessControl.revokeDatasourceByCode(canonical, datasourceId))
+                .then(matrix());
     }
 
     private DatasourceAccessMatrix build(List<RoleGrant> grants) {

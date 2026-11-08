@@ -150,15 +150,95 @@ class DataScopeResolverTest {
         assertDenied(resolver.resolve(userId, "student", 0));
     }
 
+    @Test
+    void anAccountWithoutDataScopeIsRejected() {
+        // No user_scope rows: the student policies cannot be evaluated, so the scope is refused.
+        String userId = account("student");
+
+        assertMissingScope(resolver.resolve(userId, "student", 0));
+    }
+
+    @Test
+    void anAccountWhoseRoleHasNoDataPoliciesIsRejected() {
+        String userId = "scope-test-nopolicy-" + UUID.randomUUID();
+        insertAccount(userId, "student", true, 0);
+        client.sql("INSERT INTO access_role (id, code, name, parent_id, built_in, enabled, created_at,"
+                        + " updated_at) VALUES (:id, 'scope-test-nopolicy', 'N', NULL, FALSE, TRUE, 0, 0)")
+                .bind("id", "scope-test-role-nopolicy")
+                .then()
+                .block();
+        client.sql("INSERT INTO access_user_role (user_id, role_id, created_at)"
+                        + " VALUES (:userId, 'scope-test-role-nopolicy', 0)")
+                .bind("userId", userId)
+                .then()
+                .block();
+
+        assertMissingScope(resolver.resolve(userId, "student", 0));
+    }
+
+    @Test
+    void aCounselorWithoutManagedClassesIsRejected() {
+        // classIds drives every counselor FILTER rule: without it nothing may be filtered by.
+        String userId = account("counselor");
+
+        assertMissingScope(resolver.resolve(userId, "counselor", 0));
+    }
+
+    @Test
+    void aStudentMissingStudentIdIsRejected() {
+        String userId = account("student");
+        scope(userId, "class_id", "7");
+        scope(userId, "student_no", "2023070");
+
+        assertMissingScope(resolver.resolve(userId, "student", 0));
+    }
+
+    @Test
+    void aStudentMissingStudentNoIsRejected() {
+        String userId = account("student");
+        scope(userId, "class_id", "7");
+        scope(userId, "student_id", "70");
+
+        assertMissingScope(resolver.resolve(userId, "student", 0));
+    }
+
+    @Test
+    void anAdminWithoutDataScopeStillResolves() {
+        // The bypass permission short-circuits validation: admins need no data scope rows.
+        String userId = account("admin");
+
+        DataScope scope = resolver.resolve(userId, "admin", 0).block();
+
+        assertThat(scope).isNotNull();
+        assertThat(scope.bypassesDataScope()).isTrue();
+    }
+
     @AfterEach
     void cleanUp() {
         client.sql("DELETE FROM user_scope WHERE user_id LIKE 'scope-test-%'").then().block();
+        client.sql("DELETE FROM access_data_scope WHERE id LIKE 'scope-test-%'").then().block();
         client.sql("DELETE FROM access_user_role WHERE user_id LIKE 'scope-test-%'").then().block();
+        client.sql("DELETE FROM access_user_role WHERE role_id IN"
+                        + " (SELECT id FROM access_role WHERE id LIKE 'scope-test-%')")
+                .then()
+                .block();
+        client.sql("DELETE FROM access_role WHERE id LIKE 'scope-test-%'").then().block();
         client.sql("DELETE FROM app_user WHERE id LIKE 'scope-test-%'").then().block();
     }
 
     private void assertDenied(reactor.core.publisher.Mono<DataScope> result) {
         assertThatThrownBy(result::block).isInstanceOf(ResponseStatusException.class);
+    }
+
+    /** Asserts the fail-closed 403 with the "no data scope configured" message. */
+    private void assertMissingScope(reactor.core.publisher.Mono<DataScope> result) {
+        assertThatThrownBy(result::block)
+                .isInstanceOf(ResponseStatusException.class)
+                .satisfies(ex -> {
+                    ResponseStatusException error = (ResponseStatusException) ex;
+                    assertThat(error.getStatusCode()).isEqualTo(HttpStatus.FORBIDDEN);
+                    assertThat(error.getReason()).contains("未配置数据范围");
+                });
     }
 
     /** Inserts an enabled account with a single role and returns its id. */

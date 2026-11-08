@@ -94,3 +94,38 @@ WHERE NOT EXISTS (SELECT 1 FROM access_role_datasource WHERE role_id = 'test-rol
 INSERT INTO access_role_datasource (role_id, datasource_id)
 SELECT 'test-role-counselor', 'campus'
 WHERE NOT EXISTS (SELECT 1 FROM access_role_datasource WHERE role_id = 'test-role-counselor' AND datasource_id = 'campus');
+
+-- --- 数据范围（等价于原 TablePolicy 的硬编码行为） ---------------------------------------------
+-- 学生   -> class/student/score/attendance 收敛到本人，course 全量
+-- 辅导员 -> class 收敛到所带班级，student/score/attendance 按 class_id 收敛，course 全量
+-- 管理员 -> 通过 access.bypass_data_scope 跳过，不写任何数据范围行
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-student-class', 'test-role-student', 'campus', 'class', 'FILTER', 'id', 'classIds', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-student-class');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-student-student', 'test-role-student', 'campus', 'student', 'FILTER', 'student_no', 'studentNo', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-student-student');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-student-score', 'test-role-student', 'campus', 'score', 'FILTER', 'student_id', 'studentId', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-student-score');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-student-attendance', 'test-role-student', 'campus', 'attendance', 'FILTER', 'student_id', 'studentId', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-student-attendance');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-student-course', 'test-role-student', 'campus', 'course', 'ALL', NULL, NULL, 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-student-course');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-counselor-class', 'test-role-counselor', 'campus', 'class', 'FILTER', 'id', 'classIds', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-counselor-class');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-counselor-student', 'test-role-counselor', 'campus', 'student', 'FILTER', 'class_id', 'classIds', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-counselor-student');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-counselor-score', 'test-role-counselor', 'campus', 'score', 'FILTER', 'class_id', 'classIds', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-counselor-score');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-counselor-attendance', 'test-role-counselor', 'campus', 'attendance', 'FILTER', 'class_id', 'classIds', 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-counselor-attendance');
+INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at)
+SELECT 'test-scope-counselor-course', 'test-role-counselor', 'campus', 'course', 'ALL', NULL, NULL, 1792454400000, 1792454400000
+WHERE NOT EXISTS (SELECT 1 FROM access_data_scope WHERE id = 'test-scope-counselor-course');

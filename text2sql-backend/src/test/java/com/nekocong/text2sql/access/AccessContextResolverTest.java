@@ -147,5 +147,15 @@ class AccessContextResolverTest {
         public Mono<Void> assignRoleByCode(String userId, String roleCode) {
             return Mono.empty();
         }
+
+        @Override
+        public Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId) {
+            return Mono.empty();
+        }
+
+        @Override
+        public Mono<Void> revokeDatasourceByCode(String roleCode, String datasourceId) {
+            return Mono.empty();
+        }
     }
 }

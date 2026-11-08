@@ -77,4 +77,22 @@ public interface AccessControlRepository {
      * @return completion, or an error when no enabled role carries that code
      */
     Mono<Void> assignRoleByCode(String userId, String roleCode);
+
+    /**
+     * Grants the enabled role with the given code access to a datasource, if not already granted.
+     *
+     * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
+     * @param datasourceId the datasource id
+     * @return completion, or an error when no enabled role carries that code
+     */
+    Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId);
+
+    /**
+     * Revokes the role with the given code's access to a datasource.
+     *
+     * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
+     * @param datasourceId the datasource id
+     * @return completion
+     */
+    Mono<Void> revokeDatasourceByCode(String roleCode, String datasourceId);
 }

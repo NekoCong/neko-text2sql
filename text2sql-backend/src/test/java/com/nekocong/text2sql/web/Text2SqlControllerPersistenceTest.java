@@ -3,6 +3,7 @@ package com.nekocong.text2sql.web;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.controller.Text2SqlController;
 import com.nekocong.text2sql.conversation.Conversation;
 import com.nekocong.text2sql.conversation.ConversationMessage;
@@ -52,6 +53,9 @@ class Text2SqlControllerPersistenceTest {
 
     @Autowired
     private DatabaseClient client;
+
+    @Autowired
+    private AccessControlRepository accessControl;
 
     @Test
     void persistsAssistantAnswerWithSqlRowsAndChart() {
@@ -103,9 +107,24 @@ class Text2SqlControllerPersistenceTest {
     }
 
     private void scope(String userId) {
+        insertUser(userId);
         insertScope(userId, "class_id", "1");
         insertScope(userId, "student_id", "1");
         insertScope(userId, "student_no", "2023001");
+        accessControl.assignRoleByCode(userId, "student").block();
+    }
+
+    private void insertUser(String userId) {
+        client.sql(
+                        "INSERT INTO app_user"
+                                + " (id, username, password_hash, display_name, role, created_at)"
+                                + " VALUES (:id, :username, :hash, '持久化测试', 'student', :createdAt)")
+                .bind("id", userId)
+                .bind("username", userId)
+                .bind("hash", "$2a$10$test")
+                .bind("createdAt", System.currentTimeMillis())
+                .then()
+                .block();
     }
 
     private void insertScope(String userId, String type, String value) {

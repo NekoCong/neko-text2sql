@@ -153,6 +153,29 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
                         : Mono.empty());
     }
 
+    @Override
+    public Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId) {
+        // Idempotent: an existing grant keeps its row and the statement still completes.
+        return client.sql("INSERT INTO access_role_datasource (role_id, datasource_id)"
+                        + " SELECT r.id, :ds FROM access_role r"
+                        + " WHERE r.code = :code AND r.enabled = TRUE"
+                        + " AND NOT EXISTS (SELECT 1 FROM access_role_datasource d"
+                        + " WHERE d.role_id = r.id AND d.datasource_id = :ds)")
+                .bind("ds", datasourceId)
+                .bind("code", roleCode)
+                .then();
+    }
+
+    @Override
+    public Mono<Void> revokeDatasourceByCode(String roleCode, String datasourceId) {
+        return client.sql("DELETE FROM access_role_datasource"
+                        + " WHERE datasource_id = :ds"
+                        + " AND role_id IN (SELECT id FROM access_role WHERE code = :code)")
+                .bind("ds", datasourceId)
+                .bind("code", roleCode)
+                .then();
+    }
+
     /** Confirms an already-assigned role exists, so a repeat assignment is a no-op. */
     private Mono<Void> exists(String userId, String roleCode) {
         return client.sql("SELECT 1 AS present FROM access_user_role ur"
