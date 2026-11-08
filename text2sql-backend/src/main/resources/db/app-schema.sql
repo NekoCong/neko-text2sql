@@ -13,6 +13,11 @@ CREATE TABLE IF NOT EXISTS app_user (
     -- classes it manages. Assigned out of band (seed SQL or a direct update); self-service
     -- registration always inserts 'student'.
     role          VARCHAR(32)  NOT NULL DEFAULT 'student',
+    -- Account status and session invalidation. A disabled account cannot log in, and bumping
+    -- token_version rejects every token issued before the change (disable, re-enable, password
+    -- reset). The legacy `role` column above is kept for display and for the migration backfill.
+    enabled       BOOLEAN      NOT NULL DEFAULT TRUE,
+    token_version INTEGER      NOT NULL DEFAULT 0,
     created_at    BIGINT       NOT NULL,
     CONSTRAINT uk_user_username UNIQUE (username)
 );
@@ -66,8 +71,93 @@ CREATE TABLE IF NOT EXISTS user_scope (
 );
 
 -- Which datasource each role may query. Admins are unrestricted and therefore need no rows here.
+-- Legacy matrix kept for backward compatibility; access_role_datasource is the configurable source.
 CREATE TABLE IF NOT EXISTS datasource_access (
     role          VARCHAR(32) NOT NULL,
     datasource_id VARCHAR(64) NOT NULL,
     PRIMARY KEY (role, datasource_id)
+);
+
+-- --- Configurable access control -------------------------------------------------------------
+-- Roles/users are disabled rather than deleted, so no database-level foreign keys are declared
+-- anywhere below: references are validated in the service layer. Every resolver lookup is a
+-- primary-key or unique-key prefix, so this file deliberately declares no standalone
+-- CREATE INDEX statements (H2 tests re-run it against the same named database, and MySQL has no
+-- CREATE INDEX IF NOT EXISTS); secondary indexes are created by db/migration/*.sql instead.
+
+-- A role is a named permission bundle. `code` is immutable after creation; `parent_id` gives
+-- single-parent inheritance (cycles are rejected in the application).
+CREATE TABLE IF NOT EXISTS access_role (
+    id          VARCHAR(64)  PRIMARY KEY,
+    code        VARCHAR(64)  NOT NULL,
+    name        VARCHAR(100) NOT NULL,
+    description VARCHAR(512),
+    parent_id   VARCHAR(64),
+    built_in    BOOLEAN      NOT NULL DEFAULT FALSE,
+    enabled     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at  BIGINT       NOT NULL,
+    updated_at  BIGINT       NOT NULL,
+    CONSTRAINT uk_access_role_code UNIQUE (code)
+);
+
+-- Permission catalog, keyed by dotted module.action strings such as `chat.use`.
+CREATE TABLE IF NOT EXISTS access_permission (
+    id             VARCHAR(64)  PRIMARY KEY,
+    permission_key VARCHAR(128) NOT NULL,
+    module         VARCHAR(64)  NOT NULL,
+    action         VARCHAR(64)  NOT NULL,
+    description    VARCHAR(512),
+    built_in       BOOLEAN      NOT NULL DEFAULT FALSE,
+    CONSTRAINT uk_access_permission_key UNIQUE (permission_key)
+);
+
+CREATE TABLE IF NOT EXISTS access_role_permission (
+    role_id       VARCHAR(64) NOT NULL,
+    permission_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (role_id, permission_id)
+);
+
+CREATE TABLE IF NOT EXISTS access_user_role (
+    user_id    VARCHAR(64) NOT NULL,
+    role_id    VARCHAR(64) NOT NULL,
+    created_at BIGINT      NOT NULL,
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE TABLE IF NOT EXISTS access_role_datasource (
+    role_id       VARCHAR(64) NOT NULL,
+    datasource_id VARCHAR(64) NOT NULL,
+    PRIMARY KEY (role_id, datasource_id)
+);
+
+-- Per-role, per-table row policy.
+--   policy = 'ALL'    -> no restriction (column_name / principal_attribute are NULL)
+--   policy = 'FILTER' -> column_name IN/= principal_attribute
+--   policy = 'DENY'   -> table denied (wins over every other policy)
+CREATE TABLE IF NOT EXISTS access_data_scope (
+    id                  VARCHAR(64)  PRIMARY KEY,
+    role_id             VARCHAR(64)  NOT NULL,
+    datasource_id       VARCHAR(64)  NOT NULL,
+    table_name          VARCHAR(128) NOT NULL,
+    policy              VARCHAR(16)  NOT NULL,
+    column_name         VARCHAR(128),
+    principal_attribute VARCHAR(32),
+    created_at          BIGINT       NOT NULL,
+    updated_at          BIGINT       NOT NULL,
+    CONSTRAINT uk_access_data_scope UNIQUE (role_id, datasource_id, table_name)
+);
+
+-- Access-control audit trail. JSON payloads are TEXT (not MySQL JSON) so H2 runs the same DDL,
+-- and must never contain password hashes or token material.
+CREATE TABLE IF NOT EXISTS access_audit (
+    id          VARCHAR(64)  PRIMARY KEY,
+    actor_id    VARCHAR(64)  NOT NULL,
+    action      VARCHAR(64)  NOT NULL,
+    entity_type VARCHAR(32)  NOT NULL,
+    entity_id   VARCHAR(64),
+    before_json TEXT,
+    after_json  TEXT,
+    result      VARCHAR(16)  NOT NULL,
+    reason      VARCHAR(512),
+    created_at  BIGINT       NOT NULL
 );

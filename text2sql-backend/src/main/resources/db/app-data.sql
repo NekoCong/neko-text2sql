@@ -48,6 +48,68 @@ INSERT IGNORE INTO datasource_access (role, datasource_id) VALUES
     ('student',   'campus'),
     ('counselor', 'campus');
 
+-- --- 可配置的访问控制（角色 / 权限 / 数据范围） --------------------------------------------------
+-- 内置角色与权限目录：等价于原 TablePolicy 的硬编码行为，迁移后改由数据驱动。
+-- 管理员通过 access.bypass_data_scope 跳过数据范围，因此不需要任何数据范围行。
+INSERT IGNORE INTO access_role (id, code, name, description, parent_id, built_in, enabled, created_at, updated_at) VALUES
+    ('seed-role-admin',     'admin',     '管理员', '内置角色：全部权限，跳过数据范围过滤', NULL, TRUE, TRUE, 1792454400000, 1792454400000),
+    ('seed-role-student',   'student',   '学生',   '内置角色：只能查询本人数据',           NULL, TRUE, TRUE, 1792454400000, 1792454400000),
+    ('seed-role-counselor', 'counselor', '辅导员', '内置角色：可查询所带班级的数据',       NULL, TRUE, TRUE, 1792454400000, 1792454400000);
+
+INSERT IGNORE INTO access_permission (id, permission_key, module, action, description, built_in) VALUES
+    ('seed-perm-chat-use',                'chat.use',                'chat',       'use',                '使用对话与问数',           TRUE),
+    ('seed-perm-datasource-read',         'datasource.read',         'datasource', 'read',               '查看数据源',               TRUE),
+    ('seed-perm-datasource-write',        'datasource.write',        'datasource', 'write',              '维护数据源',               TRUE),
+    ('seed-perm-model-manage',            'model.manage',            'model',      'manage',             '维护模型配置',             TRUE),
+    ('seed-perm-access-manage',           'access.manage',           'access',     'manage',             '维护角色与访问控制',       TRUE),
+    ('seed-perm-user-read',               'user.read',               'user',       'read',               '查看用户',                 TRUE),
+    ('seed-perm-user-manage',             'user.manage',             'user',       'manage',             '维护用户',                 TRUE),
+    ('seed-perm-audit-read',              'audit.read',              'audit',      'read',               '查看审计日志',             TRUE),
+    ('seed-perm-access-bypass-data-scope', 'access.bypass_data_scope', 'access',    'bypass_data_scope', '跳过数据范围过滤（管理员）', TRUE);
+
+INSERT IGNORE INTO access_role_permission (role_id, permission_id) VALUES
+    ('seed-role-admin',     'seed-perm-chat-use'),
+    ('seed-role-admin',     'seed-perm-datasource-read'),
+    ('seed-role-admin',     'seed-perm-datasource-write'),
+    ('seed-role-admin',     'seed-perm-model-manage'),
+    ('seed-role-admin',     'seed-perm-access-manage'),
+    ('seed-role-admin',     'seed-perm-user-read'),
+    ('seed-role-admin',     'seed-perm-user-manage'),
+    ('seed-role-admin',     'seed-perm-audit-read'),
+    ('seed-role-admin',     'seed-perm-access-bypass-data-scope'),
+    ('seed-role-student',   'seed-perm-chat-use'),
+    ('seed-role-student',   'seed-perm-datasource-read'),
+    ('seed-role-counselor', 'seed-perm-chat-use'),
+    ('seed-role-counselor', 'seed-perm-datasource-read');
+
+-- 账号 -> 角色：与上面的 app_user.role 保持一一对应，便于逐条核对。
+INSERT IGNORE INTO access_user_role (user_id, role_id, created_at) VALUES
+    ('seed-user-admin',       'seed-role-admin',     1792454400000),
+    ('seed-user-student01',   'seed-role-student',   1792454400000),
+    ('seed-user-student02',   'seed-role-student',   1792454400000),
+    ('seed-user-student03',   'seed-role-student',   1792454400000),
+    ('seed-user-counselor01', 'seed-role-counselor', 1792454400000);
+
+-- 角色 -> 数据源白名单（管理员跳过检查，无需记录）。
+INSERT IGNORE INTO access_role_datasource (role_id, datasource_id) VALUES
+    ('seed-role-student',   'campus'),
+    ('seed-role-counselor', 'campus');
+
+-- 数据范围：等价于原 TablePolicy。
+--   学生   -> class/student/score/attendance 收敛到本人，course 全量
+--   辅导员 -> class 收敛到所带班级，student/score/attendance 按 class_id 收敛，course 全量
+INSERT IGNORE INTO access_data_scope (id, role_id, datasource_id, table_name, policy, column_name, principal_attribute, created_at, updated_at) VALUES
+    ('seed-scope-student-class',        'seed-role-student',   'campus', 'class',      'FILTER', 'id',         'classIds',   1792454400000, 1792454400000),
+    ('seed-scope-student-student',      'seed-role-student',   'campus', 'student',    'FILTER', 'student_no', 'studentNo',  1792454400000, 1792454400000),
+    ('seed-scope-student-score',        'seed-role-student',   'campus', 'score',      'FILTER', 'student_id', 'studentId',  1792454400000, 1792454400000),
+    ('seed-scope-student-attendance',   'seed-role-student',   'campus', 'attendance', 'FILTER', 'student_id', 'studentId',  1792454400000, 1792454400000),
+    ('seed-scope-student-course',       'seed-role-student',   'campus', 'course',     'ALL',    NULL,         NULL,         1792454400000, 1792454400000),
+    ('seed-scope-counselor-class',      'seed-role-counselor', 'campus', 'class',      'FILTER', 'id',         'classIds',   1792454400000, 1792454400000),
+    ('seed-scope-counselor-student',    'seed-role-counselor', 'campus', 'student',    'FILTER', 'class_id',   'classIds',   1792454400000, 1792454400000),
+    ('seed-scope-counselor-score',      'seed-role-counselor', 'campus', 'score',      'FILTER', 'class_id',   'classIds',   1792454400000, 1792454400000),
+    ('seed-scope-counselor-attendance', 'seed-role-counselor', 'campus', 'attendance', 'FILTER', 'class_id',   'classIds',   1792454400000, 1792454400000),
+    ('seed-scope-counselor-course',     'seed-role-counselor', 'campus', 'course',     'ALL',    NULL,         NULL,         1792454400000, 1792454400000);
+
 -- --- 示例会话 -----------------------------------------------------------------------------------
 INSERT IGNORE INTO conversation (id, user_id, title, datasource_id, model_config_id, created_at, updated_at) VALUES
     ('seed-conv-student01-1',   'seed-user-student01',   '我的数学成绩',     'campus', NULL, 1792458000000, 1792461600000),
