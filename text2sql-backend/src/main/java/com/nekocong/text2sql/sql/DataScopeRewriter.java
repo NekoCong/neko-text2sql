@@ -65,12 +65,13 @@ public class DataScopeRewriter {
     /**
      * Rewrites a statement for the caller's scope.
      *
-     * @param sql   the validated, read-only SQL
+     * @param sql the validated, read-only SQL
      * @param scope the caller's scope
+     * @param datasourceId the datasource the statement will run against
      * @return the enforced SQL (identical to the input for admins)
      * @throws SqlPermissionException when the query cannot be safely scoped
      */
-    public String rewrite(String sql, DataScope scope) {
+    public String rewrite(String sql, DataScope scope, String datasourceId) {
         if (scope != null && scope.bypassesDataScope()) {
             return sql;
         }
@@ -84,7 +85,7 @@ public class DataScopeRewriter {
             throw new SqlPermissionException("只支持单条只读查询");
         }
         try {
-            rewriteSelect(select, scope, new HashSet<>());
+            rewriteSelect(select, scope, datasourceId, new HashSet<>());
             return select.toString();
         } catch (SqlPermissionException ex) {
             throw ex;
@@ -93,7 +94,8 @@ public class DataScopeRewriter {
         }
     }
 
-    private void rewriteSelect(Select select, DataScope scope, Set<String> inheritedCtes) {
+    private void rewriteSelect(
+            Select select, DataScope scope, String datasourceId, Set<String> inheritedCtes) {
         Set<String> ctes = new HashSet<>(inheritedCtes);
         List<WithItem> withItems = select.getWithItemsList();
         if (withItems != null) {
@@ -103,21 +105,21 @@ public class DataScopeRewriter {
                 }
             }
             for (WithItem item : withItems) {
-                rewriteSelect(item.getSelect(), scope, ctes);
+                rewriteSelect(item.getSelect(), scope, datasourceId, ctes);
             }
         }
 
         switch (select) {
-            case PlainSelect plain -> rewritePlainSelect(plain, scope, ctes);
+            case PlainSelect plain -> rewritePlainSelect(plain, scope, datasourceId, ctes);
             case SetOperationList setOperation -> {
                 for (Select branch : setOperation.getSelects()) {
-                    rewriteSelect(branch, scope, ctes);
+                    rewriteSelect(branch, scope, datasourceId, ctes);
                 }
-                rewriteOrderBy(setOperation.getOrderByElements(), scope, ctes);
+                rewriteOrderBy(setOperation.getOrderByElements(), scope, datasourceId, ctes);
             }
             case ParenthesedSelect parenthesed -> {
-                rewriteSelect(parenthesed.getSelect(), scope, ctes);
-                rewriteOrderBy(parenthesed.getOrderByElements(), scope, ctes);
+                rewriteSelect(parenthesed.getSelect(), scope, datasourceId, ctes);
+                rewriteOrderBy(parenthesed.getOrderByElements(), scope, datasourceId, ctes);
             }
             case Values _ ->
                 // A VALUES list can carry scalar subqueries; rejecting it keeps enforcement total.
@@ -126,68 +128,76 @@ public class DataScopeRewriter {
         }
     }
 
-    private void rewritePlainSelect(PlainSelect select, DataScope scope, Set<String> ctes) {
+    private void rewritePlainSelect(
+            PlainSelect select, DataScope scope, String datasourceId, Set<String> ctes) {
         if (select.getIntoTables() != null && !select.getIntoTables().isEmpty()) {
             throw new SqlPermissionException("不支持 SELECT ... INTO，已拒绝执行");
         }
         Set<String> aliases = new HashSet<>();
-        select.setFromItem(rewriteFromItem(select.getFromItem(), scope, ctes, aliases));
+        select.setFromItem(rewriteFromItem(select.getFromItem(), scope, datasourceId, ctes, aliases));
 
         List<Join> joins = select.getJoins();
         if (joins != null) {
             for (Join join : joins) {
-                join.setRightItem(rewriteFromItem(join.getRightItem(), scope, ctes, aliases));
+                join.setRightItem(rewriteFromItem(join.getRightItem(), scope, datasourceId, ctes, aliases));
                 if (join.getOnExpressions() != null) {
                     for (Expression on : join.getOnExpressions()) {
-                        rewriteExpression(on, scope, ctes);
+                        rewriteExpression(on, scope, datasourceId, ctes);
                     }
                 }
             }
         }
 
-        rewriteExpression(select.getWhere(), scope, ctes);
-        rewriteExpression(select.getHaving(), scope, ctes);
+        rewriteExpression(select.getWhere(), scope, datasourceId, ctes);
+        rewriteExpression(select.getHaving(), scope, datasourceId, ctes);
         for (SelectItem<?> item : select.getSelectItems()) {
-            rewriteExpression(item.getExpression(), scope, ctes);
+            rewriteExpression(item.getExpression(), scope, datasourceId, ctes);
         }
         if (select.getGroupBy() != null) {
-            rewriteExpression(select.getGroupBy().getGroupByExpressionList(), scope, ctes);
+            rewriteExpression(select.getGroupBy().getGroupByExpressionList(), scope, datasourceId, ctes);
         }
-        rewriteOrderBy(select.getOrderByElements(), scope, ctes);
+        rewriteOrderBy(select.getOrderByElements(), scope, datasourceId, ctes);
     }
 
     private void rewriteOrderBy(
-            List<OrderByElement> orderByElements, DataScope scope, Set<String> ctes) {
+            List<OrderByElement> orderByElements,
+            DataScope scope,
+            String datasourceId,
+            Set<String> ctes) {
         if (orderByElements == null) {
             return;
         }
         for (OrderByElement order : orderByElements) {
-            rewriteExpression(order.getExpression(), scope, ctes);
+            rewriteExpression(order.getExpression(), scope, datasourceId, ctes);
         }
     }
 
     private FromItem rewriteFromItem(
-            FromItem item, DataScope scope, Set<String> ctes, Set<String> aliases) {
+            FromItem item,
+            DataScope scope,
+            String datasourceId,
+            Set<String> ctes,
+            Set<String> aliases) {
         switch (item) {
             case null -> {
                 return null;
             }
             case Table table -> {
-                return rewriteTable(table, scope, ctes, aliases);
+                return rewriteTable(table, scope, datasourceId, ctes, aliases);
             }
             case ParenthesedSelect parenthesed -> {
                 // Pass the parenthesized select itself: its own ORDER BY / WITH list must be visited too.
-                rewriteSelect(parenthesed, scope, ctes);
+                rewriteSelect(parenthesed, scope, datasourceId, ctes);
                 return item;
             }
             case ParenthesedFromItem parenthesed -> {
-                parenthesed.setFromItem(rewriteFromItem(parenthesed.getFromItem(), scope, ctes, aliases));
+                parenthesed.setFromItem(rewriteFromItem(parenthesed.getFromItem(), scope, datasourceId, ctes, aliases));
                 if (parenthesed.getJoins() != null) {
                     for (Join join : parenthesed.getJoins()) {
-                        join.setRightItem(rewriteFromItem(join.getRightItem(), scope, ctes, aliases));
+                        join.setRightItem(rewriteFromItem(join.getRightItem(), scope, datasourceId, ctes, aliases));
                         if (join.getOnExpressions() != null) {
                             for (Expression on : join.getOnExpressions()) {
-                                rewriteExpression(on, scope, ctes);
+                                rewriteExpression(on, scope, datasourceId, ctes);
                             }
                         }
                     }
@@ -201,12 +211,12 @@ public class DataScopeRewriter {
     }
 
     private FromItem rewriteTable(
-            Table table, DataScope scope, Set<String> ctes, Set<String> aliases) {
+            Table table, DataScope scope, String datasourceId, Set<String> ctes, Set<String> aliases) {
         String name = table.getName() == null ? "" : table.getName().toLowerCase(Locale.ROOT);
         if (ctes.contains(name)) {
             return table;
         }
-        List<RowPredicate> predicates = policy.predicates(scope, null, name);
+        List<RowPredicate> predicates = policy.predicates(scope, datasourceId, name);
 
         String declaredAlias =
                 table.getAlias() != null ? table.getAlias().getName() : name;
@@ -226,7 +236,7 @@ public class DataScopeRewriter {
         PlainSelect inner = new PlainSelect();
         inner.addSelectItems(new AllColumns());
         inner.setFromItem(source);
-        String predicate = renderPredicates(predicates, scope, table);
+        String predicate = renderPredicates(predicates, scope);
         try {
             inner.setWhere(CCJSqlParserUtil.parseCondExpression(predicate));
         } catch (Exception ex) {
@@ -245,17 +255,16 @@ public class DataScopeRewriter {
      * the query instead of producing a predicate that matches nothing (which would silently return an
      * empty result) or, worse, everything.
      */
-    private static String renderPredicates(
-            List<RowPredicate> predicates, DataScope scope, Table table) {
+    private static String renderPredicates(List<RowPredicate> predicates, DataScope scope) {
         if (predicates.size() == 1) {
-            return renderPredicate(predicates.get(0), scope, table);
+            return renderPredicate(predicates.get(0), scope);
         }
         return predicates.stream()
-                .map(predicate -> "(" + renderPredicate(predicate, scope, table) + ")")
+                .map(predicate -> "(" + renderPredicate(predicate, scope) + ")")
                 .collect(Collectors.joining(" OR "));
     }
 
-    private static String renderPredicate(RowPredicate predicate, DataScope scope, Table table) {
+    private static String renderPredicate(RowPredicate predicate, DataScope scope) {
         String column = predicate.column();
         if (!DataScopePolicyEngine.isSafeColumn(column)) {
             throw new SqlPermissionException("行过滤列不安全，已拒绝执行：" + column);
@@ -300,8 +309,13 @@ public class DataScopeRewriter {
         return value;
     }
 
-    private static String quote(String value) {
-        return "'" + value.replace("'", "''") + "'";
+    /**
+     * Renders a string literal. Backslashes are doubled first so a value such as {@code a\'} cannot
+     * re-open the literal or smuggle in a second statement on a MySQL-family parser, then quotes are
+     * doubled.
+     */
+    static String quote(String value) {
+        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'";
     }
 
     private static String uniqueAlias(String requested, Set<String> aliases) {
@@ -320,7 +334,7 @@ public class DataScopeRewriter {
         }
     }
 
-    private void rewriteExpression(Expression expression, DataScope scope, Set<String> ctes) {
+    private void rewriteExpression(Expression expression, DataScope scope, String datasourceId, Set<String> ctes) {
         if (expression == null) {
             return;
         }
@@ -331,7 +345,7 @@ public class DataScopeRewriter {
                         // ParenthesedSelect.accept(ExpressionVisitor) dispatches to visit(Select);
                         // it does not call the visit(ParenthesedSelect) overload. Pass it through so
                         // its inner select AND its own ORDER BY / WITH list are rewritten.
-                        rewriteSelect(subSelect, scope, ctes);
+                        rewriteSelect(subSelect, scope, datasourceId, ctes);
                     }
                 });
     }

@@ -7,6 +7,7 @@ import com.nekocong.text2sql.knowledge.service.KnowledgePreviewService;
 import com.nekocong.text2sql.knowledge.store.ObjectStoreException;
 import com.nekocong.text2sql.security.DataScopeResolver;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.security.TokenClaims;
 import java.util.NoSuchElementException;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -64,7 +65,10 @@ public class KnowledgeCitationController {
     public Mono<PreviewUrlView> previewUrl(
             @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
         return scopes
-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(
+                        jwt.getSubject(),
+                        jwt.getClaimAsString(Roles.CLAIM),
+                        TokenClaims.tokenVersion(jwt))
                 .flatMap(scope -> Mono.fromCallable(() -> preview.previewUrl(documentId, scope))
                         .subscribeOn(blockingScheduler)
                         .onErrorMap(
@@ -91,7 +95,10 @@ public class KnowledgeCitationController {
     public Mono<org.springframework.http.ResponseEntity<byte[]>> file(
             @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
         return scopes
-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(
+                        jwt.getSubject(),
+                        jwt.getClaimAsString(Roles.CLAIM),
+                        TokenClaims.tokenVersion(jwt))
                 .flatMap(scope -> Mono.fromCallable(() -> preview.file(documentId, scope))
                         .subscribeOn(blockingScheduler)
                         .onErrorMap(
@@ -130,7 +137,10 @@ public class KnowledgeCitationController {
     public Mono<DocumentContentView> content(
             @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
         return scopes
-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(
+                        jwt.getSubject(),
+                        jwt.getClaimAsString(Roles.CLAIM),
+                        TokenClaims.tokenVersion(jwt))
                 .flatMap(scope -> Mono.fromCallable(() -> preview.content(documentId, scope))
                         .subscribeOn(blockingScheduler)
                         .onErrorMap(

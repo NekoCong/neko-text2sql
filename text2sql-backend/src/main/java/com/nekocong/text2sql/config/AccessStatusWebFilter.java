@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nekocong.text2sql.access.AccessContextResolver;
 import com.nekocong.text2sql.access.EffectiveAccess;
+import com.nekocong.text2sql.security.TokenClaims;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import org.slf4j.Logger;
@@ -31,9 +32,10 @@ import reactor.core.publisher.Mono;
  *
  * <p>The bearer token is read straight from the request (the {@code Authorization} header, or the
  * {@code access_token} query parameter used by the browser {@code EventSource}) and verified with
- * the same decoder as the resource server. The exchange principal is deliberately not touched: in
- * WebFlux it is backed by a single shared security-context publisher, and consuming it here would
- * starve the downstream filters and controller argument resolution.
+ * the same decoder as the resource server. The {@code ver} claim is read with {@link TokenClaims}.
+ * The exchange principal is deliberately not touched: in WebFlux it is backed by a single shared
+ * security-context publisher, and consuming it here would starve the downstream filters and
+ * controller argument resolution.
  *
  * <p>The filter only validates before the chain runs: it never reads or buffers the response body,
  * so server-sent events stream through unchanged. Requests without a bearer token (public
@@ -110,7 +112,7 @@ public class AccessStatusWebFilter implements WebFilter {
      * authorization {@code 403}, a controller error, a broken SSE stream) propagates untouched.
      */
     private Mono<Void> resolve(ServerWebExchange exchange, Jwt jwt) {
-        return resolver.resolve(jwt.getSubject(), tokenVersion(jwt))
+        return resolver.resolve(jwt.getSubject(), TokenClaims.tokenVersion(jwt))
                 .doOnNext(access -> exchange.getAttributes().put(ACCESS, access))
                 .then()
                 .onErrorResume(error -> {
@@ -119,22 +121,6 @@ public class AccessStatusWebFilter implements WebFilter {
                     }
                     return reject(exchange, jwt.getSubject(), error);
                 });
-    }
-
-    /** Reads the {@code ver} claim, tolerating the numeric types a JSON decoder may produce. */
-    private static Integer tokenVersion(Jwt jwt) {
-        Object value = jwt.getClaim("ver");
-        if (value instanceof Number number) {
-            return number.intValue();
-        }
-        if (value instanceof String text) {
-            try {
-                return Integer.valueOf(text.trim());
-            } catch (NumberFormatException ex) {
-                return null;
-            }
-        }
-        return null;
     }
 
     /**

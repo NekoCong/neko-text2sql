@@ -126,7 +126,6 @@ class KnowledgeSearchServiceTest {
                 List.of(chunk("c9", "item-x", null, "薪资统计口径说明", null, null, 0)));
         DataScope student = AccessFixtures.student();
 
-
         SearchResult result = service.search(student, "campus", null, "薪资", 5);
 
         assertThat(result.hits()).isEmpty();

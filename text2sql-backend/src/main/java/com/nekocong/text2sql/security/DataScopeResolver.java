@@ -18,8 +18,8 @@ import reactor.core.publisher.Mono;
  * its current roles, while an unrecognized claim still fails closed early.
  *
  * <p>Fails closed: an unrecognized role claim, a disabled or unknown account, a stale or missing
- * token version, or an account without usable roles is rejected instead of being handed an empty or
- * unrestricted scope.
+ * token version, an account without usable roles, or a scope whose policies cannot be evaluated is
+ * rejected instead of being handed an empty or unrestricted scope.
  */
 @Service
 public class DataScopeResolver {
@@ -49,19 +49,9 @@ public class DataScopeResolver {
         if (role != null && Roles.normalize(role) == null) {
             return Mono.error(denied("当前账号没有可识别的角色，无法确定数据范围"));
         }
-        return access.resolve(userId, tokenVersion).map(DataScope::from).map(DataScopeResolver::requireUsable);
-    }
-
-    /**
-     * Resolves the caller's scope without a token version. Kept for sources that have not migrated;
-     * it fails closed because the access resolver rejects a {@code null} token version.
-     *
-     * @param userId the authenticated user id
-     * @param role the raw role claim
-     * @return the resolved scope, or an error
-     */
-    public Mono<DataScope> resolve(String userId, String role) {
-        return resolve(userId, role, null);
+        return access.resolve(userId, tokenVersion)
+                .map(DataScope::from)
+                .map(DataScopeResolver::requireUsable);
     }
 
     /**

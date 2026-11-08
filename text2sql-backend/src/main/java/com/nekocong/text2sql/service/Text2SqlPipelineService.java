@@ -1,5 +1,7 @@
 package com.nekocong.text2sql.service;
 
+import com.nekocong.text2sql.access.DataScopePolicy;
+import com.nekocong.text2sql.access.PrincipalAttribute;
 import com.nekocong.text2sql.config.BlockingSchedulerConfig;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
@@ -22,7 +24,11 @@ import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.sql.DataScopeRewriter;
 import com.nekocong.text2sql.sql.SqlExecutor;
 import com.nekocong.text2sql.sql.SqlSafetyValidator;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
@@ -237,7 +243,7 @@ public class Text2SqlPipelineService {
             SqlGeneration generation,
             DataScope scope,
             ExecutionListener listener) {
-        String safeSql = enforce(generation.sql(), scope);
+        String safeSql = enforce(generation.sql(), id, scope);
         return Flux.concat(
                 Flux.just(new SqlEvent(id, dialect, safeSql, scopedExplanation(generation.explanation(), scope))),
                 Flux.just(new StepEvent("execute", "执行只读查询")),
@@ -256,7 +262,7 @@ public class Text2SqlPipelineService {
             SqlGeneration generation,
             DataScope scope,
             ExecutionListener listener) {
-        String safeSql = enforce(generation.sql(), scope);
+        String safeSql = enforce(generation.sql(), id, scope);
         return sqlExecutor
                 .execute(id, safeSql)
                 .doOnNext(rows -> listener.onSuccess(id, safeSql, rows.rowCount()))
@@ -279,10 +285,15 @@ public class Text2SqlPipelineService {
     /**
      * Validates then rewrites: the statement that is shown to the user and executed is the enforced
      * one, never the raw model output.
+     *
+     * @param sql the generated SQL
+     * @param datasourceId the already-resolved datasource the SQL will run against
+     * @param scope the caller's data scope
+     * @return the enforced SQL
      */
-    private String enforce(String sql, DataScope scope) {
+    private String enforce(String sql, String datasourceId, DataScope scope) {
         String safeSql = safetyValidator.validateAndNormalize(sql);
-        String rewritten = rewriter.rewrite(safeSql, scope);
+        String rewritten = rewriter.rewrite(safeSql, scope, datasourceId);
         // Defense in depth: the serialized rewrite must still be a single read-only statement.
         return safetyValidator.validateAndNormalize(rewritten);
     }
@@ -290,14 +301,36 @@ public class Text2SqlPipelineService {
     /**
      * Appends a data-scope note so the answer states the restriction instead of silently returning a
      * narrower result (see the "越界问题的回答语义" requirement).
+     *
+     * <p>The label comes from the effective {@code FILTER} attributes, never the role name, so a
+     * custom role is described by what its policies actually do.
      */
-    private static String scopedExplanation(String explanation, DataScope scope) {
+    static String scopedExplanation(String explanation, DataScope scope) {
         if (scope == null || scope.bypassesDataScope()) {
             return explanation;
         }
-        String scopeText = scope.isStudent() ? "仅本人" : "所管班级";
-        String note = "结果已按当前账号的数据范围（" + scopeText + "）过滤";
+        String note = "结果已按当前账号的数据范围（" + scopeLabel(scope) + "）过滤";
         return (explanation == null || explanation.isBlank()) ? note : explanation + "（" + note + "）";
+    }
+
+    /** Labels the effective filter: personal rows, managed classes, or the generic policy wording. */
+    private static String scopeLabel(DataScope scope) {
+        Set<PrincipalAttribute> attributes =
+                scope.access() == null
+                        ? Set.of()
+                        : scope.access().dataScopes().stream()
+                                .filter(rule -> rule.policy() == DataScopePolicy.FILTER)
+                                .map(rule -> PrincipalAttribute.fromCode(rule.principalAttribute()))
+                                .flatMap(Optional::stream)
+                                .collect(Collectors.toCollection(LinkedHashSet::new));
+        if (attributes.contains(PrincipalAttribute.STUDENT_NO)
+                || attributes.contains(PrincipalAttribute.STUDENT_ID)) {
+            return "仅本人";
+        }
+        if (attributes.contains(PrincipalAttribute.CLASS_IDS)) {
+            return "所管班级";
+        }
+        return "当前数据范围";
     }
 
     /**
@@ -315,7 +348,10 @@ public class Text2SqlPipelineService {
             return "管理员：可见全部数据，不需要按调用者过滤。";
         }
         List<String> roleNames = scope.access().roles().stream().map(role -> role.name()).toList();
-        String description = roleNames.isEmpty() ? scope.access().roleCodes().toString() : String.join("、", roleNames);
+        String description =
+                roleNames.isEmpty()
+                        ? scope.access().roleCodes().toString()
+                        : String.join("、", roleNames);
         StringBuilder context = new StringBuilder(description).append("：");
         if (scope.studentNo() != null) {
             context.append("本人学号 ")

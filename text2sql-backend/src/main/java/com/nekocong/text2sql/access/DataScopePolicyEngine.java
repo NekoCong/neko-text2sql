@@ -27,11 +27,15 @@ public final class DataScopePolicyEngine {
      * @return the decision
      */
     public PolicyDecision decide(EffectiveAccess access, String datasourceId, String tableName) {
-        if (access == null || datasourceId == null || tableName == null) {
+        if (access == null) {
             return PolicyDecision.deny();
         }
+        // Checked first: a bypassing caller is unrestricted even when the datasource is unknown.
         if (access.bypassesDataScope()) {
             return PolicyDecision.all();
+        }
+        if (datasourceId == null || tableName == null) {
+            return PolicyDecision.deny();
         }
         List<DataScopeRule> rules = access.dataScopes().stream()
                 .filter(rule -> datasourceId.equals(rule.datasourceId()))

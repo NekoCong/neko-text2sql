@@ -155,7 +155,9 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
 
     @Override
     public Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId) {
-        // Idempotent: an existing grant keeps its row and the statement still completes.
+        // Idempotent: a pre-existing grant keeps its row, so zero affected rows is expected on a
+        // repeat call. "No enabled role carries the code" is detected separately, mirroring
+        // assignRoleByCode.
         return client.sql("INSERT INTO access_role_datasource (role_id, datasource_id)"
                         + " SELECT r.id, :ds FROM access_role r"
                         + " WHERE r.code = :code AND r.enabled = TRUE"
@@ -163,7 +165,8 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
                         + " WHERE d.role_id = r.id AND d.datasource_id = :ds)")
                 .bind("ds", datasourceId)
                 .bind("code", roleCode)
-                .then();
+                .then()
+                .then(requireRole(roleCode));
     }
 
     @Override
@@ -173,6 +176,19 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
                         + " AND role_id IN (SELECT id FROM access_role WHERE code = :code)")
                 .bind("ds", datasourceId)
                 .bind("code", roleCode)
+                .then();
+    }
+
+    /**
+     * Confirms an enabled role with the code exists, so a grant against a typo fails instead of
+     * silently doing nothing.
+     */
+    private Mono<Void> requireRole(String roleCode) {
+        return client.sql("SELECT 1 AS present FROM access_role WHERE code = :code AND enabled = TRUE")
+                .bind("code", roleCode)
+                .map((row, meta) -> Boolean.TRUE)
+                .one()
+                .switchIfEmpty(Mono.error(new IllegalStateException("角色不存在：" + roleCode)))
                 .then();
     }
 

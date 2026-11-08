@@ -264,7 +264,8 @@ class Text2SqlPipelineServiceTest {
         assertThat(failure.get()).contains("没有任何可用的数据源");
     }
 
-    private static int indexOf(List<Text2SqlEvent> events, Class<? extends Text2SqlEvent> type) {        for (int i = 0; i < events.size(); i++) {
+    private static int indexOf(List<Text2SqlEvent> events, Class<? extends Text2SqlEvent> type) {
+        for (int i = 0; i < events.size(); i++) {
             if (type.isInstance(events.get(i))) {
                 return i;
             }

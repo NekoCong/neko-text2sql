@@ -120,8 +120,12 @@ public class TablePolicy {
     }
 
     /**
-     * Resolves the datasource a request targets. A {@code null} id means "the default": the single
-     * effective grant, if there is exactly one. Anything else denies.
+     * Compatibility fallback for callers that do not know the resolved datasource. A {@code null} or
+     * blank id means "the default": the single effective grant, if there is exactly one. Anything
+     * else denies.
+     *
+     * <p>Enforcement call sites (the pipeline and the agent tools) pass the datasource they resolved
+     * themselves, so a caller granted several datasources is not mistaken for an unscoped one.
      *
      * @param scope the caller's scope
      * @param datasourceId the requested datasource id, or {@code null}
@@ -148,6 +152,12 @@ public class TablePolicy {
         if (!DataScopePolicyEngine.isSafeTable(name)) {
             return PolicyDecision.deny();
         }
-        return engine.decide(scope.access(), datasourceId(scope, datasourceId), name);
+        // An explicitly supplied id is authoritative: it is the datasource the statement runs
+        // against. Only fall back to the single-grant guess when the caller supplied none.
+        String effective =
+                datasourceId != null && !datasourceId.isBlank()
+                        ? datasourceId
+                        : datasourceId(scope, null);
+        return engine.decide(scope.access(), effective, name);
     }
 }

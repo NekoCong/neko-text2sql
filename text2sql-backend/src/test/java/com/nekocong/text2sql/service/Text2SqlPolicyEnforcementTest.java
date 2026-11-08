@@ -168,6 +168,21 @@ class Text2SqlPolicyEnforcementTest {
     }
 
     @Test
+    void theScopeNoteIsLabelledByTheEffectiveFilterNotTheRoleName() {
+        assertThat(Text2SqlPipelineService.scopedExplanation(null, AccessFixtures.student()))
+                .isEqualTo("结果已按当前账号的数据范围（仅本人）过滤");
+        assertThat(Text2SqlPipelineService.scopedExplanation(null, AccessFixtures.counselor()))
+                .isEqualTo("结果已按当前账号的数据范围（所管班级）过滤");
+        // username/userId rules are a policy the seeded roles never use: the generic wording applies.
+        DataScope byUsername = AccessFixtures.custom(
+                "auditor",
+                List.of(rule("a1", "campus", "student", DataScopePolicy.FILTER, "username", "username")),
+                Set.of());
+        assertThat(Text2SqlPipelineService.scopedExplanation(null, byUsername))
+                .isEqualTo("结果已按当前账号的数据范围（当前数据范围）过滤");
+    }
+
+    @Test
     void aCustomRoleIsFilteredFromItsPolicyAndSaysSo() {
         CountingExecutor executor = new CountingExecutor(realExecutor);
         DataScope teacher = AccessFixtures.custom(

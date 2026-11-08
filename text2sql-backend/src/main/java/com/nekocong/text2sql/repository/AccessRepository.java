@@ -13,6 +13,11 @@ import reactor.core.publisher.Mono;
  *
  * <p>These live in the application database on purpose: resolving who the caller is must never
  * require reading the protected business database.
+ *
+ * <p>Transitional: {@link #scopes} and {@link #datasourcesForRole} read the legacy tables.
+ * Principal attributes are now resolved by {@code R2dbcAccessControlRepository} and datasource
+ * grants by {@code access_role_datasource}; these two methods remain only until the legacy admin
+ * matrix is replaced (task 5.5), and must not gain new callers.
  */
 @Repository
 public class AccessRepository {
@@ -34,6 +39,9 @@ public class AccessRepository {
     /**
      * Reads every scope attribute of a user.
      *
+     * <p>TODO(task 5.5): legacy {@code user_scope} read; enforcement uses {@code
+     * R2dbcAccessControlRepository.principal} instead.
+     *
      * @param userId the user id
      * @return the scope rows, in insertion order
      */
@@ -51,6 +59,9 @@ public class AccessRepository {
 
     /**
      * Reads the datasources a role is allowed to query.
+     *
+     * <p>TODO(task 5.5): legacy {@code datasource_access} read; enforcement uses {@code
+     * access_role_datasource} via {@code R2dbcAccessControlRepository.datasourceIds}.
      *
      * @param role the canonical role
      * @return the allowed datasource ids

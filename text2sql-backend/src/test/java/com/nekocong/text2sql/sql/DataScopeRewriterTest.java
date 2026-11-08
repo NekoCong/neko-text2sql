@@ -50,7 +50,7 @@ class DataScopeRewriterTest {
 
     @Test
     void filtersATableWithoutAlias() {
-        String sql = rewriter.rewrite("SELECT student_no FROM student", student());
+        String sql = rewriter.rewrite("SELECT student_no FROM student", student(), CAMPUS);
 
         assertThat(sql).containsIgnoringCase("student_no IN ('2023001')");
         assertThat(compact(sql)).contains(") as student");
@@ -63,7 +63,8 @@ class DataScopeRewriterTest {
                 rewriter.rewrite(
                         "SELECT s.name, avg(sc.score) FROM score sc JOIN student s ON s.id = sc.student_id "
                                 + "GROUP BY s.name",
-                        student());
+                        student(),
+                        CAMPUS);
 
         assertThat(sql).containsIgnoringCase("AS sc").containsIgnoringCase("AS s");
         assertThat(sql).containsIgnoringCase("student_id IN (1)");
@@ -74,7 +75,7 @@ class DataScopeRewriterTest {
     void filtersEveryBranchOfAUnion() {
         String sql =
                 rewriter.rewrite(
-                        "SELECT student_no FROM student UNION SELECT student_no FROM student", student());
+                        "SELECT student_no FROM student UNION SELECT student_no FROM student", student(), CAMPUS);
 
         assertThat(countOccurrences(sql.toLowerCase(), "student_no in ('2023001')")).isEqualTo(2);
     }
@@ -84,7 +85,8 @@ class DataScopeRewriterTest {
         String sql =
                 rewriter.rewrite(
                         "SELECT name FROM student WHERE class_id IN (SELECT class_id FROM student)",
-                        student());
+                        student(),
+                        CAMPUS);
 
         assertThat(countOccurrences(sql, "SELECT * FROM student")).isEqualTo(2);
     }
@@ -93,7 +95,7 @@ class DataScopeRewriterTest {
     void rewritesCteBodiesButLeavesCteReferencesAlone() {
         String sql =
                 rewriter.rewrite(
-                        "WITH x AS (SELECT * FROM score) SELECT * FROM x", student());
+                        "WITH x AS (SELECT * FROM score) SELECT * FROM x", student(), CAMPUS);
 
         assertThat(sql).containsIgnoringCase("student_id IN (1)");
         // The outer reference is a CTE, not a physical table, so it must not be wrapped again.
@@ -103,7 +105,7 @@ class DataScopeRewriterTest {
     @Test
     void counselorFiltersByManagedClasses() {
         String sql =
-                rewriter.rewrite("SELECT class_id, count(*) FROM score GROUP BY class_id", counselor());
+                rewriter.rewrite("SELECT class_id, count(*) FROM score GROUP BY class_id", counselor(), CAMPUS);
 
         assertThat(compact(sql)).contains("class_id in (1,2)");
         assertThat(compact(sql)).doesNotContain("student_id in");
@@ -113,19 +115,19 @@ class DataScopeRewriterTest {
     void adminStatementIsReturnedUnchanged() {
         String sql = "SELECT * FROM student";
 
-        assertThat(rewriter.rewrite(sql, admin())).isEqualTo(sql);
+        assertThat(rewriter.rewrite(sql, admin(), CAMPUS)).isEqualTo(sql);
     }
 
     @Test
     void rejectsTablesOutsideTheWhitelist() {
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM salary", student()))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM salary", student(), CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("salary");
     }
 
     @Test
     void rejectsUnparsableSql() {
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT FROM", student()))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT FROM", student(), CAMPUS))
                 .isInstanceOf(SqlPermissionException.class);
     }
 
@@ -133,7 +135,7 @@ class DataScopeRewriterTest {
     void filtersExistsSubqueries() {
         String sql =
                 rewriter.rewrite(
-                        "SELECT name FROM student WHERE EXISTS (SELECT 1 FROM score)", student());
+                        "SELECT name FROM student WHERE EXISTS (SELECT 1 FROM score)", student(), CAMPUS);
 
         assertThat(compact(sql)).contains("student_id in (1)");
         assertThat(compact(sql)).contains("student_no in ('2023001')");
@@ -144,7 +146,8 @@ class DataScopeRewriterTest {
         String sql =
                 rewriter.rewrite(
                         "SELECT (SELECT student_no FROM student ORDER BY (SELECT MAX(score) FROM score)) FROM student",
-                        student());
+                        student(),
+                        CAMPUS);
 
         assertThat(compact(sql)).contains("student_id in (1)");
     }
@@ -152,7 +155,7 @@ class DataScopeRewriterTest {
     @Test
     void rejectsValuesQueries() {
         assertThatThrownBy(
-                        () -> rewriter.rewrite("WITH v AS (VALUES (1)) SELECT * FROM v", student()))
+                        () -> rewriter.rewrite("WITH v AS (VALUES (1)) SELECT * FROM v", student(), CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("VALUES");
     }
@@ -163,7 +166,8 @@ class DataScopeRewriterTest {
                         () ->
                                 rewriter.rewrite(
                                         "SELECT name FROM student WHERE EXISTS (SELECT 1 FROM salary)",
-                                        student()))
+                                        student(),
+                                        CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("salary");
     }
@@ -174,7 +178,8 @@ class DataScopeRewriterTest {
                 rewriter.rewrite(
                         "SELECT student_no FROM student UNION SELECT student_no FROM student "
                                 + "ORDER BY (SELECT MAX(score) FROM score)",
-                        student());
+                        student(),
+                        CAMPUS);
 
         assertThat(compact(sql)).contains("student_id in (1)");
     }
@@ -186,14 +191,15 @@ class DataScopeRewriterTest {
                                 rewriter.rewrite(
                                         "SELECT student_no FROM student UNION SELECT student_no FROM student "
                                                 + "ORDER BY (SELECT score FROM salary)",
-                                        student()))
+                                        student(),
+                                        CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("salary");
     }
 
     @Test
     void rejectsSelectInto() {
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student INTO backup", student()))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student INTO backup", student(), CAMPUS))
                 .isInstanceOf(SqlPermissionException.class);
     }
 
@@ -202,7 +208,8 @@ class DataScopeRewriterTest {
         String sql =
                 rewriter.rewrite(
                         "WITH a AS (WITH b AS (SELECT * FROM score) SELECT * FROM b) SELECT * FROM a",
-                        student());
+                        student(),
+                        CAMPUS);
 
         assertThat(countOccurrences(compact(sql), "student_id in (1)")).isEqualTo(1);
         assertThat(compact(sql)).doesNotContain("as b").doesNotContain("as a");
@@ -210,7 +217,7 @@ class DataScopeRewriterTest {
 
     @Test
     void givesRepeatedTableReferencesDistinctAliases() {
-        String sql = rewriter.rewrite("SELECT 1 FROM student, student", student());
+        String sql = rewriter.rewrite("SELECT 1 FROM student, student", student(), CAMPUS);
 
         assertThat(sql).containsIgnoringCase("AS student_sp1");
     }
@@ -218,10 +225,10 @@ class DataScopeRewriterTest {
     @Test
     void aCustomRoleIsEnforcedFromItsPolicyNotItsName() {
         // The role code "teacher" is unknown to the legacy code; only the DB policy can filter score.
-        String sql = rewriter.rewrite("SELECT AVG(score) FROM score", customTeacher());
+        String sql = rewriter.rewrite("SELECT AVG(score) FROM score", customTeacher(), CAMPUS);
 
         assertThat(compact(sql)).contains("class_id in (1)");
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", customTeacher()))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", customTeacher(), CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("student");
     }
@@ -237,7 +244,7 @@ class DataScopeRewriterTest {
                 "2023002",
                 null);
 
-        String sql = rewriter.rewrite("SELECT * FROM student", scope);
+        String sql = rewriter.rewrite("SELECT * FROM student", scope, CAMPUS);
 
         assertThat(compact(sql)).contains("(student_no in ('2023002')) or (class_id in (2))");
     }
@@ -249,7 +256,7 @@ class DataScopeRewriterTest {
                 List.of(rule("u1", CAMPUS, "student", DataScopePolicy.FILTER, "username", "username")),
                 Set.of());
 
-        String sql = rewriter.rewrite("SELECT * FROM student", scope);
+        String sql = rewriter.rewrite("SELECT * FROM student", scope, CAMPUS);
 
         assertThat(sql).contains("'o''brien'");
     }
@@ -261,7 +268,7 @@ class DataScopeRewriterTest {
                 List.of(rule("g1", CAMPUS, "score", DataScopePolicy.FILTER, "student_id", "studentId")),
                 Set.of(1L));
 
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noStudentId))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noStudentId, CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("studentId");    }
 
@@ -272,7 +279,7 @@ class DataScopeRewriterTest {
                 List.of(rule("c1", CAMPUS, "score", DataScopePolicy.FILTER, "class_id", "classIds")),
                 Set.of());
 
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noClasses))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noClasses, CAMPUS))
                 .isInstanceOf(SqlPermissionException.class);
     }
 
@@ -283,7 +290,7 @@ class DataScopeRewriterTest {
                 List.of(rule("d1", CAMPUS, "student", DataScopePolicy.DENY, null, null)),
                 Set.of(1L));
 
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT name FROM student", denied))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT name FROM student", denied, CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("student");
     }
@@ -292,12 +299,63 @@ class DataScopeRewriterTest {
     void aScopeWithoutResolvedAccessIsRejected() {
         DataScope legacy = new DataScope("u", "student", Set.of(1L), 1L, "2023001", Set.of(CAMPUS));
 
-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", legacy))
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", legacy, CAMPUS))
                 .isInstanceOf(SqlPermissionException.class);
     }
 
-    private static String compact(String sql) {
-        return sql.toLowerCase().replaceAll("\\s+", " ").replaceAll(",\\s*", ",");
+    @Test
+    void usesTheExplicitDatasourceIdForACallerWithSeveralGrants() {
+        // Two grants: the single-grant fallback cannot guess, so passing the resolved id is what
+        // makes the multi-datasource caller usable.
+        DataScope multi = multiGrantStudent();
+        TablePolicy policy = new TablePolicy();
+        assertThat(policy.visibleTables(multi, null)).isEmpty();
+        assertThatThrownBy(() -> policy.predicates(multi, null, "student"))
+                .isInstanceOf(SqlPermissionException.class);
+
+        String sql = rewriter.rewrite("SELECT student_no FROM student", multi, CAMPUS);
+
+        assertThat(sql).containsIgnoringCase("student_no IN ('2023001')");
+    }
+
+    @Test
+    void theExplicitDatasourceIdSelectsThatDatasourcesPolicies() {
+        // The student policies only exist for campus: the same caller is denied on the other grant.
+        DataScope multi = multiGrantStudent();
+
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT student_no FROM student", multi, "archive"))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void escapesBackslashesAsWellAsQuotes() {
+        // The literal renderer is the single place a principal value becomes SQL text. A backslash is
+        // doubled so a following quote cannot be reinterpreted as an escape on a MySQL-family parser.
+        assertThat(DataScopeRewriter.quote("2023001")).isEqualTo("'2023001'");
+        assertThat(DataScopeRewriter.quote("o'brien")).isEqualTo("'o''brien'");
+        assertThat(DataScopeRewriter.quote("a\\")).isEqualTo("'a\\\\'");
+        assertThat(DataScopeRewriter.quote("a\\'b")).isEqualTo("'a\\\\''b'");
+    }
+
+    @Test
+    void anAdminIsUnrestrictedEvenOnAnUnknownDatasource() {
+        assertThat(rewriter.rewrite("SELECT * FROM student", admin(), "unknown")).isEqualTo(
+                "SELECT * FROM student");
+    }
+
+    private static DataScope multiGrantStudent() {
+        DataScope base = AccessFixtures.student();
+        return DataScope.from(new com.nekocong.text2sql.access.EffectiveAccess(
+                base.access().userId(),
+                base.access().roles(),
+                base.access().permissions(),
+                Set.of(CAMPUS, "archive"),
+                base.access().dataScopes(),
+                base.access().principal()));
+    }
+
+    private static String compact(String sql) {        return sql.toLowerCase().replaceAll("\\s+", " ").replaceAll(",\\s*", ",");
     }
 
     private static int countOccurrences(String text, String needle) {

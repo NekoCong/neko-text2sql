@@ -109,7 +109,8 @@ class DataScopeResolverTest {
                 .isInstanceOf(ResponseStatusException.class)
                 .satisfies(ex -> assertThat(((ResponseStatusException) ex).getStatusCode())
                         .isEqualTo(HttpStatus.UNAUTHORIZED));
-        assertThatThrownBy(() -> resolver.resolve(userId, "student").block())
+        // The 2-arg overload was removed so every caller must pass the token version.
+        assertThatThrownBy(() -> resolver.resolve(userId, "student", null).block())
                 .isInstanceOf(ResponseStatusException.class);
     }
 

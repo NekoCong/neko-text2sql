@@ -80,6 +80,7 @@ public interface AccessControlRepository {
 
     /**
      * Grants the enabled role with the given code access to a datasource, if not already granted.
+     * Idempotent.
      *
      * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
      * @param datasourceId the datasource id

@@ -6,6 +6,7 @@ import com.nekocong.text2sql.knowledge.api.dto.KnowledgeQueryRequest;
 import com.nekocong.text2sql.knowledge.service.KnowledgeSearchService;
 import com.nekocong.text2sql.security.DataScopeResolver;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.security.TokenClaims;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
@@ -77,7 +78,10 @@ public class KnowledgeRetrievalController {
 
     private Mono<SearchResult> execute(KnowledgeQueryRequest request, Jwt jwt) {
         return scopes
-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(
+                        jwt.getSubject(),
+                        jwt.getClaimAsString(Roles.CLAIM),
+                        TokenClaims.tokenVersion(jwt))
                 .flatMap(scope -> Mono.fromCallable(() -> search.search(
                                 scope,
                                 request.datasourceId(),

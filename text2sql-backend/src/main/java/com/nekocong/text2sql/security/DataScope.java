@@ -85,16 +85,6 @@ public record DataScope(
     }
 
     /**
-     * Creates an unrestricted scope for an administrator.
-     *
-     * @param userId the admin user id
-     * @return the admin scope, without a resolved access (fails closed at the enforcement points)
-     */
-    public static DataScope admin(String userId) {
-        return new DataScope(userId, Roles.ADMIN, Set.of(), null, null, Set.of());
-    }
-
-    /**
      * Reports whether this scope bypasses table, row and datasource restrictions.
      *
      * @return {@code true} when the resolved access holds the bypass permission

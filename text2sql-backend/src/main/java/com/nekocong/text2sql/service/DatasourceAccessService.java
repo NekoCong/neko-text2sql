@@ -57,6 +57,9 @@ public class DatasourceAccessService {
     /**
      * Grants a role access to a datasource, then returns the new matrix.
      *
+     * <p>Ordered so a mid-way failure can only ever leave enforcement <em>narrower</em> than the
+     * matrix: the legacy row is written first, then the enforcement row.
+     *
      * @param role the role
      * @param datasourceId the datasource id
      * @return the matrix
@@ -72,6 +75,9 @@ public class DatasourceAccessService {
     /**
      * Revokes a role's access to a datasource, then returns the new matrix.
      *
+     * <p>Ordered the opposite way from {@link #grant}: the enforcement row is deleted <em>first</em>,
+     * so a mid-way failure can only leave enforcement narrower than the matrix, never wider.
+     *
      * @param role the role
      * @param datasourceId the datasource id
      * @return the matrix
@@ -79,8 +85,9 @@ public class DatasourceAccessService {
     public Mono<DatasourceAccessMatrix> revoke(String role, String datasourceId) {
         String canonical = requireRole(role);
         requireDatasource(datasourceId);
-        return access.revoke(canonical, datasourceId)
-                .then(accessControl.revokeDatasourceByCode(canonical, datasourceId))
+        return accessControl
+                .revokeDatasourceByCode(canonical, datasourceId)
+                .then(access.revoke(canonical, datasourceId))
                 .then(matrix());
     }
 

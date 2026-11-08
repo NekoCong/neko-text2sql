@@ -33,7 +33,7 @@ class DataPermissionIntegrationTest {
 
     private QueryResult run(String sql, DataScope scope) {
         String safe = safetyValidator.validateAndNormalize(sql);
-        return executor.executeBlocking("campus", rewriter.rewrite(safe, scope));
+        return executor.executeBlocking("campus", rewriter.rewrite(safe, scope, "campus"));
     }
 
     @Test
