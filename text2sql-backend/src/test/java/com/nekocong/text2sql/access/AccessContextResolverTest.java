@@ -142,5 +142,10 @@ class AccessContextResolverTest {
         public Mono<PrincipalAttributes> principal(String userId, String username) {
             return Mono.just(PRINCIPAL);
         }
+
+        @Override
+        public Mono<Void> assignRoleByCode(String userId, String roleCode) {
+            return Mono.empty();
+        }
     }
 }

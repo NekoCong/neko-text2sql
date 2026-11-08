@@ -13,7 +13,8 @@ import reactor.core.publisher.Mono;
 @Repository
 public class UserRepository {
 
-    private static final String COLUMNS = "id, username, password_hash, display_name, role";
+    private static final String COLUMNS =
+            "id, username, password_hash, display_name, role, enabled, token_version";
 
     private final DatabaseClient client;
 
@@ -73,15 +74,19 @@ public class UserRepository {
                         .bind("role", role)
                         .bind("createdAt", System.currentTimeMillis());
         spec = displayName == null ? spec.bindNull("displayName", String.class) : spec.bind("displayName", displayName);
-        return spec.then().thenReturn(new AppUser(id, username, passwordHash, displayName, role));
+        // enabled and token_version are left to the column defaults (TRUE / 0).
+        return spec.then().thenReturn(new AppUser(id, username, passwordHash, displayName, role, true, 0));
     }
 
     private static AppUser map(io.r2dbc.spi.Row row) {
+        Integer tokenVersion = row.get("token_version", Integer.class);
         return new AppUser(
                 row.get("id", String.class),
                 row.get("username", String.class),
                 row.get("password_hash", String.class),
                 row.get("display_name", String.class),
-                row.get("role", String.class));
+                row.get("role", String.class),
+                Boolean.TRUE.equals(row.get("enabled", Boolean.class)),
+                tokenVersion == null ? 0 : tokenVersion);
     }
 }

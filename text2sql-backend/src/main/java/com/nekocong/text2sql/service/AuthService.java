@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.service;
 
+import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.repository.UserRepository;
 import com.nekocong.text2sql.security.JwtService;
 import com.nekocong.text2sql.security.Roles;
@@ -18,10 +19,11 @@ import reactor.core.scheduler.Schedulers;
  * delegated to {@link UserRepository} and token issuance to {@link JwtService}. CPU-bound password
  * hashing runs on a bounded-elastic scheduler so it never blocks the event loop.
  *
- * <p>Self-service registration always creates a {@link Roles#STUDENT}; elevated roles are assigned
- * out of band (seed SQL or a direct database update), so the registration endpoint cannot be used
- * for privilege escalation. A freshly registered student has no data scope yet and is therefore
- * rejected by the data-permission layer until one is configured.
+ * <p>Self-service registration always creates a {@link Roles#STUDENT} and assigns the built-in
+ * {@code student} role in the access-control tables; elevated roles are assigned out of band, so the
+ * registration endpoint cannot be used for privilege escalation. A freshly registered student has
+ * no data scope configured until one exists, so the data-permission layer rejects its queries in the
+ * meantime.
  */
 @Service
 public class AuthService {
@@ -29,6 +31,7 @@ public class AuthService {
     private static final int MIN_PASSWORD_LENGTH = 6;
 
     private final UserRepository users;
+    private final AccessControlRepository access;
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
 
@@ -36,11 +39,17 @@ public class AuthService {
      * Creates the service.
      *
      * @param users the user repository
+     * @param access the access-control repository used to assign the built-in role
      * @param passwordEncoder the password encoder
      * @param jwtService the token issuer
      */
-    public AuthService(UserRepository users, PasswordEncoder passwordEncoder, JwtService jwtService) {
+    public AuthService(
+            UserRepository users,
+            AccessControlRepository access,
+            PasswordEncoder passwordEncoder,
+            JwtService jwtService) {
         this.users = users;
+        this.access = access;
         this.passwordEncoder = passwordEncoder;
         this.jwtService = jwtService;
     }
@@ -74,6 +83,15 @@ public class AuthService {
                                             () ->
                                                     encode(secret)
                                                             .flatMap(hash -> users.insert(name, hash, display, Roles.STUDENT))
+                                                            .flatMap(
+                                                                    user ->
+                                                                            access.assignRoleByCode(user.id(), Roles.STUDENT)
+                                                                                    .onErrorMap(
+                                                                                            error ->
+                                                                                                    new ResponseStatusException(
+                                                                                                            HttpStatus.INTERNAL_SERVER_ERROR,
+                                                                                                            "内置 student 角色缺失"))
+                                                                                    .thenReturn(user))
                                                             .map(this::issue)));
                 });
     }
@@ -89,11 +107,17 @@ public class AuthService {
         return users.findByUsername(username == null ? "" : username)
                 .switchIfEmpty(Mono.error(invalidCredentials()))
                 .flatMap(
-                        user ->
-                                verify(password, user)
-                                        .filter(Boolean::booleanValue)
-                                        .map(ok -> issue(user))
-                                        .switchIfEmpty(Mono.error(invalidCredentials())));
+                        user -> {
+                            if (!user.enabled()) {
+                                return Mono.error(
+                                        new ResponseStatusException(
+                                                HttpStatus.UNAUTHORIZED, "账号已停用，请联系管理员"));
+                            }
+                            return verify(password, user)
+                                    .filter(Boolean::booleanValue)
+                                    .map(ok -> issue(user))
+                                    .switchIfEmpty(Mono.error(invalidCredentials()));
+                        });
     }
 
     /**
@@ -121,7 +145,7 @@ public class AuthService {
     private AuthResult issue(AppUser user) {
         String canonical = Roles.normalize(user.role());
         return new AuthResult(
-                jwtService.issue(user.id(), user.username(), user.role()),
+                jwtService.issue(user.id(), user.username(), user.role(), user.tokenVersion()),
                 jwtService.ttlSeconds(),
                 user.id(),
                 user.username(),

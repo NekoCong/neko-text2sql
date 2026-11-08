@@ -1,6 +1,7 @@
 package com.nekocong.text2sql.config;
 
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
+import com.nekocong.text2sql.access.AccessContextResolver;
 import com.nekocong.text2sql.security.Roles;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
@@ -13,6 +14,7 @@ import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AbstractAuthenticationToken;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
+import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
 import org.springframework.security.config.web.server.ServerHttpSecurity;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -46,13 +48,33 @@ import reactor.core.publisher.Mono;
 public class SecurityConfig {
 
     /**
+     * The account-status filter.
+     *
+     * <p>Deliberately declared here rather than as a {@code @Component}: Spring Boot installs every
+     * {@code WebFilter} bean on the web handler chain as well as the security chain, so a component
+     * would run twice (once before authentication). It is placed explicitly in the security chain
+     * below instead.
+     *
+     * @param resolver the access-context resolver
+     * @param jwtDecoder the JWT decoder used to read the bearer token
+     * @return the filter
+     */
+    @Bean
+    AccessStatusWebFilter accessStatusWebFilter(
+            AccessContextResolver resolver, ReactiveJwtDecoder jwtDecoder) {
+        return new AccessStatusWebFilter(resolver, jwtDecoder);
+    }
+
+    /**
      * The security filter chain.
      *
      * @param http the server HTTP security builder
+     * @param accessStatus the account-status filter, run after bearer authentication
      * @return the filter chain
      */
     @Bean
-    SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http) {
+    SecurityWebFilterChain springSecurityFilterChain(
+            ServerHttpSecurity http, AccessStatusWebFilter accessStatus) {
         ServerBearerTokenAuthenticationConverter bearerTokenConverter =
                 new ServerBearerTokenAuthenticationConverter();
         // Allow `?access_token=...` so the SSE endpoint works from the browser's EventSource.
@@ -97,7 +119,10 @@ public class SecurityConfig {
                 .oauth2ResourceServer(
                         oauth2 ->
                                 oauth2.bearerTokenConverter(bearerTokenConverter)
-                                        .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())));
+                                        .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())))
+                // Re-checks the account (enabled, token version) and publishes the resolved
+                // EffectiveAccess on the exchange before the controller runs.
+                .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHORIZATION);
         return http.build();
     }
 

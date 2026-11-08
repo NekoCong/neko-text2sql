@@ -10,6 +10,7 @@ spring:
     init:
       mode: always
       schema-locations: classpath:db/app-schema.sql
+      data-locations: classpath:db/test-access-data.sql
 
 # The demo *target* datasource stays on in-memory H2 here. application.yml points it at MySQL, but
 # the suite must run without an external server, and a later `text2sql.datasources.items` list

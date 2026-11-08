@@ -2,8 +2,10 @@ package com.nekocong.text2sql.web;
 
 import java.util.Map;
 import java.util.UUID;
+import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.repository.UserRepository;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.user.AppUser;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -29,6 +31,9 @@ class AuthControllerTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private AccessControlRepository access;
 
     private WebTestClient client;
 
@@ -71,7 +76,9 @@ class AuthControllerTest {
         // Accounts created before the campus dataset carry the legacy "user" role. Signing in must
         // not blow up on an unrecognized role claim; the permission layer rejects the scope later.
         String username = "legacy" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
-        users.insert(username, passwordEncoder.encode("secret123"), "Legacy", Roles.USER).block();
+        AppUser user = users.insert(username, passwordEncoder.encode("secret123"), "Legacy", Roles.USER).block();
+        // The account-status filter requires at least one enabled role, so assign one here.
+        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
 
         String token = TestAuth.login(client, username, "secret123");
 

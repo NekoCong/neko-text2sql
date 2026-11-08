@@ -3,8 +3,10 @@ package com.nekocong.text2sql.web;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.repository.UserRepository;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.user.AppUser;
 import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
@@ -38,6 +40,9 @@ class ConversationRoleAccessTest {
     @Autowired
     private PasswordEncoder passwordEncoder;
 
+    @Autowired
+    private AccessControlRepository access;
+
     private WebTestClient client;
     private String ownerToken;
     private String otherToken;
@@ -49,7 +54,8 @@ class ConversationRoleAccessTest {
         ownerToken = TestAuth.registerAndLogin(client);
         otherToken = TestAuth.registerAndLogin(client);
         String adminName = "admin" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
-        users.insert(adminName, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
+        AppUser admin = users.insert(adminName, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
+        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
         adminToken = TestAuth.login(client, adminName, PASSWORD);
     }
 

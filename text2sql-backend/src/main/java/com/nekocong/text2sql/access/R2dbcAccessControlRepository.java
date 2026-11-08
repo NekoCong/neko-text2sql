@@ -134,6 +134,21 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
                 .map(rows -> buildPrincipal(userId, username, rows));
     }
 
+    @Override
+    public Mono<Void> assignRoleByCode(String userId, String roleCode) {
+        return client.sql("INSERT INTO access_user_role (user_id, role_id, created_at)"
+                        + " SELECT :userId, id, :createdAt FROM access_role"
+                        + " WHERE code = :code AND enabled = TRUE")
+                .bind("userId", userId)
+                .bind("createdAt", System.currentTimeMillis())
+                .bind("code", roleCode)
+                .fetch()
+                .rowsUpdated()
+                .flatMap(rows -> rows == null || rows == 0L
+                        ? Mono.error(new IllegalStateException("角色不存在：" + roleCode))
+                        : Mono.empty());
+    }
+
     private static PrincipalAttributes buildPrincipal(
             String userId, String username, List<String[]> rows) {
         Set<Long> classIds = new LinkedHashSet<>();

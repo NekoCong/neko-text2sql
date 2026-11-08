@@ -13,9 +13,11 @@ import org.springframework.stereotype.Component;
 /**
  * Issues signed JWTs for authenticated users.
  *
- * <p>The token subject is the user id; {@code username} and {@code role} claims are included for
- * convenience. The role is a snapshot taken at sign-in time, so a role change only takes effect
- * after the user signs in again.
+ * <p>The token subject is the user id. The {@code role} claim is display-only: authorization is
+ * resolved from the access-control tables on every request, so a role change applies to the next
+ * request. The {@code ver} claim is the session version of the account; a token whose version does
+ * not match {@code app_user.token_version} is rejected, which invalidates every token issued before
+ * an account is disabled, re-enabled or has its password changed.
  */
 @Component
 public class JwtService {
@@ -40,9 +42,10 @@ public class JwtService {
      * @param userId the user id (token subject)
      * @param username the username claim
      * @param role the role claim ({@code admin}, {@code student} or {@code counselor})
+     * @param tokenVersion the session version of the account ({@code ver} claim)
      * @return the compact JWT
      */
-    public String issue(String userId, String username, String role) {
+    public String issue(String userId, String username, String role, int tokenVersion) {
         Instant now = Instant.now();
         String canonical = Roles.normalize(role);
         // Legacy or unrecognized roles are preserved verbatim so the token stays issuable; the
@@ -54,6 +57,7 @@ public class JwtService {
                         .subject(userId)
                         .claim("username", username)
                         .claim(Roles.CLAIM, claimRole)
+                        .claim("ver", tokenVersion)
                         .issuedAt(now)
                         .expiresAt(now.plus(properties.getTokenTtlMinutes(), ChronoUnit.MINUTES))
                         .build();

@@ -3,6 +3,7 @@ package com.nekocong.text2sql.web;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
 import com.nekocong.text2sql.repository.UserRepository;
 import com.nekocong.text2sql.security.DataScope;
@@ -36,6 +37,9 @@ class DatasourceAccessControllerTest {
 
     @Autowired
     private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private AccessControlRepository access;
 
     @Autowired
     private DataScopeResolver resolver;
@@ -116,8 +120,8 @@ class DatasourceAccessControllerTest {
     @Test
     void revokedDatasourceMakesTheSyncQueryReturn403() {
         String username = "student" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
-        AppUser user =
-                users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
+        AppUser user = users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
+        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
         insertScope(user.id(), "class_id", "1");
         insertScope(user.id(), "student_id", "1");
         insertScope(user.id(), "student_no", "2023001");
@@ -156,14 +160,15 @@ class DatasourceAccessControllerTest {
 
     private String adminToken() {
         String username = "admin" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
-        users.insert(username, passwordEncoder.encode("secret123"), "Admin", Roles.ADMIN).block();
+        AppUser admin = users.insert(username, passwordEncoder.encode("secret123"), "Admin", Roles.ADMIN).block();
+        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
         return TestAuth.login(client, username, "secret123");
     }
 
     private AppUser studentUser() {
         String username = "student" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
-        AppUser user =
-                users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
+        AppUser user = users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
+        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
         insertScope(user.id(), "class_id", "1");
         insertScope(user.id(), "student_id", "1");
         insertScope(user.id(), "student_no", "2023001");
@@ -199,3 +204,4 @@ class DatasourceAccessControllerTest {
                 .isOk();
     }
 }
+

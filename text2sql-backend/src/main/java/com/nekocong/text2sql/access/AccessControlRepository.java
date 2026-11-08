@@ -68,4 +68,13 @@ public interface AccessControlRepository {
      * @return the attributes
      */
     Mono<PrincipalAttributes> principal(String userId, String username);
+
+    /**
+     * Assigns the enabled role with the given code to a user, if not already assigned.
+     *
+     * @param userId the user id
+     * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
+     * @return completion, or an error when no enabled role carries that code
+     */
+    Mono<Void> assignRoleByCode(String userId, String roleCode);
 }
