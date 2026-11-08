@@ -65,7 +65,7 @@ public class FullSchemaProvider implements SchemaProvider {
         DataSource dataSource = registry.resolve(datasourceId);
         List<TableSchema> tables =
                 introspector.introspect(dataSource).stream()
-                        .filter(table -> policy.allows(scope, table.name()))
+                        .filter(table -> policy.allows(scope, datasourceId, table.name()))
                         .toList();
         return render(tables);
     }

@@ -5,6 +5,7 @@ import com.nekocong.text2sql.controller.dto.DataSourceView;
 import com.nekocong.text2sql.datasource.ConnectionTestResult;
 import com.nekocong.text2sql.security.DataScopeResolver;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.security.TokenClaims;
 import com.nekocong.text2sql.service.DataSourceService;
 import java.util.List;
 import java.util.NoSuchElementException;
@@ -58,7 +59,7 @@ public class DataSourceController {
     @GetMapping
     public Mono<List<DataSourceView>> list(@AuthenticationPrincipal Jwt jwt) {
         return scopes
-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM), TokenClaims.tokenVersion(jwt))
                 .map(
                         scope -> {
                             String defaultId = service.defaultId();

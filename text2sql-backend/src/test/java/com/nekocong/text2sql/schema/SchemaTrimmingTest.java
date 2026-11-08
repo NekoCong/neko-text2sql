@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.TablePolicy;
 import com.nekocong.text2sql.tool.SqlTools;
@@ -61,7 +62,7 @@ class SchemaTrimmingTest {
 
     @Test
     void studentSchemaHidesTheNonWhitelistedTable() {
-        String ddl = fullSchemaProvider.renderForPrompt(null, studentScope(), "工资");
+        String ddl = fullSchemaProvider.renderForPrompt("campus", studentScope(), "工资");
 
         assertThat(ddl).doesNotContainIgnoringCase(HIDDEN_TABLE);
         assertThat(ddl).containsIgnoringCase("CREATE TABLE student");
@@ -69,9 +70,27 @@ class SchemaTrimmingTest {
 
     @Test
     void adminSchemaIncludesEveryTable() {
-        String ddl = fullSchemaProvider.renderForPrompt(null, DataScope.admin("u-admin"), "工资");
+        String ddl = fullSchemaProvider.renderForPrompt("campus", AccessFixtures.admin(), "工资");
 
         assertThat(ddl).containsIgnoringCase(HIDDEN_TABLE);
+    }
+
+    @Test
+    void aScopeWithoutResolvedAccessSeesNothing() {
+        // Fail closed: the legacy 6-arg constructor carries no access, so no table is visible.
+        DataScope legacy = new DataScope("u", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+
+        assertThat(fullSchemaProvider.renderForPrompt("campus", legacy, "工资"))
+                .doesNotContainIgnoringCase("CREATE TABLE");
+    }
+
+    @Test
+    void noResolvedAccessMeansNoTablesEvenWithTheDefaultDatasource() {
+        // A default datasource (null id) must not rescue a scope that has no resolved access.
+        DataScope legacy = new DataScope("u", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+
+        assertThat(fullSchemaProvider.renderForPrompt(null, legacy, "工资"))
+                .doesNotContainIgnoringCase("CREATE TABLE");
     }
 
     @Test
@@ -87,8 +106,8 @@ class SchemaTrimmingTest {
     void adminMetadataToolsSeeTheHiddenTable() {
         SqlTools tools = tools();
 
-        assertThat(tools.listTables(null, DataScope.admin("u-admin"))).contains(HIDDEN_TABLE);
-        assertThat(tools.describeTable(HIDDEN_TABLE, null, DataScope.admin("u-admin")))
+        assertThat(tools.listTables(null, AccessFixtures.admin())).contains(HIDDEN_TABLE);
+        assertThat(tools.describeTable(HIDDEN_TABLE, null, AccessFixtures.admin()))
                 .containsIgnoringCase("CREATE TABLE " + HIDDEN_TABLE);
     }
 
@@ -105,6 +124,6 @@ class SchemaTrimmingTest {
     }
 
     private static DataScope studentScope() {
-        return new DataScope("u-student", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+        return AccessFixtures.student();
     }
 }

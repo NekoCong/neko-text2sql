@@ -159,7 +159,7 @@ public class KnowledgeSearchService {
         String id = datasourceGuard.resolve(scope, datasourceId);
         String query = question == null ? "" : question.strip();
         int limit = (topK == null || topK <= 0) ? properties.getTopK() : topK;
-        Set<String> allowedTables = scope.isAdmin() ? null : tablePolicy.tablesFor(scope.role());
+        Set<String> allowedTables = tablePolicy.visibleTables(scope, id);
         String rewritten = rewrite(id, query);
 
         List<VectorHit> business = List.of();
@@ -378,7 +378,7 @@ public class KnowledgeSearchService {
 
     private String renderFull(String datasourceId, DataScope scope) {
         List<TableSchema> tables = introspector.introspect(registry.resolve(datasourceId)).stream()
-                .filter(table -> tablePolicy.allows(scope, table.name()))
+                .filter(table -> tablePolicy.allows(scope, datasourceId, table.name()))
                 .toList();
         return renderWithinBudget(tables);
     }

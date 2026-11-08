@@ -103,8 +103,7 @@ class DatasourceAccessControllerTest {
         AppUser user = studentUser();
         revoke("student", "campus", adminToken);
 
-        DataScope student = resolver.resolve(user.id(), "student").block();
-
+        DataScope student = resolver.resolve(user.id(), "student", 0).block();
         assertThat(student).isNotNull();
         assertThat(student.allowedDatasources()).isEmpty();
         assertThatThrownBy(() -> guard.resolve(student, null))
@@ -112,7 +111,7 @@ class DatasourceAccessControllerTest {
 
         grant("student", "campus", adminToken);
 
-        DataScope restored = resolver.resolve(user.id(), "student").block();
+        DataScope restored = resolver.resolve(user.id(), "student", 0).block();
         assertThat(restored).isNotNull();
         assertThat(guard.resolve(restored, null)).isEqualTo("campus");
     }

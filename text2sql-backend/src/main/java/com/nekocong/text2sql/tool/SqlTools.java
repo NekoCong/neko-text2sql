@@ -167,7 +167,7 @@ public class SqlTools {
     private List<TableSchema> describeTables(String datasourceId, DataScope scope) {
         String resolved = datasourceGuard.resolve(scope, datasourceId);
         return introspector.introspect(registry.resolve(resolved)).stream()
-                .filter(table -> policy.allows(scope, table.name()))
+                .filter(table -> policy.allows(scope, resolved, table.name()))
                 .toList();
     }
 }

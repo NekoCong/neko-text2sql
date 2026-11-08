@@ -292,7 +292,7 @@ public class Text2SqlPipelineService {
      * narrower result (see the "越界问题的回答语义" requirement).
      */
     private static String scopedExplanation(String explanation, DataScope scope) {
-        if (scope.isAdmin()) {
+        if (scope == null || scope.bypassesDataScope()) {
             return explanation;
         }
         String scopeText = scope.isStudent() ? "仅本人" : "所管班级";
@@ -303,23 +303,36 @@ public class Text2SqlPipelineService {
     /**
      * Describes the caller to the generation model, so first-person questions resolve to the
      * caller's own identifiers instead of being guessed from the question text.
+     *
+     * <p>The wording is derived from the resolved access: a bypass (administrator) is unrestricted;
+     * otherwise the effective role display names are used with the caller's principal identifiers.
      */
     private static String callerContext(DataScope scope) {
-        if (scope.isAdmin()) {
+        if (scope == null || scope.access() == null) {
+            return "当前账号未解析出数据范围，只能看到空结果。";
+        }
+        if (scope.bypassesDataScope()) {
             return "管理员：可见全部数据，不需要按调用者过滤。";
         }
-        if (scope.isStudent()) {
-            return "学生：本人学号 "
-                    + scope.studentNo()
-                    + "，所属班级 id "
-                    + scope.classIds().stream().sorted().toList()
-                    + "。问题中的“我/我的”指该学生本人，用 student_no = '"
-                    + scope.studentNo()
-                    + "' 过滤。";
+        List<String> roleNames = scope.access().roles().stream().map(role -> role.name()).toList();
+        String description = roleNames.isEmpty() ? scope.access().roleCodes().toString() : String.join("、", roleNames);
+        StringBuilder context = new StringBuilder(description).append("：");
+        if (scope.studentNo() != null) {
+            context.append("本人学号 ")
+                    .append(scope.studentNo())
+                    .append("，所属班级 id ")
+                    .append(scope.classIds().stream().sorted().toList())
+                    .append("。问题中的“我/我的”指该学生本人，用 student_no = '")
+                    .append(scope.studentNo())
+                    .append("' 过滤。");
+        } else if (!scope.classIds().isEmpty()) {
+            context.append("管理班级 id ")
+                    .append(scope.classIds().stream().sorted().toList())
+                    .append("。问题中的“我管理的班/本班”指这些班级，用 class_id IN (...) 过滤。");
+        } else {
+            context.append("数据范围由当前账号的访问策略决定，只能查询策略允许的数据。");
         }
-        return "辅导员：管理班级 id "
-                + scope.classIds().stream().sorted().toList()
-                + "。问题中的“我管理的班/本班”指这些班级，用 class_id IN (...) 过滤。";
+        return context.toString();
     }
 
     /**

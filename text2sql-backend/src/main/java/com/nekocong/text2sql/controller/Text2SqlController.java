@@ -14,6 +14,7 @@ import com.nekocong.text2sql.nl2sql.Text2SqlResult;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.DataScopeResolver;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.security.TokenClaims;
 import com.nekocong.text2sql.service.ConversationService;
 import com.nekocong.text2sql.service.Text2SqlAgentService;
 import com.nekocong.text2sql.service.Text2SqlPipelineService;
@@ -100,7 +101,7 @@ public class Text2SqlController {
         AtomicReference<CitationEvent> citationRef = new AtomicReference<>();
 
         return scopes
-                .resolve(userId, jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(userId, jwt.getClaimAsString(Roles.CLAIM), TokenClaims.tokenVersion(jwt))
                 .flatMapMany(
                         scope ->
                                 resolveConversation(userId, isAdmin, conversationId, datasourceId, message)
@@ -152,7 +153,7 @@ public class Text2SqlController {
     @PostMapping("/query")
     public Mono<Text2SqlResult> query(@AuthenticationPrincipal Jwt jwt, @RequestBody ChatRequest request) {
         return scopes
-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM), TokenClaims.tokenVersion(jwt))
                 .flatMap(scope -> pipeline.run(scope, request.datasourceId(), request.message()));
     }
 
@@ -176,7 +177,7 @@ public class Text2SqlController {
         // conversation endpoints enforce), and stops every user from sharing one session.
         String scopedSessionId = userId + ":" + sessionId;
         return scopes
-                .resolve(userId, jwt.getClaimAsString(Roles.CLAIM))
+                .resolve(userId, jwt.getClaimAsString(Roles.CLAIM), TokenClaims.tokenVersion(jwt))
                 .flatMapMany(
                         scope ->
                                 agentService

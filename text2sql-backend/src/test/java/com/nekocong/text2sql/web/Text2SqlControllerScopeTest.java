@@ -15,6 +15,8 @@ import com.nekocong.text2sql.sql.model.QueryResult;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -66,7 +68,7 @@ class Text2SqlControllerScopeTest {
         AtomicReference<DataScope> captured = new AtomicReference<>();
 
         controller(captured)
-                .query(jwt(userId, "student"), new ChatRequest("我的成绩", null, null))
+                .query(jwt(userId, "student", 0), new ChatRequest("我的成绩", null, null))
                 .block();
 
         assertThat(captured.get()).isNotNull();
@@ -81,7 +83,7 @@ class Text2SqlControllerScopeTest {
         AtomicReference<DataScope> captured = new AtomicReference<>();
 
         controller(captured)
-                .query(jwt(userId, "counselor"), new ChatRequest("两个班的平均分", null, null))
+                .query(jwt(userId, "counselor", 0), new ChatRequest("两个班的平均分", null, null))
                 .block();
 
         assertThat(captured.get()).isNotNull();
@@ -95,35 +97,96 @@ class Text2SqlControllerScopeTest {
         AtomicReference<DataScope> captured = new AtomicReference<>();
 
         controller(captured)
-                .query(jwt(userId, "admin"), new ChatRequest("全校统计", null, null))
+                .query(jwt(userId, "admin", 0), new ChatRequest("全校统计", null, null))
                 .block();
 
         assertThat(captured.get()).isNotNull();
         assertThat(captured.get().isAdmin()).isTrue();
+        assertThat(captured.get().bypassesDataScope()).isTrue();
         assertThat(captured.get().classIds()).isEmpty();
     }
 
     @Test
     void unscopedStudentIsRejectedBeforeThePipelineRuns() {
-        String userId = seedUser("student");
+        // No account row: the token identifies nobody the access layer can resolve.
+        String userId = "scope-missing-" + UUID.randomUUID();
         AtomicReference<DataScope> captured = new AtomicReference<>();
 
         assertThatThrownBy(
                         () ->
                                 controller(captured)
-                                        .query(jwt(userId, "student"), new ChatRequest("我的成绩", null, null))
+                                        .query(jwt(userId, "student", 0), new ChatRequest("我的成绩", null, null))
                                         .block())
                 .isInstanceOf(ResponseStatusException.class);
 
         assertThat(captured.get()).isNull();
     }
 
+    @Test
+    void aStaleTokenVersionIsRejectedBeforeThePipelineRuns() {
+        String userId = seedUser("student", "class_id", "1", "student_id", "1", "student_no", "2023001");
+        AtomicReference<DataScope> captured = new AtomicReference<>();
+
+        assertThatThrownBy(
+                        () ->
+                                controller(captured)
+                                        .query(jwt(userId, "student", 9), new ChatRequest("我的成绩", null, null))
+                                        .block())
+                .isInstanceOf(ResponseStatusException.class);
+
+        assertThat(captured.get()).isNull();
+    }
+
+    @Test
+    void aTokenWithoutTheVersionClaimFailsClosed() {
+        String userId = seedUser("student", "class_id", "1", "student_id", "1", "student_no", "2023001");
+        AtomicReference<DataScope> captured = new AtomicReference<>();
+
+        assertThatThrownBy(
+                        () ->
+                                controller(captured)
+                                        .query(jwt(userId, "student", null), new ChatRequest("我的成绩", null, null))
+                                        .block())
+                .isInstanceOf(ResponseStatusException.class);
+
+        assertThat(captured.get()).isNull();
+    }
+
+    @BeforeEach
+    void ensureGrant() {
+        ensureStudentCampusGrant();
+    }
+
     private String seedUser(String role, String... scopes) {
         String userId = "scope-" + UUID.randomUUID();
+        insertUser(userId, role);
         for (int i = 0; i < scopes.length; i += 2) {
             insertScope(userId, scopes[i], scopes[i + 1]);
         }
         return userId;
+    }
+
+    private void insertUser(String userId, String role) {
+        client.sql("INSERT INTO app_user (id, username, password_hash, display_name, role, created_at)"
+                        + " VALUES (:id, :username, 'x', 'Scope', :role, 0)")
+                .bind("id", userId)
+                .bind("username", userId)
+                .bind("role", role)
+                .then()
+                .block();
+        client.sql("INSERT INTO access_user_role (user_id, role_id, created_at)"
+                        + " SELECT :userId, id, 0 FROM access_role WHERE code = :code")
+                .bind("userId", userId)
+                .bind("code", role)
+                .then()
+                .block();
+    }
+
+    @AfterEach
+    void cleanUp() {
+        client.sql("DELETE FROM user_scope WHERE user_id LIKE 'scope-%'").then().block();
+        client.sql("DELETE FROM access_user_role WHERE user_id LIKE 'scope-%'").then().block();
+        client.sql("DELETE FROM app_user WHERE id LIKE 'scope-%'").then().block();
     }
 
     private void insertScope(String userId, String type, String value) {
@@ -137,7 +200,24 @@ class Text2SqlControllerScopeTest {
                 .block();
     }
 
+    /** The registration path relies on the seeded role -> datasource grant still being present. */
+    private void ensureStudentCampusGrant() {
+        client.sql("INSERT INTO datasource_access (role, datasource_id)"
+                        + " SELECT 'student', 'campus' WHERE NOT EXISTS (SELECT 1 FROM datasource_access"
+                        + " WHERE role = 'student' AND datasource_id = 'campus')")
+                .then()
+                .block();
+    }
+
     private static Jwt jwt(String userId, String role) {
-        return Jwt.withTokenValue("t").header("alg", "none").subject(userId).claim("role", role).build();
+        return jwt(userId, role, 0);
+    }
+
+    private static Jwt jwt(String userId, String role, Integer version) {
+        Jwt.Builder builder = Jwt.withTokenValue("t").header("alg", "none").subject(userId).claim("role", role);
+        if (version != null) {
+            builder.claim("ver", version);
+        }
+        return builder.build();
     }
 }

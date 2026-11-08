@@ -3,10 +3,12 @@ package com.nekocong.text2sql.sql;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.nekocong.text2sql.access.DataScopePolicy;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.SqlPermissionException;
-import com.nekocong.text2sql.security.TablePolicy;
 import com.nekocong.text2sql.sql.model.QueryResult;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -31,7 +33,7 @@ class DataPermissionIntegrationTest {
 
     private QueryResult run(String sql, DataScope scope) {
         String safe = safetyValidator.validateAndNormalize(sql);
-        return executor.executeBlocking(null, rewriter.rewrite(safe, scope));
+        return executor.executeBlocking("campus", rewriter.rewrite(safe, scope));
     }
 
     @Test
@@ -85,7 +87,7 @@ class DataPermissionIntegrationTest {
 
     @Test
     void adminIsUnrestricted() {
-        QueryResult result = run("SELECT COUNT(*) AS n FROM class", DataScope.admin("u-admin"));
+        QueryResult result = run("SELECT COUNT(*) AS n FROM class", AccessFixtures.admin());
 
         assertThat(((Number) result.rows().get(0).get("n")).intValue()).isEqualTo(3);
     }
@@ -105,21 +107,35 @@ class DataPermissionIntegrationTest {
     }
 
     @Test
+    void aConfiguredDenyIsRejectedEvenForACustomRole() {
+        // A custom role whose policy denies the table: the statement never reaches the executor.
+        DataScope denied = AccessFixtures.custom(
+                "reviewer",
+                List.of(AccessFixtures.rule(
+                        "d1", "campus", "student", DataScopePolicy.DENY, null, null)),
+                Set.of(1L));
+
+        assertThatThrownBy(() -> run("SELECT student_no FROM student", denied))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
     void seededFactsAgreeWithTheirStudentsClass() {
         QueryResult mismatched =
                 run(
                         "SELECT COUNT(*) AS n FROM score sc JOIN student s ON s.id = sc.student_id "
                                 + "WHERE sc.class_id <> s.class_id",
-                        DataScope.admin("u-admin"));
+                        AccessFixtures.admin());
 
         assertThat(((Number) mismatched.rows().get(0).get("n")).intValue()).isZero();
     }
 
     private static DataScope studentScope() {
-        return new DataScope("u-student", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+        return AccessFixtures.student();
     }
 
     private static DataScope counselorScope() {
-        return new DataScope("u-counselor", "counselor", Set.of(1L, 2L), null, null, Set.of("campus"));
+        return AccessFixtures.counselor();
     }
 }

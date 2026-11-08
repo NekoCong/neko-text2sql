@@ -9,6 +9,7 @@ import com.nekocong.text2sql.nl2sql.ExecutionListener;
 import com.nekocong.text2sql.nl2sql.Text2SqlResult;
 import com.nekocong.text2sql.schema.SchemaIntrospector;
 import com.nekocong.text2sql.schema.SchemaRenderer;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.TablePolicy;
 import com.nekocong.text2sql.service.Text2SqlPipelineService;
@@ -79,8 +80,16 @@ class SqlToolsTest {
         String tables = tools(new AtomicReference<>()).listTables(null, studentScope());
 
         assertThat(tables.split(","))
-                .allSatisfy(name -> assertThat(TablePolicy.CAMPUS_TABLES).contains(name.trim()));
-        assertThat(tables.split(",")).hasSize(TablePolicy.CAMPUS_TABLES.size());
+                .allSatisfy(name -> assertThat(List.of("class", "course", "student", "score", "attendance"))
+                        .contains(name.trim()));
+        assertThat(tables.split(",")).hasSize(5);
+    }
+
+    @Test
+    void listTablesIsUnrestrictedOnlyForABypassScope() {
+        String tables = tools(new AtomicReference<>()).listTables(null, AccessFixtures.admin());
+
+        assertThat(tables).contains("student").contains("score");
     }
 
     @Test
@@ -114,17 +123,13 @@ class SqlToolsTest {
 
     @Test
     void metadataToolsRespectTheDatasourceWhitelist() {
-        DataScope warehouseOnly =
-                new DataScope("u-1", "student", Set.of(1L), 1L, "2023001", Set.of("warehouse"));
         DataScope noGrant = new DataScope("u-1", "student", Set.of(1L), 1L, "2023001", Set.of());
 
         org.assertj.core.api.Assertions.assertThatThrownBy(
-                        () -> tools(new AtomicReference<>()).listTables(null, warehouseOnly))
+                        () -> tools(new AtomicReference<>()).listTables("warehouse", studentScope()))
                 .isInstanceOf(com.nekocong.text2sql.security.SqlPermissionException.class);
         org.assertj.core.api.Assertions.assertThatThrownBy(
-                        () ->
-                                tools(new AtomicReference<>())
-                                        .describeTable("student", "warehouse", warehouseOnly))
+                        () -> tools(new AtomicReference<>()).describeTable("student", "warehouse", studentScope()))
                 .isInstanceOf(com.nekocong.text2sql.security.SqlPermissionException.class);
         org.assertj.core.api.Assertions.assertThatThrownBy(
                         () -> tools(new AtomicReference<>()).listTables(null, noGrant))
@@ -132,6 +137,6 @@ class SqlToolsTest {
     }
 
     private static DataScope studentScope() {
-        return new DataScope("u-student", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+        return AccessFixtures.student();
     }
 }

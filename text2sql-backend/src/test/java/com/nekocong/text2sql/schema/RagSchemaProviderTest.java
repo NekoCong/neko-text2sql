@@ -5,6 +5,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import com.nekocong.text2sql.config.Nl2SqlProperties;
 import com.nekocong.text2sql.config.RagProperties;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.TablePolicy;
 import io.agentscope.core.embedding.EmbeddingModel;
@@ -64,7 +65,7 @@ class RagSchemaProviderTest {
     }
 
     private static DataScope adminScope() {
-        return DataScope.admin("tester");
+        return AccessFixtures.admin();
     }
 
     private RagSchemaProvider provider() {
@@ -79,7 +80,7 @@ class RagSchemaProviderTest {
 
     @Test
     void selectsRelevantTableAndExpandsForeignKeyNeighbours() {
-        String ddl = provider().renderForPrompt(null, adminScope(), "attendance records");
+        String ddl = provider().renderForPrompt("campus", adminScope(), "attendance records");
 
         // 'attendance' is the top match; its FK neighbours (student, course) are pulled in...
         assertThat(ddl).containsIgnoringCase("CREATE TABLE attendance");
@@ -114,7 +115,7 @@ class RagSchemaProviderTest {
         RagSchemaProvider provider =
                 new RagSchemaProvider(broken, registry, introspector, renderer, rag, nl2Sql, new TablePolicy());
 
-        String ddl = provider.renderForPrompt(null, adminScope(), "anything");
+        String ddl = provider.renderForPrompt("campus", adminScope(), "anything");
 
         assertThat(ddl).containsIgnoringCase("CREATE TABLE student");
         assertThat(ddl).containsIgnoringCase("CREATE TABLE attendance");

@@ -88,7 +88,7 @@ class Text2SqlControllerPersistenceTest {
                         scopes,
                         new com.nekocong.text2sql.controller.AgentEventPresenter(objectMapper),
                         objectMapper);
-        Jwt jwt = Jwt.withTokenValue("t").header("alg", "none").subject(userId).claim("role", "student").build();
+        Jwt jwt = Jwt.withTokenValue("t").header("alg", "none").subject(userId).claim("role", "student").claim("ver", 0).build();
 
         controller.stream(jwt, "统计计数", "campus", conversation.id()).collectList().block();
 

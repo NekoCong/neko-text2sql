@@ -6,6 +6,7 @@ import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.schema.FullSchemaProvider;
 import com.nekocong.text2sql.schema.SchemaIntrospector;
 import com.nekocong.text2sql.schema.model.TableSchema;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.sql.SqlExecutor;
 import com.nekocong.text2sql.sql.SqlSafetyValidator;
@@ -55,7 +56,7 @@ class Nl2SqlCoreIntegrationTest {
 
     @Test
     void rendersPromptSchemaAsDdl() {
-        String ddl = schemaProvider.renderForPrompt(null, DataScope.admin("tester"), "平均分");
+        String ddl = schemaProvider.renderForPrompt("campus", AccessFixtures.admin(), "平均分");
         assertThat(ddl).contains("CREATE TABLE").containsIgnoringCase("student");
     }
 

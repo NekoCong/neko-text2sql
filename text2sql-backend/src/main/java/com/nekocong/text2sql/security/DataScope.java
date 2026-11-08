@@ -1,5 +1,7 @@
 package com.nekocong.text2sql.security;
 
+import com.nekocong.text2sql.access.EffectiveAccess;
+import com.nekocong.text2sql.access.PrincipalAttributes;
 import java.util.Set;
 
 /**
@@ -9,12 +11,20 @@ import java.util.Set;
  * <p>Immutable and self-contained: it is passed from the web layer into the pipeline, and (for the
  * agent path) placed into the AgentScope runtime context, so no layer has to re-read the identity.
  *
+ * <p>The {@code role}, {@code classIds}, {@code studentId}, {@code studentNo} and {@code
+ * allowedDatasources} components are a flat projection of the caller's {@link EffectiveAccess}, kept
+ * for rendering and for callers that only need the identity. Enforcement (table visibility and row
+ * predicates) is derived from {@code access}, never from the role name.
+ *
  * @param userId the authenticated user id
- * @param role the canonical role ({@code admin}, {@code student} or {@code counselor})
- * @param classIds the classes in scope: the classes a counselor manages, or the student's own class
- * @param studentId the caller's own business-database student id (students only)
- * @param studentNo the caller's own student number (students only)
- * @param allowedDatasources datasource ids the role may query; ignored for admins, who see all
+ * @param role the first effective role code (display/diagnostics only; enforcement never branches on
+ *     it)
+ * @param classIds the classes in scope, projected from the principal
+ * @param studentId the caller's own business-database student id, projected from the principal
+ * @param studentNo the caller's own student number, projected from the principal
+ * @param allowedDatasources the effective datasource grants
+ * @param access the database-configured effective access; {@code null} fails closed at the enforcement
+ *     chokepoints
  */
 public record DataScope(
         String userId,
@@ -22,7 +32,8 @@ public record DataScope(
         Set<Long> classIds,
         Long studentId,
         String studentNo,
-        Set<String> allowedDatasources) {
+        Set<String> allowedDatasources,
+        EffectiveAccess access) {
 
     /** Normalizes the collections so the scope is structurally immutable. */
     public DataScope {
@@ -31,18 +42,70 @@ public record DataScope(
     }
 
     /**
+     * Creates a scope without resolved access. Kept for source compatibility; callers constructed
+     * this way fail closed at every enforcement chokepoint because no policy can be evaluated.
+     *
+     * @param userId the authenticated user id
+     * @param role the role code
+     * @param classIds the classes in scope
+     * @param studentId the caller's student id
+     * @param studentNo the caller's student number
+     * @param allowedDatasources the datasource grants
+     */
+    public DataScope(
+            String userId,
+            String role,
+            Set<Long> classIds,
+            Long studentId,
+            String studentNo,
+            Set<String> allowedDatasources) {
+        this(userId, role, classIds, studentId, studentNo, allowedDatasources, null);
+    }
+
+    /**
+     * Projects the database-configured effective access into a scope.
+     *
+     * @param access the resolved access (may be {@code null}, which yields a scope that fails closed)
+     * @return the scope carrying the access
+     */
+    public static DataScope from(EffectiveAccess access) {
+        if (access == null) {
+            return new DataScope(null, null, Set.of(), null, null, Set.of(), null);
+        }
+        PrincipalAttributes principal = access.principal();
+        String role = access.roles().isEmpty() ? null : access.roles().get(0).code();
+        return new DataScope(
+                access.userId(),
+                role,
+                principal == null ? Set.of() : principal.classIds(),
+                principal == null ? null : principal.studentId(),
+                principal == null ? null : principal.studentNo(),
+                access.datasourceIds(),
+                access);
+    }
+
+    /**
      * Creates an unrestricted scope for an administrator.
      *
      * @param userId the admin user id
-     * @return the admin scope
+     * @return the admin scope, without a resolved access (fails closed at the enforcement points)
      */
     public static DataScope admin(String userId) {
         return new DataScope(userId, Roles.ADMIN, Set.of(), null, null, Set.of());
     }
 
-    /** @return {@code true} when this scope bypasses table, row and datasource restrictions */
+    /**
+     * Reports whether this scope bypasses table, row and datasource restrictions.
+     *
+     * @return {@code true} when the resolved access holds the bypass permission
+     */
+    public boolean bypassesDataScope() {
+        return access != null && access.bypassesDataScope();
+    }
+
+    /** @return {@code true} when the caller bypasses data-scope filtering */
     public boolean isAdmin() {
-        return Roles.ADMIN.equals(role);
+        return bypassesDataScope();
     }
 
     /** @return {@code true} when the caller is a student */

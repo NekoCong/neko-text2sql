@@ -3,6 +3,7 @@ package com.nekocong.text2sql.datasource;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.SqlPermissionException;
 import java.util.NoSuchElementException;
@@ -43,8 +44,8 @@ class DatasourceAccessGuardTest {
 
     @Test
     void adminMayUseAnyConfiguredDatasource() {
-        assertThat(guard.resolve(DataScope.admin("u-admin"), null)).isEqualTo("campus");
-        assertThatThrownBy(() -> guard.resolve(DataScope.admin("u-admin"), "does-not-exist"))
+        assertThat(guard.resolve(admin(), null)).isEqualTo("campus");
+        assertThatThrownBy(() -> guard.resolve(admin(), "does-not-exist"))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("不存在");
     }
@@ -57,6 +58,10 @@ class DatasourceAccessGuardTest {
         assertThatThrownBy(() -> guard.resolve(otherOnly, null))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("均不可用");
+    }
+
+    private static DataScope admin() {
+        return AccessFixtures.admin();
     }
 
     private static DataScope scope(String role, Set<String> allowed) {

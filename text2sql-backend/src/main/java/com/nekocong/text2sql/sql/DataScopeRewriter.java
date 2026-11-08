@@ -1,5 +1,9 @@
 package com.nekocong.text2sql.sql;
 
+import com.nekocong.text2sql.access.DataScopePolicyEngine;
+import com.nekocong.text2sql.access.PrincipalAttributes;
+import com.nekocong.text2sql.access.PrincipalAttribute;
+import com.nekocong.text2sql.access.RowPredicate;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.SqlPermissionException;
 import com.nekocong.text2sql.security.TablePolicy;
@@ -7,8 +11,8 @@ import com.nekocong.text2sql.security.TablePolicy;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 import net.sf.jsqlparser.expression.Alias;
 import net.sf.jsqlparser.expression.Expression;
@@ -67,7 +71,7 @@ public class DataScopeRewriter {
      * @throws SqlPermissionException when the query cannot be safely scoped
      */
     public String rewrite(String sql, DataScope scope) {
-        if (scope.isAdmin()) {
+        if (scope != null && scope.bypassesDataScope()) {
             return sql;
         }
         Statement statement;
@@ -202,15 +206,14 @@ public class DataScopeRewriter {
         if (ctes.contains(name)) {
             return table;
         }
-        policy.requireAllowed(scope, name);
+        List<RowPredicate> predicates = policy.predicates(scope, null, name);
 
         String declaredAlias =
                 table.getAlias() != null ? table.getAlias().getName() : name;
         if (declaredAlias == null || declaredAlias.isBlank()) {
             declaredAlias = "t";
         }
-        Optional<String> filter = policy.filterFor(scope, name);
-        if (filter.isEmpty()) {
+        if (predicates.isEmpty()) {
             register(declaredAlias, aliases);
             return table;
         }
@@ -223,8 +226,9 @@ public class DataScopeRewriter {
         PlainSelect inner = new PlainSelect();
         inner.addSelectItems(new AllColumns());
         inner.setFromItem(source);
+        String predicate = renderPredicates(predicates, scope, table);
         try {
-            inner.setWhere(CCJSqlParserUtil.parseCondExpression(filter.get()));
+            inner.setWhere(CCJSqlParserUtil.parseCondExpression(predicate));
         } catch (Exception ex) {
             throw new SqlPermissionException("无法生成行过滤条件", ex);
         }
@@ -232,6 +236,72 @@ public class DataScopeRewriter {
         derived.setSelect(inner);
         derived.setAlias(new Alias(alias, true));
         return derived;
+    }
+
+    /**
+     * Renders the OR of the caller's row predicates.
+     *
+     * <p>Each predicate's value comes from the principal attributes; a missing or empty value denies
+     * the query instead of producing a predicate that matches nothing (which would silently return an
+     * empty result) or, worse, everything.
+     */
+    private static String renderPredicates(
+            List<RowPredicate> predicates, DataScope scope, Table table) {
+        if (predicates.size() == 1) {
+            return renderPredicate(predicates.get(0), scope, table);
+        }
+        return predicates.stream()
+                .map(predicate -> "(" + renderPredicate(predicate, scope, table) + ")")
+                .collect(Collectors.joining(" OR "));
+    }
+
+    private static String renderPredicate(RowPredicate predicate, DataScope scope, Table table) {
+        String column = predicate.column();
+        if (!DataScopePolicyEngine.isSafeColumn(column)) {
+            throw new SqlPermissionException("行过滤列不安全，已拒绝执行：" + column);
+        }
+        PrincipalAttributes principal = scope.access().principal();
+        if (principal == null) {
+            throw new SqlPermissionException("当前账号缺少数据范围属性，无法应用数据权限");
+        }
+        PrincipalAttribute attribute = predicate.attribute();
+        if (attribute == null) {
+            throw new SqlPermissionException("行过滤属性无效，已拒绝执行");
+        }
+        return switch (attribute) {
+            case CLASS_IDS -> column + " IN (" + numericList(principal.classIds(), column) + ")";
+            case STUDENT_ID -> column + " IN (" + numeric(principal.studentId(), attribute) + ")";
+            case STUDENT_NO -> column + " IN (" + quote(text(principal.studentNo(), attribute)) + ")";
+            case USERNAME -> column + " IN (" + quote(text(principal.username(), attribute)) + ")";
+            case USER_ID -> column + " IN (" + quote(text(principal.userId(), attribute)) + ")";
+        };
+    }
+
+    private static String numericList(Set<Long> values, String column) {
+        if (values == null || values.isEmpty()) {
+            throw new SqlPermissionException("当前账号缺少数据范围值，无法过滤 " + column);
+        }
+        return values.stream().sorted().map(String::valueOf).collect(Collectors.joining(","));
+    }
+
+    private static String numeric(Long value, PrincipalAttribute attribute) {
+        if (value == null) {
+            throw new SqlPermissionException(
+                    "当前账号缺少数据范围值（" + attribute.code() + "），无法应用数据权限");
+        }
+        return String.valueOf(value);
+    }
+
+    private static String text(String value, PrincipalAttribute attribute) {
+        if (value == null || value.isBlank()) {
+            throw new SqlPermissionException(
+                    "当前账号缺少数据范围值（" + attribute.code() + "），无法应用数据权限");
+        }
+        return value;
+    }
+
+    private static String quote(String value) {
+        return "'" + value.replace("'", "''") + "'";
     }
 
     private static String uniqueAlias(String requested, Set<String> aliases) {

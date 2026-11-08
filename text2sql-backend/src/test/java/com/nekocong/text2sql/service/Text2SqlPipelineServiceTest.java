@@ -21,6 +21,7 @@ import com.nekocong.text2sql.nl2sql.Text2SqlEvent;
 import com.nekocong.text2sql.nl2sql.Text2SqlResult;
 import com.nekocong.text2sql.prompt.PromptCatalog;
 import com.nekocong.text2sql.schema.FullSchemaProvider;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.TablePolicy;
 import com.nekocong.text2sql.sql.DataScopeRewriter;
@@ -166,8 +167,9 @@ class Text2SqlPipelineServiceTest {
     }
 
     private static DataScope studentScope() {
-        return new DataScope("u-student", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+        return AccessFixtures.student();
     }
+
 
     @Test
     void listenerReceivesTheEnforcedSqlAndRowCount() {
@@ -181,7 +183,7 @@ class Text2SqlPipelineServiceTest {
         Text2SqlResult result =
                 pipeline.run(
                         studentScope(),
-                        null,
+                        "campus",
                         "how many students",
                         new ExecutionListener() {
                             @Override
@@ -214,7 +216,7 @@ class Text2SqlPipelineServiceTest {
                         () ->
                                 pipeline.run(
                                                 studentScope(),
-                                                null,
+                                                "campus",
                                                 "工资",
                                                 new ExecutionListener() {
                                                     @Override
@@ -262,8 +264,7 @@ class Text2SqlPipelineServiceTest {
         assertThat(failure.get()).contains("没有任何可用的数据源");
     }
 
-    private static int indexOf(List<Text2SqlEvent> events, Class<? extends Text2SqlEvent> type) {
-        for (int i = 0; i < events.size(); i++) {
+    private static int indexOf(List<Text2SqlEvent> events, Class<? extends Text2SqlEvent> type) {        for (int i = 0; i < events.size(); i++) {
             if (type.isInstance(events.get(i))) {
                 return i;
             }

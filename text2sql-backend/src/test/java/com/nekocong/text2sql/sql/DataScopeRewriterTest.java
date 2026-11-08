@@ -1,33 +1,51 @@
 package com.nekocong.text2sql.sql;
 
+import static com.nekocong.text2sql.security.AccessFixtures.rule;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import com.nekocong.text2sql.access.DataScopePolicy;
+import com.nekocong.text2sql.access.PrincipalAttributes;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.SqlPermissionException;
 import com.nekocong.text2sql.security.TablePolicy;
+import java.util.List;
 import java.util.Set;
 import org.junit.jupiter.api.Test;
 
 /**
  * Unit tests for the SQL filter injection: every scoped table reference must end up filtered, in
  * every shape the model is likely to produce, and anything the rewriter cannot handle must be
- * rejected instead of executed.
+ * rejected instead of executed. The filters come from the configured access policies only.
  */
 class DataScopeRewriterTest {
+
+    private static final String CAMPUS = AccessFixtures.CAMPUS;
 
     private final DataScopeRewriter rewriter = new DataScopeRewriter(new TablePolicy());
 
     private static DataScope student() {
-        return new DataScope("u-student", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+        return AccessFixtures.student();
     }
 
     private static DataScope counselor() {
-        return new DataScope("u-counselor", "counselor", Set.of(1L, 2L), null, null, Set.of("campus"));
+        return AccessFixtures.counselor();
     }
 
     private static DataScope admin() {
-        return DataScope.admin("u-admin");
+        return DataScope.from(AccessFixtures.builder("admin", Set.of(), List.of())
+                .permissions(Set.of("access.bypass_data_scope"))
+                .principal(new PrincipalAttributes("u-admin", "admin", null, null, Set.of()))
+                .build());
+    }
+
+    private static DataScope customTeacher() {
+        return AccessFixtures.custom(
+                "teacher",
+                List.of(rule("t-score", CAMPUS, "score", DataScopePolicy.FILTER, "class_id", "classIds"),
+                        rule("t-course", CAMPUS, "course", DataScopePolicy.ALL, null, null)),
+                Set.of(1L));
     }
 
     @Test
@@ -195,6 +213,87 @@ class DataScopeRewriterTest {
         String sql = rewriter.rewrite("SELECT 1 FROM student, student", student());
 
         assertThat(sql).containsIgnoringCase("AS student_sp1");
+    }
+
+    @Test
+    void aCustomRoleIsEnforcedFromItsPolicyNotItsName() {
+        // The role code "teacher" is unknown to the legacy code; only the DB policy can filter score.
+        String sql = rewriter.rewrite("SELECT AVG(score) FROM score", customTeacher());
+
+        assertThat(compact(sql)).contains("class_id in (1)");
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", customTeacher()))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void orsEveryPredicateOfAFilteredTable() {
+        DataScope scope = AccessFixtures.custom(
+                "reviewer",
+                List.of(
+                        rule("r1", CAMPUS, "student", DataScopePolicy.FILTER, "student_no", "studentNo"),
+                        rule("r2", CAMPUS, "student", DataScopePolicy.FILTER, "class_id", "classIds")),
+                Set.of(2L),
+                "2023002",
+                null);
+
+        String sql = rewriter.rewrite("SELECT * FROM student", scope);
+
+        assertThat(compact(sql)).contains("(student_no in ('2023002')) or (class_id in (2))");
+    }
+
+    @Test
+    void quotesValuesAndEscapesSingleQuotes() {
+        DataScope scope = AccessFixtures.custom(
+                "o'brien",
+                List.of(rule("u1", CAMPUS, "student", DataScopePolicy.FILTER, "username", "username")),
+                Set.of());
+
+        String sql = rewriter.rewrite("SELECT * FROM student", scope);
+
+        assertThat(sql).contains("'o''brien'");
+    }
+
+    @Test
+    void aMissingPrincipalValueDeniesInsteadOfRunning() {
+        DataScope noStudentId = AccessFixtures.custom(
+                "nograde",
+                List.of(rule("g1", CAMPUS, "score", DataScopePolicy.FILTER, "student_id", "studentId")),
+                Set.of(1L));
+
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noStudentId))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("studentId");    }
+
+    @Test
+    void anEmptyClassSetDeniesInsteadOfRunning() {
+        DataScope noClasses = AccessFixtures.custom(
+                "noclass",
+                List.of(rule("c1", CAMPUS, "score", DataScopePolicy.FILTER, "class_id", "classIds")),
+                Set.of());
+
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noClasses))
+                .isInstanceOf(SqlPermissionException.class);
+    }
+
+    @Test
+    void aDeniedTableIsRejectedBeforeAnySqlIsProduced() {
+        DataScope denied = AccessFixtures.custom(
+                "denied",
+                List.of(rule("d1", CAMPUS, "student", DataScopePolicy.DENY, null, null)),
+                Set.of(1L));
+
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT name FROM student", denied))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void aScopeWithoutResolvedAccessIsRejected() {
+        DataScope legacy = new DataScope("u", "student", Set.of(1L), 1L, "2023001", Set.of(CAMPUS));
+
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", legacy))
+                .isInstanceOf(SqlPermissionException.class);
     }
 
     private static String compact(String sql) {

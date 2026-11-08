@@ -6,6 +6,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nekocong.text2sql.access.DataScopePolicy;
 import com.nekocong.text2sql.config.KnowledgeProperties;
 import com.nekocong.text2sql.config.Nl2SqlProperties;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
@@ -30,6 +31,7 @@ import com.nekocong.text2sql.schema.SchemaRenderer;
 import com.nekocong.text2sql.schema.model.ColumnSchema;
 import com.nekocong.text2sql.schema.model.ForeignKeySchema;
 import com.nekocong.text2sql.schema.model.TableSchema;
+import com.nekocong.text2sql.security.AccessFixtures;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.Roles;
 import com.nekocong.text2sql.security.TablePolicy;
@@ -60,6 +62,10 @@ class KnowledgeSearchServiceTest {
     private final DatasourceAccessGuard guard = mock(DatasourceAccessGuard.class);
     private final DataSourceRegistry registry = mock(DataSourceRegistry.class);
     private final SchemaIntrospector introspector = mock(SchemaIntrospector.class);
+
+    private static DataScope admin() {
+        return AccessFixtures.admin();
+    }
 
     private KnowledgeSearchService newService() {
         when(guard.resolve(any(), any())).thenReturn("campus");
@@ -98,7 +104,7 @@ class KnowledgeSearchServiceTest {
                 List.of(chunk(
                         "c2", "item-a", "doc-1", "挂科评分说明", 1, new int[] {10, 10, 200, 200}, 0)));
 
-        SearchResult result = service.search(DataScope.admin("admin-1"), "campus", "agent-1", "挂科", 5);
+        SearchResult result = service.search(admin(), "campus", "agent-1", "挂科", 5);
 
         assertThat(result.hits())
                 .extracting(KnowledgeHit::knowledgeType)
@@ -118,8 +124,8 @@ class KnowledgeSearchServiceTest {
                 item("item-x", KnowledgeType.BUSINESS, KnowledgeScope.DATASOURCE, "campus", null,
                         "secret_salary", "薪资口径", "薪资统计口径说明"),
                 List.of(chunk("c9", "item-x", null, "薪资统计口径说明", null, null, 0)));
-        DataScope student =
-                new DataScope("student-1", Roles.STUDENT, Set.of(1L), 5L, "2023001", Set.of("campus"));
+        DataScope student = AccessFixtures.student();
+
 
         SearchResult result = service.search(student, "campus", null, "薪资", 5);
 
@@ -130,11 +136,48 @@ class KnowledgeSearchServiceTest {
     }
 
     @Test
+    void aScopeWithoutResolvedAccessRecallsNothing() {
+        // Fail closed: no access means an empty (not unrestricted) table whitelist.
+        DataScope legacy =
+                new DataScope("student-1", Roles.STUDENT, Set.of(1L), 5L, "2023001", Set.of("campus"));
+        KnowledgeSearchService service = newService();
+
+        SearchResult result = service.search(legacy, "campus", null, "成绩", 5);
+
+        assertThat(result.hits()).isEmpty();
+        assertThat(result.trace().candidateTables()).isEmpty();
+    }
+
+    @Test
+    void aCustomRoleRecallsOnlyItsConfiguredTables() {
+        KnowledgeSearchService service = newService();
+        vectorStore.replaceChunks(
+                item("item-s", KnowledgeType.BUSINESS, KnowledgeScope.DATASOURCE, "campus", null,
+                        "score", "成绩口径", "成绩说明"),
+                List.of(chunk("c1", "item-s", null, "成绩说明", null, null, 0)));
+        vectorStore.replaceChunks(
+                item("item-t", KnowledgeType.BUSINESS, KnowledgeScope.DATASOURCE, "campus", null,
+                        "teacher_salary", "工资", "教师工资说明"),
+                List.of(chunk("c2", "item-t", null, "教师工资说明", null, null, 0)));
+        DataScope teacher = AccessFixtures.custom(
+                "teacher",
+                List.of(AccessFixtures.rule(
+                        "t1", "campus", "score", DataScopePolicy.FILTER, "class_id", "classIds")),
+                Set.of(1L));
+
+        SearchResult result = service.search(teacher, "campus", null, "成绩", 5);
+
+        assertThat(result.hits()).extracting(KnowledgeHit::content).contains("成绩说明");
+        assertThat(result.hits()).extracting(KnowledgeHit::content).doesNotContain("教师工资说明");
+        assertThat(result.trace().finalTables()).contains("score").doesNotContain("teacher_salary");
+    }
+
+    @Test
     void fallsBackToTheFullSchemaWhenNothingIsRecalled() {
         KnowledgeSearchService service = newService();
         when(repository.listTermMappings("campus")).thenReturn(List.of());
 
-        SearchResult result = service.search(DataScope.admin("admin-1"), "campus", null, "完全不相关", 5);
+        SearchResult result = service.search(admin(), "campus", null, "完全不相关", 5);
 
         assertThat(result.hits()).isEmpty();
         assertThat(result.trace().fallback()).isTrue();
