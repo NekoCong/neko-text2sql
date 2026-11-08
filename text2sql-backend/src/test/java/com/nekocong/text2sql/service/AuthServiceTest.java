@@ -45,13 +45,31 @@ class AuthServiceTest {
     }
 
     @Test
+    void reportsInvalidCredentialsForADisabledAccountWithTheWrongPassword() {
+        // The password is verified first, so a wrong password never reveals that the account exists
+        // and is disabled.
+        AuthService service = new AuthService(new FakeUsers(DISABLED), new FakeAccess(), encoder(false), jwt("tok"));
+
+        assertThatThrownBy(() -> service.login("blocked", "wrong-password").block())
+                .isInstanceOf(ResponseStatusException.class)
+                .satisfies(error -> {
+                    ResponseStatusException failure = (ResponseStatusException) error;
+                    assertThat(failure.getStatusCode().value()).isEqualTo(HttpStatus.UNAUTHORIZED.value());
+                    assertThat(failure.getReason()).isEqualTo("用户名或密码错误");
+                });
+    }
+
+    @Test
     void issuesATokenCarryingTheAccountTokenVersion() {
-        AuthService service = new AuthService(new FakeUsers(ENABLED), new FakeAccess(), encoder(true), jwt("tok"));
+        CapturingJwt jwt = new CapturingJwt("tok");
+        AuthService service = new AuthService(new FakeUsers(ENABLED), new FakeAccess(), encoder(true), jwt);
 
         AuthResult result = service.login("student01", "secret123").block();
 
         assertThat(result).isNotNull();
         assertThat(result.token()).isEqualTo("tok");
+        assertThat(jwt.issuedUserId).isEqualTo("u-enabled");
+        assertThat(jwt.issuedTokenVersion).isEqualTo(3);
     }
 
     @Test
@@ -92,17 +110,36 @@ class AuthServiceTest {
     }
 
     private static JwtService jwt(String token) {
-        return new JwtService(null, null) {
-            @Override
-            public String issue(String userId, String username, String role, int tokenVersion) {
-                return token;
-            }
+        return new CapturingJwt(token);
+    }
 
-            @Override
-            public long ttlSeconds() {
-                return 3600;
-            }
-        };
+    /** Records the arguments {@link AuthService} passes to {@link JwtService#issue}. */
+    private static final class CapturingJwt extends JwtService {
+
+        private final String token;
+        private String issuedUserId;
+        private String issuedUsername;
+        private String issuedRole;
+        private int issuedTokenVersion;
+
+        CapturingJwt(String token) {
+            super(null, null);
+            this.token = token;
+        }
+
+        @Override
+        public String issue(String userId, String username, String role, int tokenVersion) {
+            this.issuedUserId = userId;
+            this.issuedUsername = username;
+            this.issuedRole = role;
+            this.issuedTokenVersion = tokenVersion;
+            return token;
+        }
+
+        @Override
+        public long ttlSeconds() {
+            return 3600;
+        }
     }
 
     private static final class FakeUsers extends UserRepository {

@@ -136,17 +136,34 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
 
     @Override
     public Mono<Void> assignRoleByCode(String userId, String roleCode) {
+        // Idempotent: a user who already holds the role keeps the existing row, and the statement
+        // still updates one row so the "role exists" check below keeps working.
         return client.sql("INSERT INTO access_user_role (user_id, role_id, created_at)"
-                        + " SELECT :userId, id, :createdAt FROM access_role"
-                        + " WHERE code = :code AND enabled = TRUE")
+                        + " SELECT :userId, r.id, :createdAt FROM access_role r"
+                        + " WHERE r.code = :code AND r.enabled = TRUE"
+                        + " AND NOT EXISTS (SELECT 1 FROM access_user_role ur"
+                        + " WHERE ur.user_id = :userId AND ur.role_id = r.id)")
                 .bind("userId", userId)
                 .bind("createdAt", System.currentTimeMillis())
                 .bind("code", roleCode)
                 .fetch()
                 .rowsUpdated()
                 .flatMap(rows -> rows == null || rows == 0L
-                        ? Mono.error(new IllegalStateException("角色不存在：" + roleCode))
+                        ? exists(userId, roleCode)
                         : Mono.empty());
+    }
+
+    /** Confirms an already-assigned role exists, so a repeat assignment is a no-op. */
+    private Mono<Void> exists(String userId, String roleCode) {
+        return client.sql("SELECT 1 AS present FROM access_user_role ur"
+                        + " JOIN access_role r ON r.id = ur.role_id"
+                        + " WHERE ur.user_id = :userId AND r.code = :code")
+                .bind("userId", userId)
+                .bind("code", roleCode)
+                .map((row, meta) -> Boolean.TRUE)
+                .one()
+                .switchIfEmpty(Mono.error(new IllegalStateException("角色不存在：" + roleCode)))
+                .then();
     }
 
     private static PrincipalAttributes buildPrincipal(

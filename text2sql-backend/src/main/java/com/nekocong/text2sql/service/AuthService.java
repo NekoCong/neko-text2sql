@@ -5,6 +5,8 @@ import com.nekocong.text2sql.repository.UserRepository;
 import com.nekocong.text2sql.security.JwtService;
 import com.nekocong.text2sql.security.Roles;
 import com.nekocong.text2sql.user.AppUser;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -30,11 +32,12 @@ public class AuthService {
 
     private static final int MIN_PASSWORD_LENGTH = 6;
 
+    private static final Logger log = LoggerFactory.getLogger(AuthService.class);
+
     private final UserRepository users;
     private final AccessControlRepository access;
     private final PasswordEncoder passwordEncoder;
     private final JwtService jwtService;
-
     /**
      * Creates the service.
      *
@@ -86,6 +89,12 @@ public class AuthService {
                                                             .flatMap(
                                                                     user ->
                                                                             access.assignRoleByCode(user.id(), Roles.STUDENT)
+                                                                                    .doOnError(
+                                                                                            error ->
+                                                                                                    log.error(
+                                                                                                            "Failed to assign the built-in student role to {}",
+                                                                                                            user.id(),
+                                                                                                            error))
                                                                                     .onErrorMap(
                                                                                             error ->
                                                                                                     new ResponseStatusException(
@@ -107,17 +116,15 @@ public class AuthService {
         return users.findByUsername(username == null ? "" : username)
                 .switchIfEmpty(Mono.error(invalidCredentials()))
                 .flatMap(
-                        user -> {
-                            if (!user.enabled()) {
-                                return Mono.error(
-                                        new ResponseStatusException(
-                                                HttpStatus.UNAUTHORIZED, "账号已停用，请联系管理员"));
-                            }
-                            return verify(password, user)
-                                    .filter(Boolean::booleanValue)
-                                    .map(ok -> issue(user))
-                                    .switchIfEmpty(Mono.error(invalidCredentials()));
-                        });
+                        user ->
+                                // The password is checked first so a wrong password on a disabled
+                                // account gets the generic 401 rather than revealing the account's
+                                // existence and state.
+                                verify(password, user)
+                                        .filter(Boolean::booleanValue)
+                                        .switchIfEmpty(Mono.error(invalidCredentials()))
+                                        .flatMap(ok -> requireEnabled(user))
+                                        .map(ok -> issue(user)));
     }
 
     /**
@@ -140,6 +147,14 @@ public class AuthService {
     private Mono<Boolean> verify(String raw, AppUser user) {
         return Mono.fromCallable(() -> raw != null && passwordEncoder.matches(raw, user.passwordHash()))
                 .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /** Rejects a disabled account after the password has been verified. */
+    private static Mono<Boolean> requireEnabled(AppUser user) {
+        return user.enabled()
+                ? Mono.just(Boolean.TRUE)
+                : Mono.error(
+                        new ResponseStatusException(HttpStatus.UNAUTHORIZED, "账号已停用，请联系管理员"));
     }
 
     private AuthResult issue(AppUser user) {

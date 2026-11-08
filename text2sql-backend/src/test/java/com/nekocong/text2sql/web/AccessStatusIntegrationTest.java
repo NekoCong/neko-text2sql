@@ -70,13 +70,56 @@ class AccessStatusIntegrationTest {
         assertThat(roles).isEqualTo(1L);
 
         exec("UPDATE app_user SET enabled = FALSE WHERE id = :id", userId);
-        me(token).expectStatus().isUnauthorized();
+        me(token)
+                .expectStatus()
+                .isUnauthorized()
+                .expectHeader()
+                .contentType(MediaType.APPLICATION_JSON)
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("账号已停用，请联系管理员");
 
         exec("UPDATE app_user SET enabled = TRUE, token_version = token_version + 1 WHERE id = :id", userId);
-        me(token).expectStatus().isUnauthorized();
+        me(token)
+                .expectStatus()
+                .isUnauthorized()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("登录状态已失效，请重新登录");
 
         String fresh = TestAuth.login(web, username, PASSWORD);
         me(fresh).expectStatus().isOk().expectBody().jsonPath("$.username").isEqualTo(username);
+    }
+
+    @Test
+    void disabledAccountWithTheWrongPasswordGetsTheGenericRejection() {
+        // Account enumeration guard: a wrong password must not reveal that the account is disabled.
+        String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        String body =
+                web.post()
+                        .uri("/api/auth/register")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(Map.of("username", username, "password", PASSWORD))
+                        .exchange()
+                        .expectStatus()
+                        .isCreated()
+                        .expectBody(String.class)
+                        .returnResult()
+                        .getResponseBody();
+        String userId = jsonField(body, "user", "id");
+
+        exec("UPDATE app_user SET enabled = FALSE WHERE id = :id", userId);
+
+        web.post()
+                .uri("/api/auth/login")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("username", username, "password", "wrong-password"))
+                .exchange()
+                .expectStatus()
+                .isUnauthorized()
+                .expectBody()
+                .jsonPath("$.status")
+                .isEqualTo(401);
     }
 
     private WebTestClient.ResponseSpec me(String token) {
@@ -102,3 +145,4 @@ class AccessStatusIntegrationTest {
         }
     }
 }
+

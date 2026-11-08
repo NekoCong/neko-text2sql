@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import com.nekocong.text2sql.access.AccessContextResolver;
 import com.nekocong.text2sql.security.Roles;
@@ -48,33 +49,26 @@ import reactor.core.publisher.Mono;
 public class SecurityConfig {
 
     /**
-     * The account-status filter.
-     *
-     * <p>Deliberately declared here rather than as a {@code @Component}: Spring Boot installs every
-     * {@code WebFilter} bean on the web handler chain as well as the security chain, so a component
-     * would run twice (once before authentication). It is placed explicitly in the security chain
-     * below instead.
-     *
-     * @param resolver the access-context resolver
-     * @param jwtDecoder the JWT decoder used to read the bearer token
-     * @return the filter
-     */
-    @Bean
-    AccessStatusWebFilter accessStatusWebFilter(
-            AccessContextResolver resolver, ReactiveJwtDecoder jwtDecoder) {
-        return new AccessStatusWebFilter(resolver, jwtDecoder);
-    }
-
-    /**
      * The security filter chain.
      *
+     * <p>The account-status filter is constructed here instead of being exposed as a bean: Spring
+     * Boot adds every {@code WebFilter} bean to the top-level handler chain as well, so a bean would
+     * validate every request a second time (two JWT decodes and two access resolutions).
+     *
      * @param http the server HTTP security builder
-     * @param accessStatus the account-status filter, run after bearer authentication
+     * @param resolver the access-context resolver used by the account-status filter
+     * @param jwtDecoder the JWT decoder used to read the bearer token
+     * @param objectMapper the shared Jackson mapper used for error bodies
      * @return the filter chain
      */
     @Bean
     SecurityWebFilterChain springSecurityFilterChain(
-            ServerHttpSecurity http, AccessStatusWebFilter accessStatus) {
+            ServerHttpSecurity http,
+            AccessContextResolver resolver,
+            ReactiveJwtDecoder jwtDecoder,
+            ObjectMapper objectMapper) {
+        AccessStatusWebFilter accessStatus =
+                new AccessStatusWebFilter(resolver, jwtDecoder, objectMapper);
         ServerBearerTokenAuthenticationConverter bearerTokenConverter =
                 new ServerBearerTokenAuthenticationConverter();
         // Allow `?access_token=...` so the SSE endpoint works from the browser's EventSource.
