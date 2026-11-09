@@ -65,7 +65,6 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
                                 + " VALUES (:id, :code, :name, :description, :parentId, FALSE, :enabled,"
                                 + " :createdAt, :updatedAt)")
                         .bind("id", id)
-                        .bind("id", id)
                         .bind("code", code)
                         .bind("name", name)
                         .bind("enabled", enabled)

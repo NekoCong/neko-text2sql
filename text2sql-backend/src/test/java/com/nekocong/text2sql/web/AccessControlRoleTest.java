@@ -6,6 +6,7 @@ import com.nekocong.text2sql.access.AccessControlRepository;
 import com.nekocong.text2sql.repository.UserRepository;
 import com.nekocong.text2sql.security.Roles;
 import com.nekocong.text2sql.user.AppUser;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -54,7 +55,8 @@ class AccessControlRoleTest {
     void setUp() {
         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
         String username = unique("admin");
-        AppUser admin = users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
+        AppUser admin =
+                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
         access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
         adminId = admin.id();
         adminToken = TestAuth.login(client, username, PASSWORD);
@@ -96,6 +98,10 @@ class AccessControlRoleTest {
                 .doesNotExist();
 
         String id = roleIdByCode(code);
+        assertThat(auditRows("role.create", id, "SUCCESS"))
+                .as("the role row and its audit row are committed together")
+                .isEqualTo(1);
+        assertThat(roleCountByCode(code)).isEqualTo(1);
 
         client.get()
                 .uri(ROLES)
@@ -105,11 +111,26 @@ class AccessControlRoleTest {
                 .isOk()
                 .expectBody()
                 .jsonPath("$[*].id")
-                .value(ids -> assertThat((List<Object>) ids).contains(id))
-                .jsonPath("$[0].id")
-                .exists();
+                .value(ids -> assertThat((List<Object>) ids).contains(id));
+    }
 
-        assertThat(auditRows(adminId, "role.create", id, "SUCCESS")).isEqualTo(1);
+    @Test
+    void listsRolesOrderedByCode() {
+        List<String> codes =
+                client.get()
+                        .uri(ROLES)
+                        .header(HttpHeaders.AUTHORIZATION, bearer())
+                        .exchange()
+                        .expectStatus()
+                        .isOk()
+                        .expectBodyList(Map.class)
+                        .returnResult()
+                        .getResponseBody()
+                        .stream()
+                        .map(row -> String.valueOf(row.get("code")))
+                        .toList();
+
+        assertThat(codes).isNotEmpty().isSorted();
     }
 
     @Test
@@ -128,17 +149,15 @@ class AccessControlRoleTest {
                 .jsonPath("$.message")
                 .isEqualTo("角色编码已存在");
 
-        assertThat(auditRows(adminId, "role.create", null, "DENIED"))
+        assertThat(auditRows("role.create", roleIdByCode(code), "DENIED"))
                 .as("one DENIED row for the rejected create")
                 .isEqualTo(1);
     }
 
     @Test
     void updatesNameDescriptionAndParent() {
-        String parentCode = createRole("父角色", null);
-        String parentId = roleIdByCode(parentCode);
-        String childCode = createRole("子角色", null);
-        String childId = roleIdByCode(childCode);
+        String parentId = roleIdByCode(createRole("父角色", null));
+        String childId = roleIdByCode(createRole("子角色", null));
 
         client.put()
                 .uri(ROLES + "/" + childId)
@@ -165,7 +184,68 @@ class AccessControlRoleTest {
                 .jsonPath("$.parentId")
                 .isEqualTo(parentId);
 
-        assertThat(auditRows(adminId, "role.update", childId, "SUCCESS")).isEqualTo(1);
+        assertThat(auditRows("role.update", childId, "SUCCESS")).isEqualTo(1);
+        assertThat(roleName(childId)).isEqualTo("子角色（改）");
+    }
+
+    @Test
+    void omittingParentOnUpdateKeepsIt() {
+        String parentId = roleIdByCode(createRole("父（保留）", null));
+        String childId = roleIdByCode(createRole("子（保留）", null));
+        put(childId, Map.of("parentId", parentId)).expectStatus().isOk();
+
+        // No parentId at all: keep the existing parent, change only the name.
+        put(childId, Map.of("name", "只改名"))
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.parentId")
+                .isEqualTo(parentId)
+                .jsonPath("$.name")
+                .isEqualTo("只改名");
+
+        // An explicit null is the same as omitting it.
+        put(childId, Map.of("name", "再改名"))
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.parentId")
+                .isEqualTo(parentId);
+    }
+
+    @Test
+    void emptyStringClearsTheParent() {
+        String parentId = roleIdByCode(createRole("父（清除）", null));
+        String childId = roleIdByCode(createRole("子（清除）", null));
+        put(childId, Map.of("parentId", parentId)).expectStatus().isOk();
+
+        client.put()
+                .uri(ROLES + "/" + childId)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("parentId", ""))
+                .exchange()
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.parentId")
+                .doesNotExist();
+
+        assertThat(auditRows("role.update", childId, "SUCCESS")).isEqualTo(2);
+    }
+
+    @Test
+    void allowsADisabledParent() {
+        String parentId = roleIdByCode(createRole("停用的父", null));
+        put(parentId, Map.of("enabled", false)).expectStatus().isOk();
+
+        String childId = roleIdByCode(createRole("停用父的子", null));
+        put(childId, Map.of("parentId", parentId))
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.parentId")
+                .isEqualTo(parentId);
     }
 
     @Test
@@ -185,7 +265,7 @@ class AccessControlRoleTest {
                 .jsonPath("$.message")
                 .isEqualTo("角色编码不可修改");
 
-        assertThat(auditRows(adminId, "role.update", id, "DENIED"))
+        assertThat(auditRows("role.update", id, "DENIED"))
                 .as("exactly one DENIED row for the rejected code change")
                 .isEqualTo(1);
         assertThat(roleIdByCode(code)).isEqualTo(id);
@@ -193,75 +273,113 @@ class AccessControlRoleTest {
 
     @Test
     void rejectsSelfParentAndTwoRoleCycle() {
-        String firstCode = createRole("环一", null);
-        String firstId = roleIdByCode(firstCode);
-        String secondCode = createRole("环二", null);
-        String secondId = roleIdByCode(secondCode);
+        String firstId = roleIdByCode(createRole("环一", null));
+        String secondId = roleIdByCode(createRole("环二", null));
 
-        client.put()
-                .uri(ROLES + "/" + firstId)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("parentId", firstId))
-                .exchange()
+        put(firstId, Map.of("parentId", firstId))
                 .expectStatus()
                 .isEqualTo(409)
                 .expectBody()
                 .jsonPath("$.message")
                 .isEqualTo("会形成循环继承");
 
-        client.put()
-                .uri(ROLES + "/" + firstId)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("parentId", secondId))
-                .exchange()
-                .expectStatus()
-                .isOk();
+        put(firstId, Map.of("parentId", secondId)).expectStatus().isOk();
 
-        client.put()
-                .uri(ROLES + "/" + secondId)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("parentId", firstId))
-                .exchange()
+        put(secondId, Map.of("parentId", firstId))
                 .expectStatus()
                 .isEqualTo(409)
                 .expectBody()
                 .jsonPath("$.message")
                 .isEqualTo("会形成循环继承");
 
-        assertThat(auditRows(adminId, "role.update", secondId, "DENIED")).isEqualTo(1);
+        assertThat(auditRows("role.update", secondId, "DENIED")).isEqualTo(1);
+    }
+
+    @Test
+    void rejectsACycleThroughADeepAncestor() {
+        String topId = roleIdByCode(createRole("深一", null));
+        String midId = roleIdByCode(createRole("深二", null));
+        String leafId = roleIdByCode(createRole("深三", null));
+
+        put(midId, Map.of("parentId", topId)).expectStatus().isOk();
+        put(leafId, Map.of("parentId", midId)).expectStatus().isOk();
+
+        // top -> mid -> leaf already exists; making top a child of leaf would loop.
+        put(topId, Map.of("parentId", leafId))
+                .expectStatus()
+                .isEqualTo(409)
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("会形成循环继承");
+
+        assertThat(auditRows("role.update", topId, "DENIED")).isEqualTo(1);
+    }
+
+    @Test
+    void rejectsTheBuiltInAdminRoleAsAParent() {
+        String adminRoleId = roleIdByCode(Roles.ADMIN);
+
+        client.post()
+                .uri(ROLES)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(
+                        Map.of(
+                                "code", unique("escalate"),
+                                "name", "越权",
+                                "parentId", adminRoleId))
+                .exchange()
+                .expectStatus()
+                .isEqualTo(409)
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("内置管理员角色不能作为父角色");
+
+        String ownId = roleIdByCode(createRole("自建角色", null));
+        put(ownId, Map.of("parentId", adminRoleId))
+                .expectStatus()
+                .isEqualTo(409)
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("内置管理员角色不能作为父角色");
+
+        assertThat(auditRows("role.create", adminRoleId, "DENIED")).isEqualTo(1);
+        assertThat(auditRows("role.update", ownId, "DENIED")).isEqualTo(1);
     }
 
     @Test
     void rejectsAnUnknownParent() {
-        String code = createRole("孤儿", null);
-        String id = roleIdByCode(code);
+        String id = roleIdByCode(createRole("孤儿", null));
 
-        client.put()
-                .uri(ROLES + "/" + id)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("parentId", UUID.randomUUID().toString()))
-                .exchange()
+        put(id, Map.of("parentId", UUID.randomUUID().toString()))
                 .expectStatus()
                 .isNotFound()
                 .expectBody()
                 .jsonPath("$.message")
                 .isEqualTo("父角色不存在");
+
+        assertThat(auditRows("role.update", id, "DENIED")).isEqualTo(1);
     }
 
     @Test
-    void rejectsAnUnknownRoleId() {
+    void rejectsAnUnknownRoleIdAndAuditsIt() {
+        String unknown = UUID.randomUUID().toString();
+
         client.put()
-                .uri(ROLES + "/" + UUID.randomUUID())
+                .uri(ROLES + "/" + unknown)
                 .header(HttpHeaders.AUTHORIZATION, bearer())
                 .contentType(MediaType.APPLICATION_JSON)
                 .bodyValue(Map.of("name", "不存在"))
                 .exchange()
                 .expectStatus()
-                .isNotFound();
+                .isNotFound()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("角色不存在");
+
+        assertThat(auditRows("role.update", unknown, "DENIED"))
+                .as("the rejected request is filed against the requested id")
+                .isEqualTo(1);
     }
 
     @Test
@@ -283,67 +401,84 @@ class AccessControlRoleTest {
                 .exchange()
                 .expectStatus()
                 .isBadRequest();
+
+        client.post()
+                .uri(ROLES)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("code", unique("long"), "name", "名".repeat(101)))
+                .exchange()
+                .expectStatus()
+                .isBadRequest();
+    }
+
+    @Test
+    void rejectsAnOversizedDescription() {
+        client.post()
+                .uri(ROLES)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(
+                        Map.of(
+                                "code", unique("descr"),
+                                "name", "描述过长",
+                                "description", "描".repeat(513)))
+                .exchange()
+                .expectStatus()
+                .isBadRequest();
     }
 
     @Test
     void disablesACustomRoleButNotTheBuiltInAdmin() {
-        String code = createRole("可停用", null);
-        String id = roleIdByCode(code);
+        String id = roleIdByCode(createRole("可停用", null));
 
-        client.put()
-                .uri(ROLES + "/" + id)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("enabled", false))
-                .exchange()
+        put(id, Map.of("enabled", false))
                 .expectStatus()
                 .isOk()
                 .expectBody()
                 .jsonPath("$.enabled")
                 .isEqualTo(false);
 
-        assertThat(auditRows(adminId, "role.disable", id, "SUCCESS")).isEqualTo(1);
+        assertThat(auditRows("role.disable", id, "SUCCESS")).isEqualTo(1);
 
         String adminRoleId = roleIdByCode(Roles.ADMIN);
-        client.put()
-                .uri(ROLES + "/" + adminRoleId)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("enabled", false))
-                .exchange()
+        put(adminRoleId, Map.of("enabled", false))
                 .expectStatus()
                 .isEqualTo(409)
                 .expectBody()
                 .jsonPath("$.message")
                 .isEqualTo("内置管理员角色不能停用");
 
-        assertThat(auditRows(adminId, "role.disable", adminRoleId, "DENIED")).isEqualTo(1);
+        assertThat(auditRows("role.disable", adminRoleId, "DENIED")).isEqualTo(1);
         assertThat(roleEnabled(adminRoleId)).isTrue();
     }
 
     @Test
-    void renamingTheBuiltInAdminIsAllowed() {
+    void renamingTheBuiltInAdminIsAllowedAndRestored() {
         String adminRoleId = roleIdByCode(Roles.ADMIN);
-        client.put()
-                .uri(ROLES + "/" + adminRoleId)
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("name", "超级管理员"))
-                .exchange()
-                .expectStatus()
-                .isOk()
-                .expectBody()
-                .jsonPath("$.builtIn")
-                .isEqualTo(true)
-                .jsonPath("$.name")
-                .isEqualTo("超级管理员");
+        String originalName = roleName(adminRoleId);
+        try {
+            put(adminRoleId, Map.of("name", "超级管理员"))
+                    .expectStatus()
+                    .isOk()
+                    .expectBody()
+                    .jsonPath("$.builtIn")
+                    .isEqualTo(true)
+                    .jsonPath("$.name")
+                    .isEqualTo("超级管理员");
+        } finally {
+            // The H2 database is shared across test contexts: restore the seeded name.
+            put(adminRoleId, Map.of("name", originalName)).expectStatus().isOk();
+        }
+        assertThat(roleName(adminRoleId)).isEqualTo(originalName);
     }
 
     @Test
     void aStudentCannotManageRoles() {
         String username = unique("student");
         AppUser student =
-                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT).block();
+                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT)
+                        .block();
         access.assignRoleByCode(student.id(), Roles.STUDENT).block();
         String token = TestAuth.login(client, username, PASSWORD);
 
@@ -370,10 +505,19 @@ class AccessControlRoleTest {
         return "Bearer " + adminToken;
     }
 
+    private WebTestClient.ResponseSpec put(String roleId, Map<String, Object> body) {
+        return client.put()
+                .uri(ROLES + "/" + roleId)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .exchange();
+    }
+
     /** Creates a role through the API and returns its code. */
     private String createRole(String name, String parentId) {
         String code = unique("role");
-        Map<String, Object> body = new java.util.HashMap<>();
+        Map<String, Object> body = new HashMap<>();
         body.put("code", code);
         body.put("name", name);
         if (parentId != null) {
@@ -401,6 +545,24 @@ class AccessControlRoleTest {
         return id;
     }
 
+    private long roleCountByCode(String code) {
+        Long count =
+                db.sql("SELECT COUNT(*) AS n FROM access_role WHERE code = :code")
+                        .bind("code", code)
+                        .map((row, meta) -> row.get("n", Long.class))
+                        .one()
+                        .block();
+        return count == null ? 0L : count;
+    }
+
+    private String roleName(String roleId) {
+        return db.sql("SELECT name FROM access_role WHERE id = :id")
+                .bind("id", roleId)
+                .map((row, meta) -> row.get("name", String.class))
+                .one()
+                .block();
+    }
+
     private boolean roleEnabled(String roleId) {
         Boolean enabled =
                 db.sql("SELECT enabled FROM access_role WHERE id = :id")
@@ -411,31 +573,30 @@ class AccessControlRoleTest {
         return Boolean.TRUE.equals(enabled);
     }
 
-    /** Counts audit rows matching the actor/action/result, with an optional entity id. */
-    private long auditRows(String actorId, String action, String entityId, String result) {
-        String sql =
-                "SELECT COUNT(*) AS n FROM access_audit"
-                        + " WHERE actor_id = :actorId AND action = :action AND result = :result"
-                        + (entityId == null ? "" : " AND entity_id = :entityId");
+    /**
+     * Counts audit rows for this test's admin actor and the given action/result.
+     *
+     * @param entityId the entity id to filter by, or {@code null} to apply <em>no</em> id filter
+     *     (never {@code IS NULL})
+     */
+    private long auditRows(String action, String entityId, String result) {
+        StringBuilder sql =
+                new StringBuilder(
+                        "SELECT COUNT(*) AS n FROM access_audit"
+                                + " WHERE actor_id = :actorId AND action = :action AND result = :result");
+        if (entityId != null) {
+            sql.append(" AND entity_id = :entityId");
+        }
         DatabaseClient.GenericExecuteSpec spec =
-                db.sql(sql)
-                        .bind("actorId", actorId)
+                db.sql(sql.toString())
+                        .bind("actorId", adminId)
                         .bind("action", action)
                         .bind("result", result);
         if (entityId != null) {
             spec = spec.bind("entityId", entityId);
         }
-        Long count =
-                spec.map((row, meta) -> row.get("n", Long.class)).one().block();
+        Long count = spec.map((row, meta) -> row.get("n", Long.class)).one().block();
         return count == null ? 0L : count;
-    }
-
-    private static String readId(String json) {
-        try {
-            return new com.fasterxml.jackson.databind.ObjectMapper().readTree(json).get("id").asText();
-        } catch (Exception ex) {
-            throw new IllegalStateException("Failed to parse role id", ex);
-        }
     }
 
     /** A unique, pattern-valid code (lowercase start, then alphanumerics). */

@@ -4,11 +4,14 @@ import com.nekocong.text2sql.access.AccessAdminService;
 import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRoleView;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -26,6 +29,11 @@ import reactor.core.publisher.Mono;
  * <p>There is no delete: a role is disabled with {@code PUT {enabled:false}}. Access is enforced by
  * {@code SecurityConfig} ({@code /api/admin/**} requires the {@code access.manage} permission
  * resolved from the access-control tables), so an unauthorized caller never reaches these handlers.
+ *
+ * <p>Validation and conflict failures are answered here with {@code {"status": ..., "message": ...}}.
+ * The handler is deliberately local to this controller: the application-wide advice is untouched, so
+ * the error shape of the auth, conversation, model, datasource and knowledge endpoints does not
+ * change.
  *
  * <p>The acting user id (the token subject) is passed to the service for the audit trail; without an
  * authenticated principal the request fails closed with {@code 401}.
@@ -64,20 +72,51 @@ public class AccessControlController {
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
     public Mono<AccessRoleView> create(@RequestBody AccessRoleRequest request) {
-        return actorId().flatMap(actor -> service.create(actor, request));
+        return actorId()
+                .flatMap(actor -> service.create(actor, request))
+                .onErrorMap(AccessControlController::asStatusException);
     }
 
     /**
      * Updates a role ({@code code} is immutable).
      *
+     * <p>An omitted or {@code null} field keeps its current value; {@code "parentId": ""} clears the
+     * parent.
+     *
      * @param id the role id
-     * @param request the new values; {@code null} fields keep their current value
+     * @param request the new values
      * @return the updated role
      */
     @PutMapping("/{id}")
     public Mono<AccessRoleView> update(
             @PathVariable String id, @RequestBody(required = false) AccessRoleRequest request) {
-        return actorId().flatMap(actor -> service.update(actor, id, request));
+        return actorId()
+                .flatMap(actor -> service.update(actor, id, request))
+                .onErrorMap(AccessControlController::asStatusException);
+    }
+
+    /** Converts the service's audited rejection into the status exception the handler renders. */
+    private static Throwable asStatusException(Throwable error) {
+        ResponseStatusException mapped = AccessAdminService.toResponseStatusException(error);
+        return mapped == null ? error : mapped;
+    }
+
+    /**
+     * Renders a validation or conflict failure raised by the role API.
+     *
+     * @param exception the failure
+     * @return the mapped response
+     */
+    @ExceptionHandler(ResponseStatusException.class)
+    public ResponseEntity<Map<String, Object>> handleStatus(ResponseStatusException exception) {
+        HttpStatus resolved = HttpStatus.resolve(exception.getStatusCode().value());
+        if (resolved == null) {
+            resolved = HttpStatus.INTERNAL_SERVER_ERROR;
+        }
+        String reason = exception.getReason();
+        String message = reason == null || reason.isBlank() ? resolved.getReasonPhrase() : reason;
+        return ResponseEntity.status(resolved)
+                .body(Map.of("status", resolved.value(), "message", message));
     }
 
     /**
