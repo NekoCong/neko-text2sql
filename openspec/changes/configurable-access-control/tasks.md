@@ -30,7 +30,7 @@
 
 ## 5. Admin API
 
-- [ ] 5.1 Add role CRUD and hierarchy endpoints under `/api/admin/access-control/roles`, including built-in protection, code immutability, and cycle rejection. Verify 200/403/409 cases and audit rows.
+- [x] 5.1 Add role CRUD and hierarchy endpoints under `/api/admin/access-control/roles`, including built-in protection, code immutability, and cycle rejection. Verify 200/403/409 cases and audit rows.
 - [ ] 5.2 Add permission catalog and role-permission matrix endpoints. Verify assigning/revoking a permission changes the next request's effective permission.
 - [ ] 5.3 Add data-scope endpoints with server-side validation against datasource metadata and the principal-attribute catalog. Verify invalid table/column/attribute and raw-SQL input are rejected with 422.
 - [ ] 5.4 Add user management endpoints under `/api/admin/access-control/users`: search/paginate (`user.read`), create with an initial password, edit the display name, disable/enable, reset password, and assign/remove roles (`user.manage`). Password fields are write-only and never echoed back. Verify create/duplicate-username/disable/enable/reset/role-assignment cases, that responses contain no password material, and that every mutation is audited.
