@@ -122,10 +122,14 @@ docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build --remove-
 
 # --- 6b. Migrate an existing volume ------------------------------------------------------------
 # MySQL only runs the init scripts on an empty data directory, so a container recreated on an old
-# volume would keep its old columns. app-migrate.sql is idempotent and safe to run every time.
+# volume would keep its old columns. Both scripts are idempotent and safe to run every time.
+# 03-app-migrate.sql covers the pre-existing column additions; 04-access-control.sql adds
+# app_user.enabled/token_version, the seven access_* tables, indexes and the built-in seed/backfill.
 log "Applying idempotent application-database migrations"
-docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
-    sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" < /docker-entrypoint-initdb.d/03-app-migrate.sql'
+for script in 03-app-migrate.sql 04-access-control.sql; do
+    docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
+        sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" \"\$MYSQL_DATABASE\" < /docker-entrypoint-initdb.d/$script"
+done
 
 # --- 7. Wait for it to serve --------------------------------------------------------------------
 log "Waiting for the backend to answer"

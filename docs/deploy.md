@@ -166,8 +166,10 @@ sudo bash deploy/bootstrap.sh
 4. `ufw` 只放行 22 / 80
 5. 校验 `deploy/.env`：缺 `MYSQL_ROOT_PASSWORD` 或 `TEXT2SQL_JWT_SECRET`、或 JWT 密钥短于 32 字符 → **直接退出**，绝不写默认值
 6. `docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env up -d --build`
-7. 轮询 `http://127.0.0.1/api/text2sql/health` 直到就绪（最多 5 分钟），失败则打印排查命令
-8. 打印访问地址与账号
+7. 对已有数据卷执行幂等迁移：`03-app-migrate.sql`（历史列）与 `04-access-control.sql`
+   （`app_user.enabled/token_version`、七张 `access_*` 表、索引、内置角色/权限/数据范围种子与回填）
+8. 轮询 `http://127.0.0.1/api/text2sql/health` 直到就绪（最多 5 分钟），失败则打印排查命令
+9. 打印访问地址与账号
 
 脚本**幂等**：重复执行安全，这正是实例被回收后的恢复方式。
 
@@ -209,7 +211,12 @@ curl -s -X POST http://127.0.0.1/api/auth/login \
 4. 用 `student01` 提问「全校平均分」→ 只基于本人数据回答，并说明数据范围
 5. 退出，`counselor01/counselor123` → 可查询 1 班与 2 班数据，看不到 3 班
 6. 管理员打开「数据源权限」页 → 勾选/撤销学生或辅导员的 `campus` 授权，下一次请求立即生效
-7. 管理员打开「知识库」页（顶部导航）→ 元数据分栏点「元数据同步」（应出现 5 条表条目）→
+7. 管理员打开「权限管理」页 → 角色 / 权限 / 数据范围 / 用户 / 数据源授权 / 审计 六个 Tab：
+   - 新建自定义角色 → 在「权限」Tab 勾选 `chat.use` 与 `datasource.read`；
+   - 「数据范围」Tab 为 `campus/score` 配 `FILTER student_id = studentId`；
+   - 「用户」Tab 创建用户并分配该角色 → 用新账号登录提问「我的数学成绩」，结果应只含本人；
+   - 「审计」Tab 应看到上述变更的 SUCCESS 行；停用该账号 → 旧令牌下一次请求 401/403
+8. 管理员打开「知识库」页（顶部导航）→ 元数据分栏点「元数据同步」（应出现 5 条表条目）→
    业务/智能体分栏上传一个 docx 或导入一个网页 → 状态变为「就绪」→ 用「检索调试」查看候选表与
    引用 → 回到对话提问，回答下方出现引用角标，点击可打开原文/文本快照并高亮命中位置
 
@@ -245,6 +252,61 @@ sudo bash deploy/bootstrap.sh
 
 ---
 
+## 5.1 访问控制变更迁移（2026-11-09）
+
+本分支新增可配置 RBAC / 数据范围，**只做加法**：
+
+- `app_user` 新增 `enabled BOOLEAN NOT NULL DEFAULT TRUE`、`token_version INTEGER NOT NULL DEFAULT 0`；
+- 新增 `access_role`、`access_permission`、`access_role_permission`、`access_user_role`、
+  `access_role_datasource`、`access_data_scope`、`access_audit` 七张表与二级索引；
+- 回填内置角色/权限/数据范围，并按 `app_user.role` / `datasource_access` 回填用户角色与数据源授权；
+- 旧的 `app_user.role`、`user_scope`、`datasource_access` 原样保留，供回滚与旧展示逻辑使用。
+
+**全新数据卷**：compose 会把 `04-access-control.sql` 挂到 MySQL init 目录，首次初始化自动执行。
+
+**已有数据卷**（升级现有部署）：`bootstrap.sh` 每次部署都会执行
+`03-app-migrate.sql` 与 `04-access-control.sql`（均幂等）。手动执行等价于：
+
+```bash
+docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env exec -T mysql \
+  sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" \
+         < /docker-entrypoint-initdb.d/04-access-control.sql'
+```
+
+升级前先备份（本演示默认不持久化，但升级动作仍建议留一份）：
+
+```bash
+docker compose -f deploy/docker-compose.prod.yml exec -T mysql \
+  sh -c 'mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --single-transaction "$MYSQL_DATABASE"' \
+  > backup-$(date +%Y%m%d-%H%M).sql
+```
+
+迁移后核验：
+
+```sql
+SELECT id, username, enabled, token_version FROM app_user;
+SELECT code, built_in, enabled FROM access_role;
+SELECT permission_key FROM access_permission ORDER BY permission_key;
+SELECT COUNT(*) FROM access_user_role;
+SELECT COUNT(*) FROM access_role_datasource;
+SELECT COUNT(*) FROM access_data_scope;
+```
+
+预期：`admin` / `student01` / `counselor01` 都有对应 `access_user_role` 行；`access_permission`
+有 9 个内置键；`access_role_datasource` 至少 `student → campus`、`counselor → campus`。
+
+**上线注意**：旧版本签发的 JWT 不带 `ver`，新解析器会 fail-closed，因此升级后所有用户需要
+重新登录一次（这是预期行为，不是故障）。
+
+**回滚**：回退应用镜像即可；新增的表/列是加法，可以保留不动，旧代码不会读取它们。若必须清理，
+先确认没有新数据写入，再按 `04-access-control.sql` 逆序删除表并删除两列（演示环境可直接
+`down -v` 重建，代价是数据丢失）。
+
+> 本分支的 MySQL 迁移与种子脚本目前只在 H2 测试库验证过；首次部署后请按上面的 SQL 与 §4 的浏览器
+> 流程复跑确认。
+
+---
+
 ## 6. 故障排查
 
 | 现象 | 原因 | 处理 |
@@ -257,7 +319,8 @@ sudo bash deploy/bootstrap.sh
 | 页面能开但接口 502 | backend 未就绪或崩了 | `docker compose -f deploy/docker-compose.prod.yml logs --tail=200 backend` |
 | 提问时 SSE 中途断流 | nginx 缓冲/超时 | `nginx.conf` 里已设 `proxy_buffering off; proxy_read_timeout 3600s;`，确认容器用的是仓库里的这份配置 |
 | 种子数据没进库 | MySQL 卷已存在，init 脚本不会再跑 | `docker compose -f deploy/docker-compose.prod.yml down -v` 再 up（**会删库**） |
-| 改了 `app-schema.sql` 但表结构没变 | init 脚本只在空库时执行 | 新列/索引同时写进 `deploy/app-migrate.sql`（幂等，`bootstrap.sh` 每次部署都会执行）；或 `down -v` 重建 |
+| 改了 `app-schema.sql` 但表结构没变 | init 脚本只在空库时执行 | 新列/索引同时写进幂等迁移（`deploy/app-migrate.sql` 或 `db/migration/*.sql`，`bootstrap.sh` 每次部署都会执行）；或 `down -v` 重建 |
+| 升级后所有账号被登出 | 旧 JWT 没有 `ver`，新解析器 fail-closed | 预期行为，重新登录一次；不是故障 |
 | `docker pull` 卡住 / `TIMEOUT` / `no such host` | Docker Hub 在大陆被封（见 §1.1） | 确认 `deploy/.env` 里 6 个 `*_IMAGE` 变量都指向华为云 SWR 且不为空 |
 | 构建报 `docker.io/library/maven:... : not found` | 给 maven 加了 `library/` 前缀 | maven 用 `.../docker.io/maven:...`（不带 library），见 §1.1 |
 | `docker compose` 不存在 | 只装了 `docker.io` 没装插件 | `apt-get install -y docker-compose-v2` |
@@ -289,7 +352,8 @@ Docker 构建不受影响（镜像里自带 JDK 25）。
 | `text2sql-frontend/Dockerfile` | `node:22-alpine` 构建 → `nginx:alpine` 托管 |
 | `text2sql-frontend/nginx.conf` | SPA 回退 + `/api` 反代 + SSE 关缓冲 |
 | `docker-compose.yml` | **本地**只用基础设施（MySQL + otel-lgtm），不含应用容器 |
-| `text2sql-backend/src/main/resources/db/app-data.sql` | 种子数据：admin / student01-03 / counselor01 + 数据范围 + 会话 |
+| `text2sql-backend/src/main/resources/db/app-data.sql` | 种子数据：admin / student01-03 / counselor01 + 数据范围 + 会话 + 内置角色/权限 |
+| `text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql` | 已有数据卷的幂等迁移：`app_user` 两列、七张 `access_*` 表、索引、种子与回填 |
 
 ---
 

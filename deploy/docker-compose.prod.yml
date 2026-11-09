@@ -36,6 +36,9 @@ services:
       # Idempotent migrations for volumes created before a column was added. Also executed by
       # deploy/bootstrap.sh on every deploy, because init scripts only run on empty volumes.
       - ./app-migrate.sql:/docker-entrypoint-initdb.d/03-app-migrate.sql:ro
+      # Access-control migration (app_user.enabled/token_version + access_* tables/seed): additive and
+      # idempotent. On a fresh volume it runs once here; on an existing volume bootstrap.sh runs it.
+      - ../text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql:/docker-entrypoint-initdb.d/04-access-control.sql:ro
     healthcheck:
       # $$ escapes to a literal $ inside the container, where MYSQL_ROOT_PASSWORD is already set,
       # so the password is not duplicated into the compose file's environment.

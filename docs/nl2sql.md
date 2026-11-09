@@ -53,9 +53,9 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 | `SchemaProvider` / `FullSchemaProvider` | `schema` | 生成提示词用 schema 文本（带字符预算） |
 | `SchemaRenderer` | `schema` | 表结构 → 紧凑 DDL |
 | `SqlSafetyValidator` | `sql` | 只读校验（多语句、非 SELECT、危险关键字） |
-| `TablePolicy` | `security` | 角色 → 可访问表 + 行过滤谓词模板 |
-| `DataScopeResolver` / `DataScope` | `security` | 从应用库解析调用者的角色、班级、学号与可用数据源 |
-| `DataScopeRewriter` | `sql` | AST 重写：把受保护表的引用替换为带过滤谓词的派生表（fail-closed） |
+| `AccessContextResolver` / `EffectiveAccess` | `access` | 每次请求从应用库解析账号状态、令牌版本、有效角色/权限、数据源授权、数据范围与主体属性 |
+| `DataScopePolicyEngine` | `access` | 合并同名表的角色策略：`DENY` > `ALL` > `FILTER`（多个 `FILTER` 取 OR），未配置即拒绝 |
+| `DataScopeRewriter` | `sql` | AST 重写：按策略把受保护表替换为带过滤谓词的派生表（fail-closed，CTE 安全） |
 | `DatasourceAccessGuard` | `datasource` | 数据源白名单判定与默认回落 |
 | `SqlExecutor` | `sql` | 只读执行、行数上限、超时、结果集映射 |
 | `PromptAssembler` | `nl2sql` | 系统/用户提示词 |
@@ -71,13 +71,46 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 
 1. **语句级**：仅单条语句；必须以 `SELECT` / `WITH` 开头；标识符扫描阻断
    `INSERT/UPDATE/DELETE/DROP/ALTER/.../INTO/...`。
-2. **权限级（强制的数据边界）**：生成的 SQL 在执行前经 `DataScopeRewriter` 做 AST 重写，
-   每张受保护表的引用变成带过滤谓词的派生表（学生按本人、辅导员按所管班级）；模型未写过滤条件
-   也会被补上，写了越界条件只会得到空集。解析失败、结构不支持或引用白名单外的表时直接拒绝执行。
-3. **数据源级**：非管理员只能使用角色被授权的数据源；授权集合为空时失败，不回落到全局默认。
-4. **连接级**：`Connection.setReadOnly(true)`；建议数据源使用只读账号。
-5. **资源级**：`Statement.setMaxRows(rowLimit+1)`（检测截断）、`setQueryTimeout(timeout)`。
-6. **线程级**：阻塞 JDBC 全部在 `Schedulers.boundedElastic()` 上执行，绝不阻塞 Netty 事件循环。
+2. **权限级（强制的数据边界）**：生成 SQL 后先由 `DataScopePolicyEngine` 按“角色 → 数据源 →
+   表”解析策略，再由 `DataScopeRewriter` 做 AST 重写。策略只有三种，均由管理端配置、存表：
+   - `DENY`：该表一律拒绝（优先级最高，压过同表的 `ALL`/`FILTER`）；
+   - `ALL`：不附加行过滤（优先于 `FILTER`）；
+   - `FILTER`：把 `column IN/= 主体属性` 注入为派生表谓词；同一张表有多条 `FILTER` 时取 OR。
+   未配置任何策略的表默认拒绝。学生、辅导员的具体范围来自种子数据（本人 / 所管班级），
+   不再是代码常量。若模型写了越界条件，只会得到空集；解析失败、结构不支持、引用白名单外的表、
+   递归 CTE 或同名 CTE 遮蔽一律拒绝执行。`access.bypass_data_scope`（内置管理员）跳过行过滤，
+   但仍受表可见性与 SQL 只读校验约束。
+3. **数据源级**：非管理员只能使用**有效角色**（含继承）被授权的数据源；授权集合为空时失败，
+   不回落到全局默认。角色→数据源矩阵存于 `access_role_datasource`，旧的 `datasource_access`
+   仅作兼容与迁移回填。
+4. **账号与令牌级**：每个受保护请求都校验 `app_user.enabled` 与 JWT `ver` 是否等于
+   `app_user.token_version`；停用、启用、重置密码都会递增版本，旧令牌在下一次请求即失效。
+   JWT 的 `role` claim 仅用于展示，授权只读取数据库中的有效角色/权限。
+5. **管理接口级**：角色/权限/数据范围/数据源矩阵需要 `access.manage`；用户列表/详情需要
+   `user.read`，用户写操作需要 `user.manage`；审计读取需要 `audit.read`。防提权规则禁止管理员
+   授予或继承自己未持有的权限，并保护最后一个 `access.manage` 持有者与内置 `admin` 角色。
+6. **连接级**：`Connection.setReadOnly(true)`；建议数据源使用只读账号。
+7. **资源级**：`Statement.setMaxRows(rowLimit+1)`（检测截断）、`setQueryTimeout(timeout)`。
+8. **线程级**：阻塞 JDBC 统一在 `blockingScheduler`（每任务一个虚拟线程）上执行，绝不阻塞
+   Netty 事件循环。
+
+### 4.1 可配置访问控制（角色/权限/数据范围存表）
+
+角色、权限与数据范围都是数据，不是代码常量；新增角色或调整范围不需要改代码、也不需要重新登录：
+
+- **表**：`access_role`（编码不可变、单父继承、内置标记、启用状态）、`access_permission`
+  （权限目录）、`access_role_permission`、`access_user_role`、`access_role_datasource`、
+  `access_data_scope`、`access_audit`。无数据库外键，引用在服务层校验；角色/用户停用而非删除。
+- **权限键**：`chat.use`、`datasource.read`、`datasource.write`、`model.manage`、`access.manage`、
+  `user.read`、`user.manage`、`audit.read`、`access.bypass_data_scope`。
+- **合并规则**：同一张表（同一角色、同一数据源）上 `DENY` > `ALL` > `FILTER`；多个 `FILTER`
+  之间为 OR；没有任何策略即拒绝。继承来的角色与其父角色一并参与合并。
+- **管理 API**：`/api/admin/access-control/**`。角色/权限/数据范围/数据源矩阵 → `access.manage`；
+  用户列表/详情 → `user.read`，用户写操作 → `user.manage`；审计读取 → `audit.read`。
+- **审计**：每次变更写 `access_audit`（操作者、动作、对象、before/after、结果），密码材料永不入审计；
+  被拒绝的提权/锁定操作也会写 `DENIED`。
+- **生效时机**：权限与数据范围在每次请求重新解析，改角色后下一次请求立即生效；停用账号、重置密码
+  会递增 `token_version`，旧令牌立即失效。
 
 ## 5. SSE 事件契约（前端契约，与 AgentScope 内部事件解耦）
 
@@ -179,6 +212,14 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 - `AuthControllerTest` — 注册/登录/当前用户 + 受保护接口 401（真实 JWT）。
 - `ConversationControllerTest` — 会话 CRUD 与用户隔离。
 - `ModelConfigControllerTest` — 模型配置 CRUD（API Key 不外泄）。
+- `AccessControlRoleTest` / `AccessControlPermissionTest` / `AccessControlDataScopeTest` /
+  `AccessControlUserTest` / `AccessControlDatasourceMatrixTest` / `AccessControlAuditTest` /
+  `AccessControlEscalationTest` — 角色/权限矩阵/数据范围/用户生命周期/数据源矩阵/审计/防提权与
+  lockout 的真实 HTTP + H2 用例（含审计行、下一次请求生效、`user.read`/`user.manage`/`audit.read`
+  路由隔离）。
+- `DataScopeRewriterTest` / `DataScopePolicyEngineTest` — `DENY` > `ALL` > `FILTER` 合并、CTE
+  同名遮蔽/递归 CTE/schema 限定引用、越界条件与解析失败 fail-closed。
+- `AccessStatusIntegrationTest` — 停用账号与过期 `token_version` 在下一次请求被拒绝。
 
 > 所有测试运行在 `test` profile（H2 应用库），无需 MySQL。测试通过真实 `/api/auth/register`+`/login` 取 JWT 后再访问受保护接口。
 
