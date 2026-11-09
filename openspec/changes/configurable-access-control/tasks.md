@@ -19,7 +19,7 @@
 - [x] 3.1 Replace `DataScope`/`TablePolicy` usage in `Text2SqlPipelineService`, `SqlTools`, schema providers, and introspection with the effective-access context and policy engine. Verify pipeline and AgentScope tests produce the same filtered result for the same user.
 - [x] 3.2 Update `SqlExecutor` and the pipeline guard so an unconfigured table, unknown policy, or missing access context fails before `executeQuery`. Verify no statement is executed for a denied table.
 - [x] 3.3 Replace `scopedExplanation` and `callerContext` role branches with policy/role metadata from the effective-access context. Verify student/counselor/admin answers keep the same scope wording and no role-name helper remains in those methods.
-- [ ] 3.4 Replace `Roles.isAdmin(jwt)` checks in `SecurityConfig`, datasource admin controllers, and model-config controllers with permission checks. Verify non-admin users get 403 on management APIs and authorized custom roles get 200.
+- [x] 3.4 Replace `Roles.isAdmin(jwt)` checks in `SecurityConfig`, datasource admin controllers, and model-config controllers with permission checks. Verify non-admin users get 403 on management APIs and authorized custom roles get 200.
 - [x] 3.5 Add account-status and session invalidation: login rejects disabled accounts; the JWT carries the user's `token_version` (`ver`); the access resolver rejects a disabled account or version mismatch on every request; disable, re-enable and password reset bump the version; self-registration assigns the seeded `student` role. Verify disabled login returns 401, an old token is rejected after disable and after reset, a re-enabled account still needs a new login, and a newly registered user has the student role.
 
 ## 4. SQL rewriting and CTE fix
