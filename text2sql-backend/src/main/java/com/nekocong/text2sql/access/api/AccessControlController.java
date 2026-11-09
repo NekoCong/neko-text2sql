@@ -3,6 +3,7 @@ package com.nekocong.text2sql.access.api;
 import com.nekocong.text2sql.access.AccessAdminService;
 import com.nekocong.text2sql.access.AuditQueryService;
 import com.nekocong.text2sql.access.DataScopeService;
+import com.nekocong.text2sql.access.DatasourceSchemaService;
 import com.nekocong.text2sql.access.RoleDatasourceService;
 import com.nekocong.text2sql.access.RolePermissionService;
 import com.nekocong.text2sql.access.UserAdminService;
@@ -22,6 +23,7 @@ import com.nekocong.text2sql.access.api.dto.AccessUserView;
 import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
 import com.nekocong.text2sql.access.api.dto.DataScopeView;
 import com.nekocong.text2sql.access.api.dto.DatasourceMatrixView;
+import com.nekocong.text2sql.access.api.dto.DatasourceSchemaView;
 import com.nekocong.text2sql.access.api.dto.RoleDatasourcesRequest;
 import com.nekocong.text2sql.access.api.dto.RoleDatasourcesView;
 import java.util.List;
@@ -82,6 +84,7 @@ public class AccessControlController {
     private final UserAdminService users;
     private final RoleDatasourceService roleDatasources;
     private final AuditQueryService auditService;
+    private final DatasourceSchemaService schemaService;
 
     /**
      * Creates the controller.
@@ -92,6 +95,7 @@ public class AccessControlController {
      * @param users the user lifecycle service
      * @param roleDatasources the role → datasource matrix service
      * @param auditService the read-only audit-trail service
+     * @param schemaService the read-only datasource schema service
      */
     public AccessControlController(
             AccessAdminService service,
@@ -99,13 +103,15 @@ public class AccessControlController {
             DataScopeService dataScopes,
             UserAdminService users,
             RoleDatasourceService roleDatasources,
-            AuditQueryService auditService) {
+            AuditQueryService auditService,
+            DatasourceSchemaService schemaService) {
         this.service = service;
         this.permissions = permissions;
         this.dataScopes = dataScopes;
         this.users = users;
         this.roleDatasources = roleDatasources;
         this.auditService = auditService;
+        this.schemaService = schemaService;
     }
 
     /**
@@ -317,6 +323,21 @@ public class AccessControlController {
     @ResponseStatus(HttpStatus.NO_CONTENT)
     public Mono<Void> deleteDataScope(@PathVariable String id) {
         return actorId().flatMap(actor -> dataScopes.delete(actor, id));
+    }
+
+    /**
+     * Reads one datasource's live table/column metadata for the data-scope editor's selectors.
+     *
+     * <p>Read-only and gated by the generic {@code /api/admin/**} {@code access.manage} rule. Returns
+     * only table and column names plus type names — never connection settings or credentials. An
+     * unknown datasource is a {@code 404} rendered in the controller's {@code {status,message}} shape.
+     *
+     * @param id the datasource id
+     * @return the schema
+     */
+    @GetMapping(path = "/api/admin/access-control/datasources/{id}/schema")
+    public Mono<DatasourceSchemaView> datasourceSchema(@PathVariable String id) {
+        return schemaService.schema(id);
     }
 
     /**
