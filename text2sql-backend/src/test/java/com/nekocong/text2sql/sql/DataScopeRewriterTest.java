@@ -344,6 +344,180 @@ class DataScopeRewriterTest {
                 "SELECT * FROM student");
     }
 
+    @Test
+    void rejectsACteWhoseNameCollidesWithAProtectedTable() {
+        // The bypass probe: a CTE named like a protected table must not make the outer reference
+        // look like a CTE, which would skip both the whitelist and the row filter.
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH student AS (SELECT * FROM student) SELECT * FROM student",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void rejectsACteNameCollisionEvenWhenTheBodyLooksBenign() {
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH score AS (SELECT 1 AS x) SELECT * FROM score",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("score");
+    }
+
+    @Test
+    void rejectsACteNameCollisionCaseInsensitively() {
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH Student AS (SELECT 1 AS x) SELECT * FROM Student",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class);
+    }
+
+    @Test
+    void filtersAProtectedTableReferencedInsideALegalCteBody() {
+        String sql =
+                rewriter.rewrite(
+                        "WITH mine AS (SELECT * FROM student WHERE class_id = 1) SELECT * FROM mine",
+                        student(),
+                        CAMPUS);
+
+        assertThat(compact(sql)).contains("student_no in ('2023001')");
+        // The outer reference is the CTE itself and must not be wrapped again.
+        assertThat(compact(sql)).doesNotContain("as mine");
+    }
+
+    @Test
+    void rejectsADeniedTableReferencedInsideALegalCteBody() {
+        DataScope denied = AccessFixtures.custom(
+                "denied",
+                List.of(rule("d1", CAMPUS, "student", DataScopePolicy.DENY, null, null)),
+                Set.of(1L));
+
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH mine AS (SELECT * FROM student) SELECT * FROM mine",
+                                        denied,
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void aSchemaQualifiedCteBodyReferenceIsStillFiltered() {
+        String sql =
+                rewriter.rewrite(
+                        "WITH mine AS (SELECT * FROM campus.student) SELECT * FROM mine",
+                        student(),
+                        CAMPUS);
+
+        assertThat(compact(sql)).contains("student_no in ('2023001')");
+    }
+
+    @Test
+    void earlierCtesAreVisibleInsideALaterCteBodyButTheCurrentNameIsNot() {
+        // b may read a (defined earlier); a is a CTE reference, so it is not wrapped. The physical
+        // table inside a's body is still filtered.
+        String sql =
+                rewriter.rewrite(
+                        "WITH a AS (SELECT * FROM score), b AS (SELECT * FROM a) SELECT * FROM b",
+                        student(),
+                        CAMPUS);
+
+        assertThat(countOccurrences(compact(sql), "student_id in (1)")).isEqualTo(1);
+        assertThat(compact(sql)).doesNotContain("as a").doesNotContain("as b");
+    }
+
+    @Test
+    void aCteNameIsNotVisibleInsideItsOwnBody() {
+        // `sub` reads the physical table `student`; `x` reads `sub` (an earlier CTE, so visible).
+        // If the current CTE's name were visible while rewriting its own body, `sub` inside `x` would
+        // be treated as the CTE `sub` - fine - but the discriminating case is the one below: a CTE
+        // whose body references a name that is ALSO a later CTE. Here `x`'s body reads `student`,
+        // which is a protected physical table, so it must be filtered, not treated as anything else.
+        String sql =
+                rewriter.rewrite(
+                        "WITH x AS (SELECT * FROM student), y AS (SELECT * FROM x) "
+                                + "SELECT * FROM y",
+                        student(),
+                        CAMPUS);
+
+        assertThat(countOccurrences(compact(sql), "student_no in ('2023001')")).isEqualTo(1);
+        // x and y are CTE references at their use sites: not wrapped again.
+        assertThat(compact(sql)).doesNotContain("as x").doesNotContain("as y");
+    }
+
+    @Test
+    void aCteCannotReferenceItsOwnNameAsAPhysicalTable() {
+        // The name `x` is only a CTE from outside its body. Inside its own body `FROM x` is a
+        // physical table reference, which the policy denies.
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH x AS (SELECT * FROM x) SELECT * FROM x",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("x");
+    }
+
+    @Test
+    void rejectsRecursiveCtes() {
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("RECURSIVE");
+    }
+
+    @Test
+    void rejectsAnUnsafePredicateColumn() {
+        // A malformed rule must deny the table, never render raw identifier text into SQL.
+        DataScope unsafe = AccessFixtures.custom(
+                "unsafe",
+                List.of(
+                        rule(
+                                "u1",
+                                CAMPUS,
+                                "student",
+                                DataScopePolicy.FILTER,
+                                "student_no) OR 1=1 --",
+                                "studentNo")),
+                Set.of(1L));
+
+        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", unsafe, CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void aStudentCteQueryReturnsNoOutOfScopeRows() {
+        // Task 4.3 regression: the filtered columns come from the caller's own attributes; a row
+        // filter for another student's number or class must not be produced for this caller.
+        String sql =
+                rewriter.rewrite(
+                        "WITH mine AS (SELECT * FROM student), s AS (SELECT * FROM score) "
+                                + "SELECT mine.name FROM mine JOIN s ON s.student_id = mine.id",
+                        student(),
+                        CAMPUS);
+
+        String compacted = compact(sql);
+        assertThat(compacted).contains("student_no in ('2023001')");
+        assertThat(compacted).contains("student_id in (1)");
+        assertThat(compacted).doesNotContain("'2023002'").doesNotContain("student_id in (2)");
+    }
+
     private static DataScope multiGrantStudent() {
         DataScope base = AccessFixtures.student();
         return DataScope.from(new com.nekocong.text2sql.access.EffectiveAccess(

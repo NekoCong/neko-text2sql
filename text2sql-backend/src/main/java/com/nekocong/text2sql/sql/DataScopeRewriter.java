@@ -84,6 +84,14 @@ public class DataScopeRewriter {
         if (!(statement instanceof Select select)) {
             throw new SqlPermissionException("只支持单条只读查询");
         }
+        List<WithItem> topLevelWithItems = select.getWithItemsList();
+        if (topLevelWithItems != null) {
+            for (WithItem item : topLevelWithItems) {
+                if (item.isRecursive()) {
+                    throw new SqlPermissionException("不支持 WITH RECURSIVE 查询，无法应用数据权限");
+                }
+            }
+        }
         try {
             rewriteSelect(select, scope, datasourceId, new HashSet<>());
             return select.toString();
@@ -96,16 +104,25 @@ public class DataScopeRewriter {
 
     private void rewriteSelect(
             Select select, DataScope scope, String datasourceId, Set<String> inheritedCtes) {
+        // Visible CTE names are scoped like SQL itself: a CTE is visible only to the text after it
+        // in the same WITH list, and to the statement the WITH list belongs to. A CTE's own name is
+        // never visible inside its own body (that is what RECURSIVE is for, and we reject it).
         Set<String> ctes = new HashSet<>(inheritedCtes);
         List<WithItem> withItems = select.getWithItemsList();
         if (withItems != null) {
+            Set<String> protectedTables = inheritedVisibleTables(scope, datasourceId);
             for (WithItem item : withItems) {
-                if (item.getAlias() != null && item.getAlias().getName() != null) {
-                    ctes.add(item.getAlias().getName().toLowerCase(Locale.ROOT));
+                if (item.isRecursive()) {
+                    throw new SqlPermissionException("不支持 WITH RECURSIVE 查询，无法应用数据权限");
                 }
-            }
-            for (WithItem item : withItems) {
+                String cteName = cteName(item);
+                if (protectedTables.contains(cteName)) {
+                    throw new SqlPermissionException(
+                            "公共表表达式 " + cteName + " 与受保护的表同名，已拒绝执行");
+                }
+                // Only earlier CTEs are visible while rewriting this body: ctes does not yet hold it.
                 rewriteSelect(item.getSelect(), scope, datasourceId, ctes);
+                ctes.add(cteName);
             }
         }
 
@@ -126,6 +143,43 @@ public class DataScopeRewriter {
                     throw new SqlPermissionException("不支持 VALUES 查询，无法应用数据权限");
             default -> throw new SqlPermissionException("不支持该查询结构，无法应用数据权限");
         }
+    }
+
+    /**
+     * The lower-cased, unqualified name of a CTE.
+     *
+     * <p>A WITH item without a name cannot be matched against protected tables and would let its
+     * body's references be misclassified, so it is rejected.
+     */
+    private static String cteName(WithItem item) {
+        String name = item.getAlias() == null ? null : item.getAlias().getName();
+        if (name == null || name.isBlank()) {
+            throw new SqlPermissionException("公共表表达式缺少名称，无法应用数据权限");
+        }
+        String unqualified = name;
+        int dot = unqualified.lastIndexOf('.');
+        if (dot >= 0) {
+            unqualified = unqualified.substring(dot + 1);
+        }
+        unqualified = unqualified.replace("`", "").replace("\"", "").trim().toLowerCase(Locale.ROOT);
+        if (unqualified.isEmpty()) {
+            throw new SqlPermissionException("公共表表达式缺少名称，无法应用数据权限");
+        }
+        return unqualified;
+    }
+
+    /**
+     * The lower-cased table names that must not be shadowed by a CTE for this caller in this
+     * datasource.
+     *
+     * <p>This is the policy's {@link TablePolicy#visibleTables(DataScope, String) visible set}, i.e.
+     * every configured table that is not denied; a name in it is a protected table whose reference
+     * the rewriter would otherwise filter. A {@code null} result (a bypassing caller, whose statement
+     * is returned unchanged) is normalized to the empty set.
+     */
+    private Set<String> inheritedVisibleTables(DataScope scope, String datasourceId) {
+        Set<String> visible = policy.visibleTables(scope, datasourceId);
+        return visible == null ? Set.of() : visible;
     }
 
     private void rewritePlainSelect(
@@ -277,6 +331,9 @@ public class DataScopeRewriter {
         if (attribute == null) {
             throw new SqlPermissionException("行过滤属性无效，已拒绝执行");
         }
+        // The rendered predicate is interpolated verbatim into a parsed condition, so every piece of
+        // identifier text in it must be a bare identifier. Values never take part in this check:
+        // they are always emitted as a validated literal (numeric or escaped string).
         return switch (attribute) {
             case CLASS_IDS -> column + " IN (" + numericList(principal.classIds(), column) + ")";
             case STUDENT_ID -> column + " IN (" + numeric(principal.studentId(), attribute) + ")";
