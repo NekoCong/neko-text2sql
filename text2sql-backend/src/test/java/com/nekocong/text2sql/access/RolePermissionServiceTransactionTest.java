@@ -196,8 +196,14 @@ class RolePermissionServiceTransactionTest {
             }
 
             @Override
-            public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
-                return delegate.users(query, enabled, roleId);
+            public Mono<List<AccessUser>> users(
+                    String query, Boolean enabled, String roleId, int size, long offset) {
+                return delegate.users(query, enabled, roleId, size, offset);
+            }
+
+            @Override
+            public Mono<Long> countUsers(String query, Boolean enabled, String roleId) {
+                return delegate.countUsers(query, enabled, roleId);
             }
 
             @Override
@@ -224,6 +230,11 @@ class RolePermissionServiceTransactionTest {
             @Override
             public Mono<Void> updateUserPassword(String id, String passwordHash) {
                 return delegate.updateUserPassword(id, passwordHash);
+            }
+
+            @Override
+            public Mono<Void> updateUserDisplayName(String id, String displayName) {
+                return delegate.updateUserDisplayName(id, displayName);
             }
 
             @Override

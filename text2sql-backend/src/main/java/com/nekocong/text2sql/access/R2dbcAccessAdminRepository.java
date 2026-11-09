@@ -245,39 +245,27 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
-    public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
-        boolean hasQuery = query != null && !query.isBlank();
-        boolean hasEnabled = enabled != null;
-        boolean hasRole = roleId != null && !roleId.isBlank();
-        List<String> where = new ArrayList<>();
-        if (hasQuery) {
-            where.add("(LOWER(u.username) LIKE :query OR LOWER(u.display_name) LIKE :query)");
-        }
-        if (hasEnabled) {
-            where.add("u.enabled = :enabled");
-        }
-        if (hasRole) {
-            where.add(
-                    "EXISTS (SELECT 1 FROM access_user_role ur"
-                            + " WHERE ur.user_id = u.id AND ur.role_id = :roleId)");
-        }
-        StringBuilder sql = new StringBuilder("SELECT " + USER_COLUMNS + " FROM app_user u");
-        if (!where.isEmpty()) {
-            sql.append(" WHERE ").append(String.join(" AND ", where));
-        }
-        sql.append(" ORDER BY u.username");
-
-        DatabaseClient.GenericExecuteSpec spec = client.sql(sql.toString());
-        if (hasQuery) {
-            spec = spec.bind("query", "%" + query.trim().toLowerCase(Locale.ROOT) + "%");
-        }
-        if (hasEnabled) {
-            spec = spec.bind("enabled", enabled);
-        }
-        if (hasRole) {
-            spec = spec.bind("roleId", roleId.trim());
-        }
+    public Mono<List<AccessUser>> users(
+            String query, Boolean enabled, String roleId, int size, long offset) {
+        Where where = where(query, enabled, roleId);
+        String sql = "SELECT " + USER_COLUMNS + " FROM app_user u" + where.sql
+                + " ORDER BY u.username, u.id"
+                + " LIMIT :size OFFSET :offset";
+        DatabaseClient.GenericExecuteSpec spec = bindWhere(client.sql(sql), where);
+        spec = spec.bind("size", size).bind("offset", offset);
         return spec.map((row, meta) -> baseUser(row)).all().collectList().flatMap(this::attachRoles);
+    }
+
+    @Override
+    public Mono<Long> countUsers(String query, Boolean enabled, String roleId) {
+        Where where = where(query, enabled, roleId);
+        String sql = "SELECT COUNT(*) AS n FROM app_user u" + where.sql;
+        return bindWhere(client.sql(sql), where)
+                .map((row, meta) -> {
+                    Long count = row.get("n", Long.class);
+                    return count == null ? 0L : count;
+                })
+                .one();
     }
 
     @Override
@@ -337,6 +325,15 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
+    public Mono<Void> updateUserDisplayName(String id, String displayName) {
+        DatabaseClient.GenericExecuteSpec spec =
+                client.sql("UPDATE app_user SET display_name = :displayName WHERE id = :id")
+                        .bind("id", id);
+        spec = bindNullable(spec, "displayName", displayName);
+        return spec.then();
+    }
+
+    @Override
     public Mono<Void> replaceUserRoles(String userId, List<String> roleIds) {
         Mono<Void> delete =
                 client.sql("DELETE FROM access_user_role WHERE user_id = :userId")
@@ -386,6 +383,50 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
             DatabaseClient.GenericExecuteSpec spec, String name, String value) {
         return value == null ? spec.bindNull(name, String.class) : spec.bind(name, value);
     }
+
+    /** Builds the shared user-list/count {@code WHERE} fragment and its bound values. */
+    private static Where where(String query, Boolean enabled, String roleId) {
+        boolean hasQuery = query != null && !query.isBlank();
+        boolean hasEnabled = enabled != null;
+        boolean hasRole = roleId != null && !roleId.isBlank();
+        List<String> conditions = new ArrayList<>();
+        if (hasQuery) {
+            conditions.add("(LOWER(u.username) LIKE :query OR LOWER(u.display_name) LIKE :query)");
+        }
+        if (hasEnabled) {
+            conditions.add("u.enabled = :enabled");
+        }
+        if (hasRole) {
+            conditions.add(
+                    "EXISTS (SELECT 1 FROM access_user_role ur"
+                            + " WHERE ur.user_id = u.id AND ur.role_id = :roleId)");
+        }
+        String sql = conditions.isEmpty() ? "" : " WHERE " + String.join(" AND ", conditions);
+        return new Where(
+                sql,
+                hasQuery ? query.trim().toLowerCase(Locale.ROOT) : null,
+                enabled,
+                hasRole ? roleId.trim() : null);
+    }
+
+    /** Binds the {@link Where} values to a statement (skipping the absent filters). */
+    private static DatabaseClient.GenericExecuteSpec bindWhere(
+            DatabaseClient.GenericExecuteSpec spec, Where where) {
+        DatabaseClient.GenericExecuteSpec bound = spec;
+        if (where.query != null) {
+            bound = bound.bind("query", "%" + where.query + "%");
+        }
+        if (where.enabled != null) {
+            bound = bound.bind("enabled", where.enabled);
+        }
+        if (where.roleId != null) {
+            bound = bound.bind("roleId", where.roleId);
+        }
+        return bound;
+    }
+
+    /** The user-list/count filter state: the SQL fragment plus the values to bind. */
+    private record Where(String sql, String query, Boolean enabled, String roleId) {}
 
     /** The account columns of a user row, without its roles. */
     private static UserBase baseUser(io.r2dbc.spi.Row row) {

@@ -446,6 +446,213 @@ class AccessControlUserTest {
         assertThat(auditRows("user.enable", id, "SUCCESS")).isZero();
     }
 
+    @Test
+    void listIsPaginatedInSqlWithATotalAndNoOverlap() {
+        String prefix = unique("page");
+        String studentRoleId = roleIdByCode(Roles.STUDENT);
+        createUser(prefix + "a", "甲", List.of(studentRoleId));
+        createUser(prefix + "b", "乙", List.of(studentRoleId));
+        createUser(prefix + "c", "丙", List.of(studentRoleId));
+
+        Map<String, Object> first = pageEnvelope(prefix, null, null, 0, 2);
+        assertThat(((Number) first.get("total")).intValue()).isEqualTo(3);
+        assertThat(((Number) first.get("page")).intValue()).isEqualTo(0);
+        assertThat(((Number) first.get("size")).intValue()).isEqualTo(2);
+        List<String> firstNames = itemUsernames(first);
+        assertThat(firstNames).containsExactly(prefix + "a", prefix + "b");
+
+        Map<String, Object> second = pageEnvelope(prefix, null, null, 1, 2);
+        assertThat(((Number) second.get("total")).intValue()).isEqualTo(3);
+        List<String> secondNames = itemUsernames(second);
+        assertThat(secondNames).containsExactly(prefix + "c");
+
+        assertThat(firstNames).doesNotContainAnyElementsOf(secondNames);
+    }
+
+    @Test
+    void editsAndClearsTheDisplayNameWithAuditAndNoTokenBump() {
+        String id = createUser(unique("dn"), "原名", List.of(roleIdByCode(Roles.STUDENT)));
+        int versionBefore = tokenVersion(id);
+
+        setDisplayName(id, "新名")
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.displayName")
+                .isEqualTo("新名");
+        assertThat(displayNameOf(id)).isEqualTo("新名");
+        assertThat(tokenVersion(id))
+                .as("display-name edits must not bump token_version")
+                .isEqualTo(versionBefore);
+
+        // A blank value clears the name.
+        setDisplayName(id, "").expectStatus().isOk();
+        assertThat(displayNameOf(id)).isNull();
+        assertThat(tokenVersion(id)).isEqualTo(versionBefore);
+
+        assertThat(auditRows("user.update", id, "SUCCESS")).isEqualTo(2);
+        // The payload carries only the display name.
+        assertThat(auditDistinct("user.update", id, "SUCCESS", "before_json"))
+                .containsExactlyInAnyOrder("{\"displayName\":\"原名\"}", "{\"displayName\":\"新名\"}");
+        assertThat(auditDistinct("user.update", id, "SUCCESS", "after_json"))
+                .containsExactlyInAnyOrder("{\"displayName\":\"新名\"}", "{\"displayName\":null}");
+    }
+
+    @Test
+    void readsOneUserAndReturnsNotFoundForUnknown() {
+        String username = unique("dtl");
+        String id = createUser(username, "详情", List.of(roleIdByCode(Roles.STUDENT)));
+
+        client.get()
+                .uri(USERS + "/" + id)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.id")
+                .isEqualTo(id)
+                .jsonPath("$.username")
+                .isEqualTo(username)
+                .jsonPath("$.roles[0].code")
+                .isEqualTo(Roles.STUDENT);
+
+        client.get()
+                .uri(USERS + "/" + UUID.randomUUID())
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isNotFound()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("用户不存在");
+    }
+
+    @Test
+    void aUserReadOnlyRoleCanReadButNotWrite() {
+        String readRoleId = createRoleGranting(Permissions.USER_READ);
+        String username = unique("rd");
+        AppUser user =
+                users.insert(username, passwordEncoder.encode(PASSWORD), "ReadOnly", Roles.STUDENT).block();
+        assignRoleDirectly(user.id(), readRoleId);
+        String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
+
+        client.get().uri(USERS).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
+        client.get().uri(USERS + "/" + user.id()).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
+
+        client.post()
+                .uri(USERS)
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("username", unique("nope"), "password", PASSWORD, "roleIds", List.of(roleIdByCode(Roles.STUDENT))))
+                .exchange()
+                .expectStatus()
+                .isForbidden();
+        client.put()
+                .uri(USERS + "/" + user.id())
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("displayName", "x"))
+                .exchange()
+                .expectStatus()
+                .isForbidden();
+        client.put()
+                .uri(USERS + "/" + user.id() + "/status")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("enabled", false))
+                .exchange()
+                .expectStatus()
+                .isForbidden();
+        client.post()
+                .uri(USERS + "/" + user.id() + "/reset-password")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("password", "newsecret9"))
+                .exchange()
+                .expectStatus()
+                .isForbidden();
+        client.put()
+                .uri(USERS + "/" + user.id() + "/roles")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("roleIds", List.of(roleIdByCode(Roles.STUDENT))))
+                .exchange()
+                .expectStatus()
+                .isForbidden();
+    }
+
+    @Test
+    void aUserManageOnlyRoleCanWriteButNotRead() {
+        String manageRoleId = createRoleGranting(Permissions.USER_MANAGE);
+        String username = unique("mng");
+        AppUser user =
+                users.insert(username, passwordEncoder.encode(PASSWORD), "Manager", Roles.STUDENT).block();
+        assignRoleDirectly(user.id(), manageRoleId);
+        String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
+        String studentRoleId = roleIdByCode(Roles.STUDENT);
+
+        client.get().uri(USERS).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isForbidden();
+        client.get().uri(USERS + "/" + user.id()).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isForbidden();
+
+        // Create a target user, then mutate the target (not self) so the acting token stays valid
+        // across the token-version-bumping operations.
+        Map<String, Object> created =
+                client.post()
+                        .uri(USERS)
+                        .header(HttpHeaders.AUTHORIZATION, token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(
+                                Map.of(
+                                        "username",
+                                        unique("mng2"),
+                                        "password",
+                                        PASSWORD,
+                                        "roleIds",
+                                        List.of(studentRoleId)))
+                        .exchange()
+                        .expectStatus()
+                        .isCreated()
+                        .expectBody(Map.class)
+                        .returnResult()
+                        .getResponseBody();
+        assertThat(created).isNotNull();
+        String targetId = String.valueOf(created.get("id"));
+
+        client.put()
+                .uri(USERS + "/" + user.id())
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("displayName", "改名"))
+                .exchange()
+                .expectStatus()
+                .isOk();
+        client.put()
+                .uri(USERS + "/" + targetId + "/status")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("enabled", false))
+                .exchange()
+                .expectStatus()
+                .isOk();
+        client.post()
+                .uri(USERS + "/" + targetId + "/reset-password")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("password", "newsecret9"))
+                .exchange()
+                .expectStatus()
+                .isNoContent();
+        client.put()
+                .uri(USERS + "/" + targetId + "/roles")
+                .header(HttpHeaders.AUTHORIZATION, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("roleIds", List.of(studentRoleId)))
+                .exchange()
+                .expectStatus()
+                .isOk();
+    }
+
     // --- helpers ----------------------------------------------------------------------------
 
     private String bearer() {
@@ -513,43 +720,63 @@ class AccessControlUserTest {
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private List<Map<String, Object>> listUsers(String query) {
-        return (List) client.get()
-                .uri(uriBuilder -> uriBuilder.path(USERS).queryParam("query", query).build())
-                .header(HttpHeaders.AUTHORIZATION, bearer())
-                .exchange()
-                .expectStatus()
-                .isOk()
-                .expectBodyList(Map.class)
-                .returnResult()
-                .getResponseBody();
+        return (List<Map<String, Object>>) pageEnvelope(query, null, null, null, null).get("items");
     }
 
     private List<String> usernames(String query, Boolean enabled, String roleId) {
-        return client.get()
-                .uri(
-                        uriBuilder -> {
-                            uriBuilder.path(USERS);
-                            if (query != null) {
-                                uriBuilder.queryParam("query", query);
-                            }
-                            if (enabled != null) {
-                                uriBuilder.queryParam("enabled", enabled);
-                            }
-                            if (roleId != null) {
-                                uriBuilder.queryParam("roleId", roleId);
-                            }
-                            return uriBuilder.build();
-                        })
+        return itemUsernames(pageEnvelope(query, enabled, roleId, null, null));
+    }
+
+    /** GETs the user list and returns the full page envelope ({@code items}, {@code total}, ...). */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private Map<String, Object> pageEnvelope(
+            String query, Boolean enabled, String roleId, Integer page, Integer size) {
+        Map<String, Object> body =
+                (Map) client.get()
+                        .uri(
+                                uriBuilder -> {
+                                    uriBuilder.path(USERS);
+                                    if (query != null) {
+                                        uriBuilder.queryParam("query", query);
+                                    }
+                                    if (enabled != null) {
+                                        uriBuilder.queryParam("enabled", enabled);
+                                    }
+                                    if (roleId != null) {
+                                        uriBuilder.queryParam("roleId", roleId);
+                                    }
+                                    if (page != null) {
+                                        uriBuilder.queryParam("page", page);
+                                    }
+                                    if (size != null) {
+                                        uriBuilder.queryParam("size", size);
+                                    }
+                                    return uriBuilder.build();
+                                })
+                        .header(HttpHeaders.AUTHORIZATION, bearer())
+                        .exchange()
+                        .expectStatus()
+                        .isOk()
+                        .expectBody(Map.class)
+                        .returnResult()
+                        .getResponseBody();
+        assertThat(body).isNotNull();
+        return body;
+    }
+
+    @SuppressWarnings("unchecked")
+    private List<String> itemUsernames(Map<String, Object> page) {
+        return ((List<Map<String, Object>>) page.get("items"))
+                .stream().map(row -> String.valueOf(row.get("username"))).toList();
+    }
+
+    private WebTestClient.ResponseSpec setDisplayName(String id, String displayName) {
+        return client.put()
+                .uri(USERS + "/" + id)
                 .header(HttpHeaders.AUTHORIZATION, bearer())
-                .exchange()
-                .expectStatus()
-                .isOk()
-                .expectBodyList(Map.class)
-                .returnResult()
-                .getResponseBody()
-                .stream()
-                .map(row -> String.valueOf(row.get("username")))
-                .toList();
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("displayName", displayName))
+                .exchange();
     }
 
     private void loginExpects(String username, String password, boolean success) {
@@ -652,6 +879,41 @@ class AccessControlUserTest {
                                 + " WHERE ur.user_id = :userId ORDER BY r.code")
                 .bind("userId", userId)
                 .map((row, meta) -> row.get("code", String.class))
+                .all()
+                .collectList()
+                .block();
+    }
+
+    private String displayNameOf(String id) {
+        String value =
+                db.sql("SELECT COALESCE(display_name, '') AS dn FROM app_user WHERE id = :id")
+                        .bind("id", id)
+                        .map((row, meta) -> row.get("dn", String.class))
+                        .one()
+                        .block();
+        return value == null || value.isEmpty() ? null : value;
+    }
+
+    private void assignRoleDirectly(String userId, String roleId) {
+        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:u, :r, :now)")
+                .bind("u", userId)
+                .bind("r", roleId)
+                .bind("now", System.currentTimeMillis())
+                .fetch()
+                .rowsUpdated()
+                .block();
+    }
+
+    private List<String> auditDistinct(String action, String entityId, String result, String column) {
+        return db.sql(
+                        "SELECT DISTINCT " + column + " AS v FROM access_audit"
+                                + " WHERE actor_id = :actorId AND action = :action"
+                                + " AND entity_id = :entityId AND result = :result")
+                .bind("actorId", adminId)
+                .bind("action", action)
+                .bind("entityId", entityId)
+                .bind("result", result)
+                .map((row, meta) -> row.get("v", String.class))
                 .all()
                 .collectList()
                 .block();

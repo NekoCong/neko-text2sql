@@ -51,3 +51,42 @@ in commit on `master`; covering class `AccessControlUserTest` is now 13 tests.
 - The permission-gated route used by the token-version test is `/api/admin/access-control/roles`
   (`access.manage`); `datasource.read` is currently unenforced at any HTTP route, so it was not
   used to avoid asserting a no-op.
+
+## Fix round 2 (spec/design cross-check — 3 gaps)
+
+1. **User routes gated by `user.read` / `user.manage`, not `access.manage`.**
+   `SecurityConfig` now maps `GET /api/admin/access-control/users` (list) and `GET
+   /api/admin/access-control/users/*` (detail) to `Permissions.USER_READ`, and `POST
+   /api/admin/access-control/users` + `/api/admin/access-control/users/**` (create / display-name
+   / status / reset-password / roles) to `Permissions.USER_MANAGE`. These matchers precede the
+   generic `/api/admin/**` → `access.manage` rule, so roles/permissions/data-scopes stay on
+   `access.manage`. Helpers `userRead()`/`userManage()` mirror the file's existing style; the JWT
+   role claim is not consulted.
+2. **Pagination on the user list.** `GET /users` now takes `page`/`size` (defaults 0/20, `size`
+   capped at 100; negative `page`/`size` or `size=0` → 400 `分页参数无效`) and returns
+   `{items, total, page, size}`. `total` is a `COUNT(*)` over the same filters and paging is
+   applied in SQL (`LIMIT :size OFFSET :offset`, ordered by `username, id`), never in memory.
+   New DTO `AccessUserPage`; repository `users(...)` gained `size`/`offset` and a `countUsers`
+   method (shared `WHERE` builder).
+3. **Display-name edit + detail.** Added `PUT /users/{id}` (body `{displayName}`; null/blank
+   clears; ≤100 else 400) auditing `user.update` with before/after `{displayName}` only and no
+   `token_version` bump, and `GET /users/{id}` (unknown → 404 `用户不存在`). New DTO
+   `AccessUserDisplayNameRequest`; repository `updateUserDisplayName`.
+
+Tests added in `AccessControlUserTest` (now 18): `listIsPaginatedInSqlWithATotalAndNoOverlap`
+(3 users, size 2 → 2 pages, total 3, no overlap), `editsAndClearsTheDisplayNameWithAuditAndNoTokenBump`,
+`readsOneUserAndReturnsNotFoundForUnknown`, `aUserReadOnlyRoleCanReadButNotWrite`, and
+`aUserManageOnlyRoleCanWriteButNotRead`. Existing list assertions were updated for the envelope.
+
+## Validation
+
+- `mvn test -Dtest=AccessControlUserTest` — 18 run, 0 failures.
+- `mvn test` (no `DASHSCOPE_API_KEY`) — **BUILD SUCCESS**, Tests run: **333**, Failures: 0,
+  Errors: 0, Skipped: 0.
+
+## Notes / residual concerns
+
+- `LIMIT :size OFFSET :offset` uses bound parameters, verified against H2 (the test dialect).
+  Production MySQL also accepts parameterised `LIMIT ? OFFSET ?`; no literal is interpolated.
+- The `total` JSON field is an integer; the test reads it via `Number` to stay agnostic of the
+  Jackson `Integer` vs `Long` deserialization choice.

@@ -10,6 +10,8 @@ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
 import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRoleView;
 import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserPage;
 import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
 import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
 import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
@@ -226,19 +228,34 @@ public class AccessControlController {
     }
 
     /**
-     * Lists users, ordered by username.
+     * Lists users, ordered by username, paginated.
      *
      * @param query the case-insensitive username/display-name filter, or omitted for all
      * @param enabled keep only enabled/disabled users, or omitted for both
      * @param roleId keep only users directly assigned that role, or omitted for all
-     * @return the users
+     * @param page the zero-based page number (default 0)
+     * @param size the page size (default 20; capped at the service maximum)
+     * @return the page of users with the total count
      */
     @GetMapping(path = USERS)
-    public Mono<List<AccessUserView>> listUsers(
+    public Mono<AccessUserPage> listUsers(
             @RequestParam(required = false) String query,
             @RequestParam(required = false) Boolean enabled,
-            @RequestParam(required = false) String roleId) {
-        return users.list(query, enabled, roleId);
+            @RequestParam(required = false) String roleId,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        return users.list(query, enabled, roleId, page, size);
+    }
+
+    /**
+     * Reads one user.
+     *
+     * @param id the user id
+     * @return the user
+     */
+    @GetMapping(path = USERS + "/{id}")
+    public Mono<AccessUserView> getUser(@PathVariable String id) {
+        return users.detail(id);
     }
 
     /**
@@ -252,6 +269,22 @@ public class AccessControlController {
     public Mono<AccessUserView> createUser(@RequestBody(required = false) AccessUserCreateRequest request) {
         return actorId()
                 .flatMap(actor -> users.create(actor, request))
+                .onErrorMap(AccessControlController::asStatusException);
+    }
+
+    /**
+     * Edits a user's display name (the only mutable free-form field).
+     *
+     * @param id the user id
+     * @param request the new display name ({@code null}/blank clears it)
+     * @return the updated user
+     */
+    @PutMapping(path = USERS + "/{id}")
+    public Mono<AccessUserView> updateUserDisplayName(
+            @PathVariable String id,
+            @RequestBody(required = false) AccessUserDisplayNameRequest request) {
+        return actorId()
+                .flatMap(actor -> users.updateDisplayName(actor, id, request))
                 .onErrorMap(AccessControlController::asStatusException);
     }
 

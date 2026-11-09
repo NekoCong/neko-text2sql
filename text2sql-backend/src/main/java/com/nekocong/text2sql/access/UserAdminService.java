@@ -3,6 +3,8 @@ package com.nekocong.text2sql.access;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserPage;
 import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
 import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
 import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
@@ -77,6 +79,9 @@ public class UserAdminService {
     /** Matches {@code access_audit.reason VARCHAR(512)}. */
     private static final int MAX_REASON_LENGTH = 512;
 
+    /** Upper bound on the user-list page size; larger requests are capped, not rejected. */
+    static final int MAX_PAGE_SIZE = 100;
+
     private static final String ENTITY_TYPE = "USER";
 
     private static final String ACTION_CREATE = "user.create";
@@ -84,6 +89,7 @@ public class UserAdminService {
     private static final String ACTION_DISABLE = "user.disable";
     private static final String ACTION_PASSWORD_RESET = "user.password_reset";
     private static final String ACTION_ROLES = "user.roles";
+    private static final String ACTION_UPDATE = "user.update";
 
     private static final String RESULT_SUCCESS = "SUCCESS";
     private static final String RESULT_DENIED = "DENIED";
@@ -95,6 +101,7 @@ public class UserAdminService {
     private static final String REASON_ROLE_REQUIRED = "至少需要一个角色";
     private static final String REASON_ROLES_BODY_MISSING = "roleIds 不能为空";
     private static final String REASON_ROLE_ID_BLANK = "角色标识不能为空";
+    private static final String REASON_PAGE_INVALID = "分页参数无效";
 
     private final AccessAdminRepository repository;
     private final AccessContextResolver access;
@@ -131,20 +138,97 @@ public class UserAdminService {
     }
 
     /**
-     * Lists users, ordered by username.
+     * Lists users, ordered by username, paginated.
      *
      * <p>Reads are not audited. Missing filters mean "any"; the {@code query} filter matches
-     * username/display name case-insensitively (contains).
+     * username/display name case-insensitively (contains). The page is applied in SQL, so it works
+     * for large tables. {@code size} is capped at {@value #MAX_PAGE_SIZE}.
      *
      * @param query the username/display-name filter, or {@code null}
      * @param enabled the enabled filter, or {@code null}
      * @param roleId the direct-role filter, or {@code null}
-     * @return the matching users
+     * @param page the zero-based page number (must be at least 0)
+     * @param size the requested page size (must be at least 1)
+     * @return the page of users with the total count
      */
-    public Mono<List<AccessUserView>> list(String query, Boolean enabled, String roleId) {
-        return repository
-                .users(query, enabled, roleId)
-                .map(users -> users.stream().map(AccessUserView::of).toList());
+    public Mono<AccessUserPage> list(
+            String query, Boolean enabled, String roleId, int page, int size) {
+        return Mono.defer(
+                () -> {
+                    int limit = validatePage(page, size);
+                    long offset = (long) page * limit;
+                    return Mono.zip(
+                                    repository.users(query, enabled, roleId, limit, offset),
+                                    repository.countUsers(query, enabled, roleId))
+                            .map(
+                                    tuple ->
+                                            AccessUserPage.of(
+                                                    tuple.getT1(), tuple.getT2(), page, limit));
+                });
+    }
+
+    /**
+     * Reads one user.
+     *
+     * <p>An unknown id is a {@code 404}; reads are not audited.
+     *
+     * @param userId the user id
+     * @return the user
+     */
+    public Mono<AccessUserView> detail(String userId) {
+        return Mono.defer(
+                        () -> {
+                            requireIdentifier(userId);
+                            return repository.user(userId).switchIfEmpty(Mono.error(notFound()));
+                        })
+                .map(AccessUserView::of);
+    }
+
+    /**
+     * Updates a user's display name.
+     *
+     * <p>The display name is the only mutable free-form field; a {@code null} or blank value clears
+     * it. This does <em>not</em> bump {@code token_version}: the display name is not part of any
+     * authorization decision, so no token needs to be invalidated.
+     *
+     * @param actorId the acting user id
+     * @param userId the user id
+     * @param request the request; {@code displayName} may be {@code null}/blank to clear
+     * @return the updated user
+     */
+    public Mono<AccessUserView> updateDisplayName(
+            String actorId, String userId, AccessUserDisplayNameRequest request) {
+        return Mono.defer(
+                        () -> {
+                            requireIdentifier(userId);
+                            String displayName =
+                                    normalizeDisplayName(request == null ? null : request.displayName());
+                            return repository
+                                    .user(userId)
+                                    .switchIfEmpty(
+                                            Mono.defer(
+                                                    () ->
+                                                            deny(
+                                                                            actorId,
+                                                                            ACTION_UPDATE,
+                                                                            userId,
+                                                                            null,
+                                                                            null,
+                                                                            missing())
+                                                                    .then(Mono.<AccessUser>empty())))
+                                    .flatMap(before -> updateDisplayName(actorId, before, displayName));
+                        })
+                .as(transactions::transactional)
+                .onErrorMap(Denial.class, Denial::toException)
+                .map(AccessUserView::of);
+    }
+
+    private Mono<AccessUser> updateDisplayName(
+            String actorId, AccessUser before, String displayName) {
+        return Mono.defer(() -> repository.updateUserDisplayName(before.id(), displayName))
+                .then(repository.user(before.id()))
+                .switchIfEmpty(Mono.error(new IllegalStateException("用户更新后丢失：" + before.id())))
+                .flatMap(after -> auditDisplayName(actorId, before, after));
     }
 
     /**
@@ -607,6 +691,19 @@ public class UserAdminService {
         }
     }
 
+    /**
+     * Validates the page number and size, returning the (capped) effective size.
+     *
+     * <p>A negative page, a non-positive size, or a zero size is rejected with {@code 400}; a size
+     * larger than {@link #MAX_PAGE_SIZE} is capped rather than rejected.
+     */
+    private static int validatePage(int page, int size) {
+        if (page < 0 || size <= 0) {
+            throw badRequest(REASON_PAGE_INVALID);
+        }
+        return Math.min(size, MAX_PAGE_SIZE);
+    }
+
     // --- audit -----------------------------------------------------------------------------
 
     private Mono<AccessUser> audit(String actorId, String action, AccessUser before, AccessUser after) {
@@ -640,6 +737,21 @@ public class UserAdminService {
                 json(after),
                 RESULT_SUCCESS,
                 null);
+    }
+
+    /** Appends the {@code user.update} SUCCESS row; the payload carries only the display name. */
+    private Mono<AccessUser> auditDisplayName(String actorId, AccessUser before, AccessUser after) {
+        return repository
+                .record(
+                        actorId,
+                        ACTION_UPDATE,
+                        ENTITY_TYPE,
+                        after.id(),
+                        json(new AuditDisplayName(before.displayName())),
+                        json(new AuditDisplayName(after.displayName())),
+                        RESULT_SUCCESS,
+                        null)
+                .thenReturn(after);
     }
 
     /**
@@ -759,6 +871,10 @@ public class UserAdminService {
         return new Denial(REASON_USER_MISSING, HttpStatus.NOT_FOUND);
     }
 
+    private static ResponseStatusException notFound() {
+        return new ResponseStatusException(HttpStatus.NOT_FOUND, REASON_USER_MISSING);
+    }
+
     private static String truncate(String reason) {
         return reason == null || reason.length() <= MAX_REASON_LENGTH
                 ? reason
@@ -805,6 +921,9 @@ public class UserAdminService {
             boolean enabled,
             List<String> roleCodes,
             String password) {}
+
+    /** The audited projection of a display-name change: the display name only. */
+    private record AuditDisplayName(String displayName) {}
 
     /**
      * A rejected mutation, carrying the reason and the HTTP status. Carried through the reactive

@@ -148,18 +148,32 @@ public interface AccessAdminRepository {
     Mono<Long> deleteDataScope(String id);
 
     /**
-     * Lists users, ordered by username, with each user's directly assigned roles attached.
+     * Lists users, ordered by username then id, with each user's directly assigned roles attached.
      *
      * <p>Every filter is optional; a {@code null} filter means "any". The {@code query} matches
      * username and display name case-insensitively (contains); {@code roleId} keeps only users
-     * directly assigned that role.
+     * directly assigned that role. The page is applied in SQL ({@code LIMIT}/{@code OFFSET}), never
+     * in memory.
      *
      * @param query the case-insensitive username/display-name contains filter, or {@code null}
      * @param enabled keep only enabled/disabled users, or {@code null} for both
      * @param roleId keep only users directly holding this role, or {@code null}
-     * @return the matching users, ordered by username
+     * @param size the page size (already validated, at least 1)
+     * @param offset the zero-based offset of the page (already validated, at least 0)
+     * @return the matching users, ordered by username then id
      */
-    Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId);
+    Mono<List<AccessUser>> users(
+            String query, Boolean enabled, String roleId, int size, long offset);
+
+    /**
+     * Counts the users matching the given filters (the {@code total} of a page query).
+     *
+     * @param query the case-insensitive username/display-name contains filter, or {@code null}
+     * @param enabled keep only enabled/disabled users, or {@code null} for both
+     * @param roleId keep only users directly holding this role, or {@code null}
+     * @return the matching user count
+     */
+    Mono<Long> countUsers(String query, Boolean enabled, String roleId);
 
     /**
      * Finds one user by id, with directly assigned roles.
@@ -210,6 +224,16 @@ public interface AccessAdminRepository {
      * @return completion
      */
     Mono<Void> updateUserPassword(String id, String passwordHash);
+
+    /**
+     * Updates a user's display name. This is the only mutable free-form field; it does not bump
+     * {@code token_version} (display name is not authorization-relevant).
+     *
+     * @param id the user id
+     * @param displayName the new display name, or {@code null} to clear
+     * @return completion
+     */
+    Mono<Void> updateUserDisplayName(String id, String displayName);
 
     /**
      * Replaces one user's role assignments.

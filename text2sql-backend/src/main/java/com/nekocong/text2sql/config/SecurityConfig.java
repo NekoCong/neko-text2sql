@@ -95,6 +95,20 @@ public class SecurityConfig {
                                                 "/api/text2sql/health",
                                                 "/actuator/**")
                                         .permitAll()
+                                        // The user lifecycle API is gated by its own permissions
+                                        // (user.read for list/detail, user.manage for writes) so an
+                                        // operator can manage accounts without editing roles or
+                                        // data scopes. These must precede the generic /api/admin/**
+                                        // access.manage rule below.
+                                        .pathMatchers(
+                                                HttpMethod.GET,
+                                                "/api/admin/access-control/users",
+                                                "/api/admin/access-control/users/*")
+                                        .access(userRead())
+                                        .pathMatchers(
+                                                "/api/admin/access-control/users",
+                                                "/api/admin/access-control/users/**")
+                                        .access(userManage())
                                         .pathMatchers("/api/admin/**")
                                         .access(accessManage())
                                         // The three knowledge collections, their documents and the
@@ -144,6 +158,24 @@ public class SecurityConfig {
      */
     static ReactiveAuthorizationManager<AuthorizationContext> datasourceWrite() {
         return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_WRITE);
+    }
+
+    /**
+     * Requires the {@code user.read} permission (list/detail user routes).
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> userRead() {
+        return PermissionAuthorizationManager.permission(Permissions.USER_READ);
+    }
+
+    /**
+     * Requires the {@code user.manage} permission (user create/status/reset/roles/display-name).
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> userManage() {
+        return PermissionAuthorizationManager.permission(Permissions.USER_MANAGE);
     }
 
     /**
