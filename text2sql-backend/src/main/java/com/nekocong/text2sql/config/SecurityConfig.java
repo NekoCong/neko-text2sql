@@ -3,6 +3,8 @@ package com.nekocong.text2sql.config;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nimbusds.jose.jwk.source.ImmutableSecret;
 import com.nekocong.text2sql.access.AccessContextResolver;
+import com.nekocong.text2sql.access.Permissions;
+import com.nekocong.text2sql.security.PermissionAuthorizationManager;
 import com.nekocong.text2sql.security.Roles;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
@@ -13,6 +15,7 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.convert.converter.Converter;
 import org.springframework.http.HttpMethod;
 import org.springframework.security.authentication.AbstractAuthenticationToken;
+import org.springframework.security.authorization.ReactiveAuthorizationManager;
 import org.springframework.security.config.Customizer;
 import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
 import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
@@ -29,6 +32,7 @@ import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
 import org.springframework.security.oauth2.server.resource.authentication.ReactiveJwtAuthenticationConverter;
 import org.springframework.security.oauth2.server.resource.web.server.authentication.ServerBearerTokenAuthenticationConverter;
 import org.springframework.security.web.server.SecurityWebFilterChain;
+import org.springframework.security.web.server.authorization.AuthorizationContext;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
@@ -41,8 +45,10 @@ import reactor.core.publisher.Mono;
  * {@code EventSource} used for SSE cannot set headers).
  *
  * <p>The {@code role} claim is mapped to a {@code ROLE_ADMIN} / {@code ROLE_USER} authority so the
- * role is available on the {@code Authentication}. Row-level data scoping (who may read which
- * conversation) is enforced in the service layer, which receives the role explicitly.
+ * role is available on the {@code Authentication}, but route authorization does not use it: the
+ * management routes are gated by the permissions resolved from the access-control tables (see
+ * {@link PermissionAuthorizationManager}). Row-level data scoping (who may read which conversation)
+ * is enforced in the service layer.
  */
 @Configuration
 @EnableWebFluxSecurity
@@ -90,24 +96,25 @@ public class SecurityConfig {
                                                 "/actuator/**")
                                         .permitAll()
                                         .pathMatchers("/api/admin/**")
-                                        .hasRole("ADMIN")
+                                        .access(accessManage())
                                         // The three knowledge collections, their documents and the
-                                        // retrieval debug endpoints are administrator-only.
+                                        // retrieval debug endpoints require the access-management
+                                        // permission.
                                         // The legacy in-memory API stays open to any authenticated
                                         // caller for backwards compatibility.
                                         .pathMatchers("/api/text2sql/knowledge/legacy/**")
                                         .authenticated()
                                         .pathMatchers("/api/text2sql/knowledge/**")
-                                        .hasRole("ADMIN")
+                                        .access(accessManage())
                                         .pathMatchers(
                                                 HttpMethod.POST,
                                                 "/api/text2sql/datasources",
                                                 "/api/text2sql/datasources/**")
-                                        .hasRole("ADMIN")
+                                        .access(datasourceWrite())
                                         .pathMatchers(HttpMethod.PUT, "/api/text2sql/datasources/**")
-                                        .hasRole("ADMIN")
+                                        .access(datasourceWrite())
                                         .pathMatchers(HttpMethod.DELETE, "/api/text2sql/datasources/**")
-                                        .hasRole("ADMIN")
+                                        .access(datasourceWrite())
                                         .anyExchange()
                                         .authenticated())
                 .oauth2ResourceServer(
@@ -115,9 +122,28 @@ public class SecurityConfig {
                                 oauth2.bearerTokenConverter(bearerTokenConverter)
                                         .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())))
                 // Re-checks the account (enabled, token version) and publishes the resolved
-                // EffectiveAccess on the exchange before the controller runs.
-                .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHORIZATION);
+                // EffectiveAccess on the exchange. It must run before AUTHORIZATION so the
+                // permission-based route checks above can read the attribute.
+                .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHENTICATION);
         return http.build();
+    }
+
+    /**
+     * Requires the {@code access.manage} permission (administration of roles and access control).
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> accessManage() {
+        return PermissionAuthorizationManager.permission(Permissions.ACCESS_MANAGE);
+    }
+
+    /**
+     * Requires the {@code datasource.write} permission.
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> datasourceWrite() {
+        return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_WRITE);
     }
 
     /**
@@ -125,7 +151,8 @@ public class SecurityConfig {
      *
      * <p>An unknown or missing role maps to {@code ROLE_NONE}: the caller stays authenticated but
      * carries no role authority. The data-permission layer validates the resolved scope on every
-     * query, and {@code /api/admin/**} plus datasource mutation endpoints require {@code ROLE_ADMIN}.
+     * query, and the management routes are gated by permissions resolved from the access-control
+     * tables, so this authority is informational only.
      *
      * @return the converter
      */

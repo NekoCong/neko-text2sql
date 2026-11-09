@@ -11,10 +11,11 @@ import org.springframework.web.bind.annotation.RestController;
 import reactor.core.publisher.Mono;
 
 /**
- * Administrator endpoints for the role -> datasource whitelist.
+ * <p>Administrator endpoints for the role -> datasource whitelist.
  *
- * <p>Access is enforced by {@code SecurityConfig} ({@code /api/admin/**} requires the admin role), so
- * a non-admin never reaches these handlers.
+ * <p>Access is enforced by {@code SecurityConfig} ({@code /api/admin/**} requires the {@code
+ * access.manage} permission resolved from the access-control tables), so an unauthorized caller
+ * never reaches these handlers.
  */
 @RestController
 @RequestMapping("/api/admin/datasource-access")
