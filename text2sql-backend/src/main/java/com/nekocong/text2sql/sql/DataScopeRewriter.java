@@ -8,6 +8,7 @@ import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.SqlPermissionException;
 import com.nekocong.text2sql.security.TablePolicy;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
@@ -17,7 +18,13 @@ import java.util.stream.Collectors;
 import net.sf.jsqlparser.expression.Alias;
 import net.sf.jsqlparser.expression.Expression;
 import net.sf.jsqlparser.expression.ExpressionVisitorAdapter;
+import net.sf.jsqlparser.expression.Parenthesis;
+import net.sf.jsqlparser.expression.operators.conditional.OrExpression;
+import net.sf.jsqlparser.expression.operators.relational.ExpressionList;
+import net.sf.jsqlparser.expression.operators.relational.InExpression;
 import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.schema.Column;
+import net.sf.jsqlparser.schema.Database;
 import net.sf.jsqlparser.statement.Statement;
 import net.sf.jsqlparser.statement.select.AllColumns;
 import net.sf.jsqlparser.statement.select.FromItem;
@@ -84,14 +91,6 @@ public class DataScopeRewriter {
         if (!(statement instanceof Select select)) {
             throw new SqlPermissionException("只支持单条只读查询");
         }
-        List<WithItem> topLevelWithItems = select.getWithItemsList();
-        if (topLevelWithItems != null) {
-            for (WithItem item : topLevelWithItems) {
-                if (item.isRecursive()) {
-                    throw new SqlPermissionException("不支持 WITH RECURSIVE 查询，无法应用数据权限");
-                }
-            }
-        }
         try {
             rewriteSelect(select, scope, datasourceId, new HashSet<>());
             return select.toString();
@@ -110,7 +109,7 @@ public class DataScopeRewriter {
         Set<String> ctes = new HashSet<>(inheritedCtes);
         List<WithItem> withItems = select.getWithItemsList();
         if (withItems != null) {
-            Set<String> protectedTables = inheritedVisibleTables(scope, datasourceId);
+            Set<String> protectedTables = protectedTables(scope, datasourceId);
             for (WithItem item : withItems) {
                 if (item.isRecursive()) {
                     throw new SqlPermissionException("不支持 WITH RECURSIVE 查询，无法应用数据权限");
@@ -146,40 +145,67 @@ public class DataScopeRewriter {
     }
 
     /**
-     * The lower-cased, unqualified name of a CTE.
-     *
-     * <p>A WITH item without a name cannot be matched against protected tables and would let its
-     * body's references be misclassified, so it is rejected.
+     * The lower-cased, unqualified name of a CTE, with quoting removed.
      */
     private static String cteName(WithItem item) {
         String name = item.getAlias() == null ? null : item.getAlias().getName();
-        if (name == null || name.isBlank()) {
+        String normalized = normalizeIdentifier(name);
+        if (normalized.isEmpty()) {
             throw new SqlPermissionException("公共表表达式缺少名称，无法应用数据权限");
+        }
+        return normalized;
+    }
+
+    /**
+     * Normalizes an identifier for comparison: quoting removed, unqualified, lower-cased.
+     *
+     * <p>Both sides of a CTE-versus-table comparison go through this so that {@code `mine`} matches
+     * {@code mine} and {@code campus.student} compares by its base name {@code student}.
+     *
+     * @param name the raw identifier (may be {@code null})
+     * @return the normalized name; empty when nothing usable remains
+     */
+    private static String normalizeIdentifier(String name) {
+        if (name == null) {
+            return "";
         }
         String unqualified = name;
         int dot = unqualified.lastIndexOf('.');
         if (dot >= 0) {
             unqualified = unqualified.substring(dot + 1);
         }
-        unqualified = unqualified.replace("`", "").replace("\"", "").trim().toLowerCase(Locale.ROOT);
-        if (unqualified.isEmpty()) {
-            throw new SqlPermissionException("公共表表达式缺少名称，无法应用数据权限");
-        }
-        return unqualified;
+        return unqualified.replace("`", "").replace("\"", "").replace("[", "").replace("]", "")
+                .trim().toLowerCase(Locale.ROOT);
+    }
+
+    /**
+     * Reports whether a table reference has no schema/database qualifier.
+     *
+     * <p>Only such a reference can resolve to a CTE; a qualified one is always a physical table.
+     * JSqlParser reports a missing qualifier as {@code null} (schema) or an empty string (database),
+     * so both are treated as absent.
+     */
+    private static boolean isUnqualified(Table table) {
+        Database database = table.getDatabase();
+        return isBlank(table.getSchemaName())
+                && (database == null || isBlank(database.getDatabaseName()));
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     /**
      * The lower-cased table names that must not be shadowed by a CTE for this caller in this
      * datasource.
      *
-     * <p>This is the policy's {@link TablePolicy#visibleTables(DataScope, String) visible set}, i.e.
-     * every configured table that is not denied; a name in it is a protected table whose reference
-     * the rewriter would otherwise filter. A {@code null} result (a bypassing caller, whose statement
-     * is returned unchanged) is normalized to the empty set.
+     * <p>This is every table the policy configures for the datasource — {@code ALL}, {@code FILTER}
+     * and {@code DENY} alike — because the rule is "no CTE may be named like a table the policy
+     * governs". Using the visible set would let a CTE shadow a {@code DENY}-only table. A bypassing
+     * caller gets an empty set (their statement is returned unchanged).
      */
-    private Set<String> inheritedVisibleTables(DataScope scope, String datasourceId) {
-        Set<String> visible = policy.visibleTables(scope, datasourceId);
-        return visible == null ? Set.of() : visible;
+    private Set<String> protectedTables(DataScope scope, String datasourceId) {
+        return policy.configuredTables(scope, datasourceId);
     }
 
     private void rewritePlainSelect(
@@ -267,10 +293,16 @@ public class DataScopeRewriter {
     private FromItem rewriteTable(
             Table table, DataScope scope, String datasourceId, Set<String> ctes, Set<String> aliases) {
         String name = table.getName() == null ? "" : table.getName().toLowerCase(Locale.ROOT);
-        if (ctes.contains(name)) {
+        // A CTE can only be referenced unqualified. `campus.salary` is always the physical table even
+        // when a CTE called `salary` exists: Table.getName() returns just the base name, so matching
+        // on it alone would let a qualified reference escape the whitelist and the row filter.
+        if (isUnqualified(table) && ctes.contains(normalizeIdentifier(name))) {
             return table;
         }
-        List<RowPredicate> predicates = policy.predicates(scope, datasourceId, name);
+        // For the policy the name must be the bare identifier: a quoted reference (`mine`) must not be
+        // sent to the whitelist with its quoting still attached, which would deny a legal table.
+        String policyName = name.replace("`", "").replace("\"", "").replace("[", "").replace("]", "");
+        List<RowPredicate> predicates = policy.predicates(scope, datasourceId, policyName);
 
         String declaredAlias =
                 table.getAlias() != null ? table.getAlias().getName() : name;
@@ -290,12 +322,7 @@ public class DataScopeRewriter {
         PlainSelect inner = new PlainSelect();
         inner.addSelectItems(new AllColumns());
         inner.setFromItem(source);
-        String predicate = renderPredicates(predicates, scope);
-        try {
-            inner.setWhere(CCJSqlParserUtil.parseCondExpression(predicate));
-        } catch (Exception ex) {
-            throw new SqlPermissionException("无法生成行过滤条件", ex);
-        }
+        inner.setWhere(buildPredicate(predicates, scope));
         ParenthesedSelect derived = new ParenthesedSelect();
         derived.setSelect(inner);
         derived.setAlias(new Alias(alias, true));
@@ -303,22 +330,90 @@ public class DataScopeRewriter {
     }
 
     /**
-     * Renders the OR of the caller's row predicates.
+     * Builds the row predicate for one table reference.
+     *
+     * <p>The predicate is rendered to text (identifiers are bare, values are validated literals) and
+     * then parsed back into an AST. Re-parsing alone is unsafe: the parser returned a bare column for
+     * a value containing {@code \'}, turning "only my rows" into "every row". So the parsed tree is
+     * verified against what was rendered, and a mismatch denies the query — fail closed rather than
+     * execute an under-filtered statement.
      *
      * <p>Each predicate's value comes from the principal attributes; a missing or empty value denies
      * the query instead of producing a predicate that matches nothing (which would silently return an
      * empty result) or, worse, everything.
      */
-    private static String renderPredicates(List<RowPredicate> predicates, DataScope scope) {
-        if (predicates.size() == 1) {
-            return renderPredicate(predicates.get(0), scope);
+    private static Expression buildPredicate(List<RowPredicate> predicates, DataScope scope) {
+        List<String> parts = new ArrayList<>(predicates.size());
+        for (RowPredicate predicate : predicates) {
+            parts.add(renderOne(predicate, scope));
         }
-        return predicates.stream()
-                .map(predicate -> "(" + renderPredicate(predicate, scope) + ")")
-                .collect(Collectors.joining(" OR "));
+        if (parts.isEmpty()) {
+            throw new SqlPermissionException("行过滤条件为空，已拒绝执行");
+        }
+        String text = parts.size() == 1
+                ? parts.get(0)
+                : parts.stream().map(part -> "(" + part + ")").collect(Collectors.joining(" OR "));
+        Expression parsed;
+        try {
+            parsed = CCJSqlParserUtil.parseCondExpression(text);
+        } catch (Exception ex) {
+            throw new SqlPermissionException("无法生成行过滤条件", ex);
+        }
+        verifyPredicate(parsed, predicates, parts);
+        return parsed;
     }
 
-    private static String renderPredicate(RowPredicate predicate, DataScope scope) {
+    /**
+     * Fails unless the parsed predicate has exactly the shape that was rendered: one {@code IN} over a
+     * plain column per expected predicate, with the expected literal count.
+     *
+     * <p>This is what catches a value whose literal the parser could not read back verbatim (for
+     * example a bare-column result), instead of letting the filter silently disappear.
+     */
+    private static void verifyPredicate(
+            Expression parsed, List<RowPredicate> predicates, List<String> parts) {
+        List<Expression> operands;
+        if (predicates.size() == 1) {
+            operands = List.of(parsed);
+        } else {
+            operands = flattenOr(parsed);
+        }
+        if (operands.size() != predicates.size()) {
+            throw new SqlPermissionException("无法生成行过滤条件，已拒绝执行");
+        }
+        for (int i = 0; i < predicates.size(); i++) {
+            if (!isInOverColumn(operands.get(i))) {
+                throw new SqlPermissionException("无法生成行过滤条件，已拒绝执行");
+            }
+        }
+    }
+
+    /** Flattens {@code (a) OR (b) OR (c)} into {@code [a, b, c]}; anything else yields the input. */
+    private static List<Expression> flattenOr(Expression expression) {
+        if (expression instanceof OrExpression or) {
+            List<Expression> flattened = new ArrayList<>();
+            flattened.addAll(flattenOr(or.getLeftExpression()));
+            flattened.addAll(flattenOr(or.getRightExpression()));
+            return flattened;
+        }
+        if (expression instanceof Parenthesis parenthesis) {
+            return flattenOr(parenthesis.getExpression());
+        }
+        return List.of(expression);
+    }
+
+    private static boolean isInOverColumn(Expression expression) {
+        if (!(expression instanceof InExpression in)) {
+            return false;
+        }
+        if (!(in.getLeftExpression() instanceof Column)) {
+            return false;
+        }
+        Expression right = in.getRightExpression();
+        return right instanceof ExpressionList<?>;
+    }
+
+    private static String renderOne(RowPredicate predicate, DataScope scope) {
         String column = predicate.column();
         if (!DataScopePolicyEngine.isSafeColumn(column)) {
             throw new SqlPermissionException("行过滤列不安全，已拒绝执行：" + column);
@@ -331,15 +426,14 @@ public class DataScopeRewriter {
         if (attribute == null) {
             throw new SqlPermissionException("行过滤属性无效，已拒绝执行");
         }
-        // The rendered predicate is interpolated verbatim into a parsed condition, so every piece of
-        // identifier text in it must be a bare identifier. Values never take part in this check:
-        // they are always emitted as a validated literal (numeric or escaped string).
+        // The column is a bare identifier (checked above); every value is a validated literal, so no
+        // caller-controlled text reaches the predicate unescaped.
         return switch (attribute) {
             case CLASS_IDS -> column + " IN (" + numericList(principal.classIds(), column) + ")";
             case STUDENT_ID -> column + " IN (" + numeric(principal.studentId(), attribute) + ")";
-            case STUDENT_NO -> column + " IN (" + quote(text(principal.studentNo(), attribute)) + ")";
-            case USERNAME -> column + " IN (" + quote(text(principal.username(), attribute)) + ")";
-            case USER_ID -> column + " IN (" + quote(text(principal.userId(), attribute)) + ")";
+            case STUDENT_NO -> column + " IN (" + stringLiteral(text(principal.studentNo(), attribute)) + ")";
+            case USERNAME -> column + " IN (" + stringLiteral(text(principal.username(), attribute)) + ")";
+            case USER_ID -> column + " IN (" + stringLiteral(text(principal.userId(), attribute)) + ")";
         };
     }
 
@@ -367,12 +461,25 @@ public class DataScopeRewriter {
     }
 
     /**
-     * Renders a string literal. Backslashes are doubled first so a value such as {@code a\'} cannot
-     * re-open the literal or smuggle in a second statement on a MySQL-family parser, then quotes are
-     * doubled.
+     * Renders a string principal value as a SQL literal.
+     *
+     * <p>Backslashes are doubled first so a value such as {@code a\'} cannot re-open the literal or
+     * smuggle in a second statement on a MySQL-family parser, then quotes are doubled. The result is
+     * verified after re-parsing (see {@link #verifyPredicate}) so a value the parser cannot read back
+     * verbatim denies the query instead of dropping the filter.
+     */
+    private static String stringLiteral(String value) {
+        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'";
+    }
+
+    /**
+     * Renders a string value as a quoted SQL literal.
+     *
+     * @param value the raw value
+     * @return the escaped literal
      */
     static String quote(String value) {
-        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'";
+        return stringLiteral(value);
     }
 
     private static String uniqueAlias(String requested, Set<String> aliases) {

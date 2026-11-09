@@ -100,6 +100,37 @@ public class TablePolicy {
     }
 
     /**
+     * Every table configured for a datasource, regardless of decision (ALL, FILTER or DENY).
+     *
+     * <p>Used to refuse a CTE that shadows a protected table: the rule is "no CTE may be named like a
+     * table the policy governs", not "only the tables this caller may see". A bypassing caller has no
+     * policy view and gets an empty set.
+     *
+     * @param scope the caller's scope
+     * @param datasourceId the datasource id
+     * @return the lower-cased configured table names (empty for a bypassing or unresolved caller)
+     */
+    public Set<String> configuredTables(DataScope scope, String datasourceId) {
+        if (scope == null || scope.access() == null) {
+            return Set.of();
+        }
+        if (scope.bypassesDataScope()) {
+            return Set.of();
+        }
+        String effective = datasourceId(scope, datasourceId);
+        if (effective == null) {
+            return Set.of();
+        }
+        Set<String> tables = new LinkedHashSet<>();
+        scope.access().dataScopes().stream()
+                .filter(rule -> effective.equals(rule.datasourceId()))
+                .filter(rule -> rule.tableName() != null)
+                .map(rule -> rule.tableName().toLowerCase(Locale.ROOT))
+                .forEach(tables::add);
+        return tables;
+    }
+
+    /**
      * The row predicates to enforce on one table reference.
      *
      * @param scope the caller's scope

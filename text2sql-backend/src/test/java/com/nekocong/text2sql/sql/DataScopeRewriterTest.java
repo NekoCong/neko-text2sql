@@ -424,25 +424,8 @@ class DataScopeRewriterTest {
 
     @Test
     void earlierCtesAreVisibleInsideALaterCteBodyButTheCurrentNameIsNot() {
-        // b may read a (defined earlier); a is a CTE reference, so it is not wrapped. The physical
-        // table inside a's body is still filtered.
-        String sql =
-                rewriter.rewrite(
-                        "WITH a AS (SELECT * FROM score), b AS (SELECT * FROM a) SELECT * FROM b",
-                        student(),
-                        CAMPUS);
-
-        assertThat(countOccurrences(compact(sql), "student_id in (1)")).isEqualTo(1);
-        assertThat(compact(sql)).doesNotContain("as a").doesNotContain("as b");
-    }
-
-    @Test
-    void aCteNameIsNotVisibleInsideItsOwnBody() {
-        // `sub` reads the physical table `student`; `x` reads `sub` (an earlier CTE, so visible).
-        // If the current CTE's name were visible while rewriting its own body, `sub` inside `x` would
-        // be treated as the CTE `sub` - fine - but the discriminating case is the one below: a CTE
-        // whose body references a name that is ALSO a later CTE. Here `x`'s body reads `student`,
-        // which is a protected physical table, so it must be filtered, not treated as anything else.
+        // `y` may read `x` (defined earlier), so `x` is not wrapped at the use site, while the
+        // physical table in `x`'s body is filtered exactly once.
         String sql =
                 rewriter.rewrite(
                         "WITH x AS (SELECT * FROM student), y AS (SELECT * FROM x) "
@@ -451,7 +434,6 @@ class DataScopeRewriterTest {
                         CAMPUS);
 
         assertThat(countOccurrences(compact(sql), "student_no in ('2023001')")).isEqualTo(1);
-        // x and y are CTE references at their use sites: not wrapped again.
         assertThat(compact(sql)).doesNotContain("as x").doesNotContain("as y");
     }
 
@@ -479,6 +461,143 @@ class DataScopeRewriterTest {
                                         CAMPUS))
                 .isInstanceOf(SqlPermissionException.class)
                 .hasMessageContaining("RECURSIVE");
+    }
+
+    @Test
+    void rejectsNestedRecursiveCtes() {
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH a AS (WITH RECURSIVE r AS (SELECT 1) SELECT * FROM r) "
+                                                + "SELECT * FROM a",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("RECURSIVE");
+    }
+
+    @Test
+    void rejectsACteNameCollisionInsideANestedWithList() {
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH a AS (WITH score AS (SELECT 1 AS x) SELECT * FROM score) "
+                                                + "SELECT * FROM a",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("score");
+    }
+
+    @Test
+    void rejectsACteShadowingADeniedTable() {
+        // The collision rule covers every configured table, including DENY-only ones (e.g. a salary
+        // table the caller may not see at all): the CTE must not be used as a probe for it.
+        DataScope denied = AccessFixtures.custom(
+                "denied",
+                List.of(rule("d1", CAMPUS, "salary", DataScopePolicy.DENY, null, null),
+                        rule("d2", CAMPUS, "student", DataScopePolicy.FILTER, "student_no", "studentNo")),
+                Set.of(1L),
+                "2023001",
+                null);
+
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH salary AS (SELECT 1 AS x) SELECT * FROM salary",
+                                        denied,
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("salary");
+    }
+
+    @Test
+    void aSchemaQualifiedReferenceIsNotShadowedByACte() {
+        // C1 regression: `Table.getName()` is only `salary`, so matching the base name against the CTE
+        // set would return the physical table unfiltered. A qualified reference is always physical.
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH salary AS (SELECT 1 AS x) SELECT * FROM campus.salary",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("salary");
+    }
+
+    @Test
+    void aSchemaQualifiedProtectedTableInACteBodyIsStillFiltered() {
+        // The qualified reference appears inside a CTE body whose name does not collide; the physical
+        // table must still be filtered rather than taken for the CTE.
+        String sql =
+                rewriter.rewrite(
+                        "WITH mine AS (SELECT * FROM campus.student), other AS (SELECT * FROM mine) "
+                                + "SELECT * FROM campus.student",
+                        student(),
+                        CAMPUS);
+
+        // Two physical references (inside the body and in the outer FROM) -> two filters.
+        assertThat(countOccurrences(compact(sql), "student_no in ('2023001')")).isEqualTo(2);
+    }
+
+    @Test
+    void handlesQuotedCteNamesAndReferences() {
+        String sql =
+                rewriter.rewrite(
+                        "WITH `mine` AS (SELECT * FROM score) SELECT * FROM `mine`", student(), CAMPUS);
+
+        assertThat(compact(sql)).contains("student_id in (1)");
+        assertThat(compact(sql)).doesNotContain("as `mine`");
+    }
+
+    @Test
+    void rejectsACteWhoseQuotedNameCollidesWithAProtectedTable() {
+        assertThatThrownBy(
+                        () ->
+                                rewriter.rewrite(
+                                        "WITH `student` AS (SELECT 1 AS x) SELECT * FROM `student`",
+                                        student(),
+                                        CAMPUS))
+                .isInstanceOf(SqlPermissionException.class)
+                .hasMessageContaining("student");
+    }
+
+    @Test
+    void predicateValuesContainingQuoteAndBackslashNeverDegradeToABareColumn() {
+        // I3 regression: a value like a\'b used to make the re-parse return the bare column, turning
+        // "only my rows" into "every row". Such values now deny (fail closed) instead of degrading.
+        for (String hostile : new String[] {"a\\'b", "it\\'s"}) {
+            DataScope scope = scopeWithUsername(hostile);
+            assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", scope, CAMPUS))
+                    .as("value %s", hostile)
+                    .isInstanceOf(SqlPermissionException.class)
+                    .hasMessageContaining("行过滤条件");
+        }
+
+        // A leading/embedded quote without a preceding backslash is unambiguous and still filters.
+        DataScope ok = scopeWithUsername("o'brien");
+        String sql = rewriter.rewrite("SELECT * FROM student", ok, CAMPUS);
+        assertThat(compact(sql)).contains("username in ('o''brien')");
+        // The filter did not degrade to a bare column (the old widening bug).
+        assertThat(compact(sql)).doesNotContain("where username)");
+    }
+
+    @Test
+    void aBackslashOnlyValueKeepsTheEscapedLiteral() {
+        DataScope scope = scopeWithUsername("a\\b");
+        String sql = rewriter.rewrite("SELECT * FROM student", scope, CAMPUS);
+
+        assertThat(compact(sql)).contains("username in ('a\\\\b')");
+    }
+
+    private static DataScope scopeWithUsername(String username) {
+        return DataScope.from(new com.nekocong.text2sql.access.EffectiveAccess(
+                "u-username",
+                List.of(),
+                Set.of(),
+                Set.of(CAMPUS),
+                List.of(rule("u1", CAMPUS, "student", DataScopePolicy.FILTER, "username", "username")),
+                new PrincipalAttributes("u-username", username, null, null, Set.of())));
     }
 
     @Test
