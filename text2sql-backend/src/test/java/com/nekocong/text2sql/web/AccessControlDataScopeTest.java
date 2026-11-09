@@ -154,17 +154,33 @@ class AccessControlDataScopeTest {
     }
 
     @Test
-    void anInvalidPolicyOrRawSqlIsRejected() {
+    void anInvalidPolicyIsRejectedWithoutAudit() {
         expectedError("score", "EVERYTHING", null, null, 400);
         expectedError("score", null, null, null, 400);
-
-        // A raw predicate, a qualified name or a quoted identifier never reaches the database.
-        expectedError("score WHERE 1=1", "ALL", null, null, 400);
-        expectedError("campus.score", "ALL", null, null, 400);
-        expectedError("\"score\"", "ALL", null, null, 400);
-        expectedError("score", "FILTER", "student_id = 1 OR 1=1", "studentId", 400);
-        expectedError("score", "FILTER", "student-id", "studentId", 400);
         assertThat(listRules()).isEmpty();
+        assertThat(auditRows("data_scope.upsert", null, "DENIED")).isZero();
+    }
+
+    @Test
+    void rawSqlOrQualifiedOrQuotedNamesAreUnprocessableAndAudited() {
+        // A raw predicate, a qualified name or a quoted identifier never reaches the database. The
+        // identifier rule is a 422 rejection (not a 400 shape error) and is audited as DENIED.
+        assertThat(error("score WHERE 1=1", "ALL", null, null, 422))
+                .startsWith("标识符不合法");
+        assertThat(error("campus.score", "ALL", null, null, 422))
+                .isEqualTo("标识符不合法：campus.score");
+        assertThat(error("\"score\"", "ALL", null, null, 422))
+                .isEqualTo("标识符不合法：\"score\"");
+        assertThat(error("score", "FILTER", "student_id = 1 OR 1=1", "studentId", 422))
+                .isEqualTo("标识符不合法：student_id = 1 OR 1=1");
+        assertThat(error("score", "FILTER", "student-id", "studentId", 422))
+                .isEqualTo("标识符不合法：student-id");
+
+        assertThat(listRules()).isEmpty();
+        assertThat(auditRows("data_scope.upsert", null, "DENIED")).isEqualTo(5);
+        assertThat(auditRows("data_scope.upsert", null, "SUCCESS")).isZero();
+        assertThat(auditDistinct("data_scope.upsert", "DENIED", "reason"))
+                .allSatisfy(reason -> assertThat(reason).startsWith("标识符不合法"));
     }
 
     @Test
@@ -182,6 +198,161 @@ class AccessControlDataScopeTest {
         assertThat(listRules()).isEmpty();
         assertThat(auditRows("data_scope.upsert", null, "DENIED")).isEqualTo(4);
         assertThat(auditRows("data_scope.upsert", null, "SUCCESS")).isZero();
+    }
+
+    @Test
+    void aNumericAttributeOnATextColumnIsUnprocessableAndAudited() {
+        // student_id is BIGINT and studentNo is text: fine. student.name is text and studentId is
+        // rendered as a bare number: rejected rather than left to fail at query time.
+        assertThat(error("student", "FILTER", "name", "studentId", 422))
+                .startsWith("列类型与主体属性不匹配：student.name");
+
+        assertThat(upsertRule("student", "FILTER", "id", "studentId").get("policy"))
+                .isEqualTo("FILTER");
+        assertThat(upsertRule("student", "FILTER", "student_no", "studentNo").get("policy"))
+                .isEqualTo("FILTER");
+
+        assertThat(auditRows("data_scope.upsert", null, "DENIED")).isEqualTo(1);
+    }
+
+    @Test
+    void aCaseVariantReUpsertKeepsTheRowAndStoresCanonicalNames() {
+        String id =
+                String.valueOf(upsertRule("score", "FILTER", "STUDENT_ID", "studentId").get("id"));
+
+        Map<String, Object> variant = upsertRule("SCORE", "DENY", null, null);
+        assertThat(variant.get("id"))
+                .as("a different case is the same table: one row, updated in place")
+                .isEqualTo(id);
+        assertThat(variant.get("tableName")).isEqualTo("score");
+
+        assertThat(listRules()).hasSize(1);
+        assertThat(listRules().get(0).get("tableName")).isEqualTo("score");
+
+        // The stored column is the introspected spelling, not the client's.
+        Map<String, Object> filter = upsertRule("Score", "FILTER", "STUDENT_ID", "studentId");
+        assertThat(filter.get("id")).isEqualTo(id);
+        assertThat(filter.get("tableName")).isEqualTo("score");
+        assertThat(filter.get("columnName")).isEqualTo("student_id");
+    }
+
+    @Test
+    void reUpsertPreservesTheCreatedAtTimestamp() {
+        String id = String.valueOf(upsertRule("score", "ALL", null, null).get("id"));
+        Long createdAt = createdAt(id);
+        assertThat(createdAt).isNotNull();
+
+        upsertRule("score", "FILTER", "student_id", "studentId");
+
+        assertThat(createdAt(id))
+                .as("the upsert updates in place; it never recreates the row")
+                .isEqualTo(createdAt);
+        assertThat(listRules()).hasSize(1);
+    }
+
+    @Test
+    void anUnknownStoredPolicyIsListedAsDeny() {
+        // A value the service would never write (a bad migration, a manual edit): reads fail closed.
+        String id = UUID.randomUUID().toString();
+        db.sql(
+                        "INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy,"
+                                + " column_name, principal_attribute, created_at, updated_at)"
+                                + " VALUES (:id, :role, :ds, 'score', 'BOGUS', NULL, NULL, :now, :now)")
+                .bind("id", id)
+                .bind("role", customRoleId)
+                .bind("ds", DATASOURCE)
+                .bind("now", System.currentTimeMillis())
+                .fetch()
+                .rowsUpdated()
+                .block();
+
+        List<Map<String, Object>> rules = listRules();
+        assertThat(rules).hasSize(1);
+        assertThat(rules.get(0).get("id")).isEqualTo(id);
+        assertThat(rules.get(0).get("policy")).isEqualTo("DENY");
+
+        // The policy engine agrees: the table is denied.
+        AppUser user =
+                users.insert(unique("u"), passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT)
+                        .block();
+        assign(user.id(), customRoleId);
+        assertThat(engine.decide(resolve(user.id()), DATASOURCE, "score").denied()).isTrue();
+    }
+
+    @Test
+    void listIsOrderedByDatasourceThenTable() {
+        upsertRule("student", "ALL", null, null);
+        upsertRule("class", "DENY", null, null);
+        upsertRule("score", "FILTER", "student_id", "studentId");
+
+        assertThat(listRules()).extracting(rule -> rule.get("tableName"))
+                .containsExactly("class", "score", "student");
+
+        // The explicit datasource filter returns only that datasource's rows.
+        assertThat(listRules("campus")).hasSize(3);
+        assertThat(listRules("elsewhere")).isEmpty();
+    }
+
+    @Test
+    void aMissingBodyOrRequiredParameterKeepsTheStatusMessageShape() {
+        client.put()
+                .uri(DATA_SCOPES)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.status")
+                .isEqualTo(400)
+                .jsonPath("$.message")
+                .isEqualTo("请求体不能为空");
+
+        client.put()
+                .uri(DATA_SCOPES)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{}")
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.status")
+                .isEqualTo(400)
+                .jsonPath("$.message")
+                .isEqualTo("角色标识不能为空");
+
+        client.get()
+                .uri(DATA_SCOPES)
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.status")
+                .isEqualTo(400)
+                .jsonPath("$.message")
+                .isEqualTo("角色标识不能为空");
+
+        client.get()
+                .uri(uri -> uri.path(DATA_SCOPES).queryParam("roleId", "").build())
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("角色标识不能为空");
+
+        assertThat(listRules()).isEmpty();
+    }
+
+    @Test
+    void aDatasourceIdWithRegistryCharactersIsAccepted() {
+        // The datasource id space is wider than a SQL identifier (dots, dashes); such an id is still
+        // bound, never interpolated, and an unknown one is a 404 rather than a 400.
+        assertThat(error("no-such-ds", "score", "ALL", null, null, 404))
+                .isEqualTo("数据源不存在");
     }
 
     @Test
@@ -447,6 +618,42 @@ class AccessControlDataScopeTest {
             String principalAttribute,
             int status) {
         error(tableName, policy, columnName, principalAttribute, status);
+    }
+
+    /** Sends an {@code ALL} rule against {@code datasourceId} (exercises the datasource id space). */
+    private String error(
+            String datasourceId, String tableName, String policy, String columnName,
+            String principalAttribute, int status) {
+        Map<String, Object> response =
+                client.put()
+                        .uri(DATA_SCOPES)
+                        .header(HttpHeaders.AUTHORIZATION, bearer())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(
+                                body(
+                                        customRoleId,
+                                        datasourceId,
+                                        tableName,
+                                        policy,
+                                        columnName,
+                                        principalAttribute))
+                        .exchange()
+                        .expectStatus()
+                        .isEqualTo(status)
+                        .expectBody(new ParameterizedTypeReference<Map<String, Object>>() {})
+                        .returnResult()
+                        .getResponseBody();
+        assertThat(response).isNotNull();
+        assertThat(response.get("status")).isEqualTo(status);
+        return String.valueOf(response.get("message"));
+    }
+
+    private Long createdAt(String id) {
+        return db.sql("SELECT created_at FROM access_data_scope WHERE id = :id")
+                .bind("id", id)
+                .map((row, meta) -> row.get("created_at", Long.class))
+                .one()
+                .block();
     }
 
     private String error(

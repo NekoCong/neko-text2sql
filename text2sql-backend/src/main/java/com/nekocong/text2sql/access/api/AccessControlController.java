@@ -165,14 +165,20 @@ public class AccessControlController {
     /**
      * Lists a role's data-scope rules, ordered by datasource then table.
      *
-     * @param roleId the role id (required)
+     * @param roleId the role id (required; a missing one is a {@code 400})
      * @param datasourceId the datasource to filter by, or omitted for all
      * @return the rules
      */
     @GetMapping(path = DATA_SCOPES)
     public Mono<List<DataScopeView>> listDataScopes(
-            @RequestParam String roleId,
+            @RequestParam(required = false) String roleId,
             @RequestParam(required = false) String datasourceId) {
+        if (roleId == null || roleId.isBlank()) {
+            // A missing required parameter is a client error; route it through the local handler so the
+            // body keeps the {status,message} shape like every other failure here.
+            return Mono.error(
+                    new ResponseStatusException(HttpStatus.BAD_REQUEST, "角色标识不能为空"));
+        }
         return dataScopes.list(roleId, datasourceId);
     }
 
@@ -186,7 +192,12 @@ public class AccessControlController {
      * @return the stored rule
      */
     @PutMapping(path = DATA_SCOPES)
-    public Mono<DataScopeView> upsertDataScope(@RequestBody DataScopeRequest request) {
+    public Mono<DataScopeView> upsertDataScope(
+            @RequestBody(required = false) DataScopeRequest request) {
+        if (request == null) {
+            // An empty body must not fall through to Spring's error shape: the service answers it.
+            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "请求体不能为空"));
+        }
         return actorId().flatMap(actor -> dataScopes.upsert(actor, request));
     }
 

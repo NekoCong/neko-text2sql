@@ -9,7 +9,13 @@ package com.nekocong.text2sql.access.api.dto;
  * {@code PrincipalAttribute} catalog, never raw SQL.
  *
  * <p>{@code FILTER} requires both {@code columnName} and {@code principalAttribute}; {@code ALL} and
- * {@code DENY} must carry neither.
+ * {@code DENY} must carry neither. The table and column must be bare identifiers present in the
+ * datasource's live metadata (the stored values are the canonical, introspected spellings).
+ *
+ * <p>Type compatibility: {@code studentId} is rendered as a bare number, so it must target a numeric
+ * column; {@code classIds} is rendered as an {@code IN} list; {@code userId}, {@code username} and
+ * {@code studentNo} are compared as text. A single-valued numeric attribute on a known text column is
+ * rejected as a {@code 422}.
  *
  * @param roleId the owning role id (required)
  * @param datasourceId the datasource id (required; must exist in the registry)
