@@ -90,6 +90,35 @@ public interface AccessAdminRepository {
     Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds);
 
     /**
+     * Loads the datasource ids granted to one role directly, ordered by id.
+     *
+     * <p>Inherited grants are not included: this is the role's own, editable set.
+     *
+     * @param roleId the role id
+     * @return the granted datasource ids (empty when the role holds none)
+     */
+    Mono<List<String>> datasourceIdsOf(String roleId);
+
+    /**
+     * Loads every role → datasource grant, for the full matrix.
+     *
+     * @return the grants (one row per {@code (role_id, datasource_id)} pair)
+     */
+    Mono<List<RoleDatasource>> datasourceGrants();
+
+    /**
+     * Replaces one role's datasource grant set.
+     *
+     * <p>Deletes every grant of the role, then inserts the given ones. Both statements must run in
+     * the caller's transaction so the set is replaced atomically.
+     *
+     * @param roleId the role id
+     * @param datasourceIds the datasource ids to grant (already validated against the registry)
+     * @return completion
+     */
+    Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds);
+
+    /**
      * Lists one role's data-scope rules, ordered by datasource then table.
      *
      * @param roleId the role id

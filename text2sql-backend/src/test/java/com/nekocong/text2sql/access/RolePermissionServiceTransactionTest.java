@@ -163,6 +163,21 @@ class RolePermissionServiceTransactionTest {
             }
 
             @Override
+            public Mono<List<String>> datasourceIdsOf(String roleId) {
+                return delegate.datasourceIdsOf(roleId);
+            }
+
+            @Override
+            public Mono<List<RoleDatasource>> datasourceGrants() {
+                return delegate.datasourceGrants();
+            }
+
+            @Override
+            public Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds) {
+                return delegate.replaceRoleDatasources(roleId, datasourceIds);
+            }
+
+            @Override
             public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
                 return delegate.dataScopesOf(roleId, datasourceId);
             }

@@ -159,6 +159,51 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
+    public Mono<List<String>> datasourceIdsOf(String roleId) {
+        return client.sql("SELECT datasource_id FROM access_role_datasource"
+                        + " WHERE role_id = :roleId"
+                        + " ORDER BY datasource_id")
+                .bind("roleId", roleId)
+                .map((row, meta) -> row.get("datasource_id", String.class))
+                .all()
+                .collectList();
+    }
+
+    @Override
+    public Mono<List<RoleDatasource>> datasourceGrants() {
+        return client.sql("SELECT role_id, datasource_id FROM access_role_datasource")
+                .map((row, meta) -> new RoleDatasource(
+                        row.get("role_id", String.class),
+                        row.get("datasource_id", String.class)))
+                .all()
+                .collectList();
+    }
+
+    @Override
+    public Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds) {
+        Mono<Void> delete =
+                client.sql("DELETE FROM access_role_datasource WHERE role_id = :roleId")
+                        .bind("roleId", roleId)
+                        .then();
+        if (datasourceIds == null || datasourceIds.isEmpty()) {
+            return delete;
+        }
+        // One INSERT ... VALUES per id keeps every value bound (no IN-list is built from client
+        // input). Duplicates are already removed by the service, so the primary key cannot collide.
+        Mono<Void> insert = Mono.empty();
+        for (String datasourceId : List.copyOf(datasourceIds)) {
+            insert =
+                    insert.then(
+                            client.sql("INSERT INTO access_role_datasource (role_id, datasource_id)"
+                                            + " VALUES (:roleId, :datasourceId)")
+                                    .bind("roleId", roleId)
+                                    .bind("datasourceId", datasourceId)
+                                    .then());
+        }
+        return delete.then(insert);
+    }
+
+    @Override
     public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
         if (datasourceId == null) {
             return client.sql("SELECT " + DATA_SCOPE_COLUMNS + " FROM access_data_scope"

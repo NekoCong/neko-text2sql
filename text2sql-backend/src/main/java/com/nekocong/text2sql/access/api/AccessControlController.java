@@ -2,6 +2,7 @@ package com.nekocong.text2sql.access.api;
 
 import com.nekocong.text2sql.access.AccessAdminService;
 import com.nekocong.text2sql.access.DataScopeService;
+import com.nekocong.text2sql.access.RoleDatasourceService;
 import com.nekocong.text2sql.access.RolePermissionService;
 import com.nekocong.text2sql.access.UserAdminService;
 import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
@@ -18,6 +19,9 @@ import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
 import com.nekocong.text2sql.access.api.dto.AccessUserView;
 import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
 import com.nekocong.text2sql.access.api.dto.DataScopeView;
+import com.nekocong.text2sql.access.api.dto.DatasourceMatrixView;
+import com.nekocong.text2sql.access.api.dto.RoleDatasourcesRequest;
+import com.nekocong.text2sql.access.api.dto.RoleDatasourcesView;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -68,10 +72,13 @@ public class AccessControlController {
 
     private static final String USERS = "/api/admin/access-control/users";
 
+    private static final String DATASOURCE_ACCESS = "/api/admin/access-control/datasource-access";
+
     private final AccessAdminService service;
     private final RolePermissionService permissions;
     private final DataScopeService dataScopes;
     private final UserAdminService users;
+    private final RoleDatasourceService roleDatasources;
 
     /**
      * Creates the controller.
@@ -80,16 +87,19 @@ public class AccessControlController {
      * @param permissions the permission catalog and role-permission matrix service
      * @param dataScopes the data-scope policy service
      * @param users the user lifecycle service
+     * @param roleDatasources the role → datasource matrix service
      */
     public AccessControlController(
             AccessAdminService service,
             RolePermissionService permissions,
             DataScopeService dataScopes,
-            UserAdminService users) {
+            UserAdminService users,
+            RoleDatasourceService roleDatasources) {
         this.service = service;
         this.permissions = permissions;
         this.dataScopes = dataScopes;
         this.users = users;
+        this.roleDatasources = roleDatasources;
     }
 
     /**
@@ -174,6 +184,49 @@ public class AccessControlController {
                 .flatMap(actor ->
                         permissions.replacePermissions(
                                 actor, id, request == null ? null : request.permissions()));
+    }
+
+    /**
+     * Reads the full role → datasource matrix: every role (ordered by code) with its sorted grant
+     * set, and every registered datasource.
+     *
+     * @return the matrix
+     */
+    @GetMapping(path = DATASOURCE_ACCESS)
+    public Mono<DatasourceMatrixView> datasourceMatrix() {
+        return roleDatasources.matrix();
+    }
+
+    /**
+     * Reads a role's own datasource grant set.
+     *
+     * @param id the role id
+     * @return the role's datasource ids
+     */
+    @GetMapping(path = ROLES + "/{id}/datasources")
+    public Mono<RoleDatasourcesView> roleDatasources(@PathVariable String id) {
+        return roleDatasources.datasourcesOf(id);
+    }
+
+    /**
+     * Replaces a role's datasource grant set with the complete requested set.
+     *
+     * <p>The body is <em>required</em>: a missing body, or a body without a {@code datasourceIds}
+     * array, is a {@code 400} rather than an empty set. Only an explicit {@code {"datasourceIds": []}}
+     * clears the role.
+     *
+     * @param id the role id
+     * @param request the new set
+     * @return the stored set
+     */
+    @PutMapping(path = ROLES + "/{id}/datasources")
+    public Mono<RoleDatasourcesView> replaceRoleDatasources(
+            @PathVariable String id,
+            @RequestBody(required = false) RoleDatasourcesRequest request) {
+        return actorId()
+                .flatMap(actor ->
+                        roleDatasources.replaceDatasources(
+                                actor, id, request == null ? null : request.datasourceIds()));
     }
 
     /**
