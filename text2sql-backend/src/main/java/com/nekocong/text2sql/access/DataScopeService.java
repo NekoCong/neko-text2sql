@@ -69,7 +69,7 @@ public class DataScopeService {
 
     /**
      * The datasource id space. Deliberately wider than a SQL identifier and narrower than "anything":
-     * ids come from configuration or the management API and may contain dots, dashes and slashes
+     * ids come from configuration or the management API and may contain dots, dashes and underscores
      * (e.g. {@code campus}, {@code erp-prod}, {@code tenant.a}), and they are only ever bound as
      * parameters, never interpolated. {@link DataSourceDefinition#setId} does not constrain the form.
      */
@@ -166,7 +166,9 @@ public class DataScopeService {
                     requireId(roleId, "角色标识无效");
                     String datasource = blankToNull(datasourceId);
                     if (datasource != null) {
-                        requireId(datasource, "数据源标识无效");
+                        // Same relaxed id space as the PUT body: the filter is only bound, and a
+                        // datasource id may legitimately contain dots or dashes.
+                        requireDatasourceId(datasource);
                     }
                     return repository
                             .role(roleId)
@@ -197,12 +199,17 @@ public class DataScopeService {
                             requireShape(request);
                             DataScopeRule candidate = candidate(request);
                             return requireRole(actorId, candidate)
-                                    .then(Mono.defer(() -> requireDatasource(actorId, candidate)))
                                     .then(
                                             Mono.defer(
                                                     () ->
-                                                            requireTableAndColumnAndType(
-                                                                    actorId, request, candidate)))
+                                                            requireDatasource(actorId, candidate)
+                                                                    .flatMap(
+                                                                            dataSource ->
+                                                                                    requireTableAndColumnAndType(
+                                                                                            actorId,
+                                                                                            request,
+                                                                                            candidate,
+                                                                                            dataSource))))
                                     .flatMap(rule -> store(actorId, rule));
                         })
                 .onErrorMap(Denial.class, Denial::toException)
@@ -332,20 +339,22 @@ public class DataScopeService {
     }
 
     /**
-     * Requires the datasource to exist in the registry, and returns the resolved pool, so later
-     * metadata work reuses it instead of resolving again (a registry removal in between would
-     * otherwise turn a {@code 404} into a server error).
+     * Requires the datasource to exist in the registry and returns its resolved pool, so the
+     * metadata pass reuses it instead of resolving the registry a second time (a registry removal in
+     * between would otherwise turn the {@code 404} already decided here into a server error).
      *
      * <p>Resolution is offloaded to the blocking scheduler: {@code resolve} is {@code synchronized}
-     * over the pool map, so it can wait behind a concurrent registration.
+     * over the pool map, so it can wait behind a concurrent registration. A registry miss is audited
+     * as {@code DENIED} and fails the returned {@code Mono} with the denial.
      */
     private Mono<DataSource> requireDatasource(String actorId, DataScopeRule requested) {
         return Mono.fromCallable(() -> datasources.resolve(requested.datasourceId()))
                 .subscribeOn(blockingScheduler)
-                .<Optional<DataSource>>map(Optional::of)
                 .onErrorResume(
                         NoSuchElementException.class,
                         error ->
+                                // deny(...) always completes with an error, so the empty fallback
+                                // exists only to satisfy the return type.
                                 deny(
                                                 actorId,
                                                 ACTION_UPSERT,
@@ -355,16 +364,12 @@ public class DataScopeService {
                                                 new Denial(
                                                         REASON_DATASOURCE_MISSING,
                                                         HttpStatus.NOT_FOUND))
-                                        .then(Mono.just(Optional.<DataSource>empty())))
-                .<DataSource>flatMap(
-                        resolved ->
-                                resolved.map(Mono::just)
-                                        .orElseGet(Mono::empty));
+                                        .then(Mono.<DataSource>empty()));
     }
 
     /**
-     * Validates the name syntax, the table, the column, the attribute and the attribute/column type
-     * compatibility against the live metadata, and returns the rule with canonical names.
+     * Validates the name syntax, the table, the column and the attribute/column type compatibility
+     * against the live metadata, and returns the rule with canonical names.
      *
      * <p>One introspection pass answers every metadata check, because it is the expensive part.
      * Introspection is blocking JDBC, so it runs on the blocking scheduler; an introspection failure
@@ -373,17 +378,21 @@ public class DataScopeService {
      * @param actorId the acting user id
      * @param request the body (for the raw table/column/attribute spellings)
      * @param candidate the candidate rule
+     * @param dataSource the datasource already resolved and validated by {@link #requireDatasource}
      * @return the rule ready to store, with canonical table and column names
      */
     private Mono<DataScopeRule> requireTableAndColumnAndType(
-            String actorId, DataScopeRequest request, DataScopeRule candidate) {
+            String actorId,
+            DataScopeRequest request,
+            DataScopeRule candidate,
+            DataSource dataSource) {
         return Mono.fromCallable(
                         () -> {
                             Optional<Denial> syntax = checkIdentifiers(request);
                             if (syntax.isPresent()) {
                                 return Inspection.reject(syntax.get());
                             }
-                            return inspect(resolveDatasource(candidate.datasourceId()), candidate);
+                            return inspect(dataSource, candidate);
                         })
                 .subscribeOn(blockingScheduler)
                 .flatMap(
@@ -456,21 +465,17 @@ public class DataScopeService {
     /**
      * Checks the canonical table, column and type against the live metadata.
      *
+     * <p>The attribute was already validated by {@link #checkIdentifiers}, so it resolves here
+     * without a rejection path.
+     *
      * @param dataSource the already-resolved datasource
      * @param candidate the candidate rule
      * @return the canonical rule, or the rejection
      */
     private Inspection inspect(DataSource dataSource, DataScopeRule candidate) {
-        String canonicalAttribute =
-                PrincipalAttribute.fromCode(candidate.principalAttribute())
-                        .map(PrincipalAttribute::code)
-                        .orElse(null);
-        if (candidate.principalAttribute() != null && canonicalAttribute == null) {
-            return Inspection.reject(
-                    new Denial(
-                            REASON_UNKNOWN_ATTRIBUTE + echo(candidate.principalAttribute()),
-                            HttpStatus.UNPROCESSABLE_ENTITY));
-        }
+        PrincipalAttribute attribute =
+                PrincipalAttribute.fromCode(candidate.principalAttribute()).orElse(null);
+        String canonicalAttribute = attribute == null ? null : attribute.code();
         TableSchema table = findTable(dataSource, candidate.tableName());
         if (table == null) {
             return Inspection.reject(
@@ -491,8 +496,6 @@ public class DataScopeService {
                             HttpStatus.UNPROCESSABLE_ENTITY));
         }
         ColumnSchema found = column.get();
-        PrincipalAttribute attribute =
-                canonicalAttribute == null ? null : PrincipalAttribute.fromCode(canonicalAttribute).get();
         if (attribute != null && !typeCompatible(found.typeName(), attribute)) {
             return Inspection.reject(
                     new Denial(
@@ -599,19 +602,6 @@ public class DataScopeService {
                 rule.policy(),
                 columnName,
                 principalAttribute);
-    }
-
-    /**
-     * Resolves the datasource pool for the introspection pass.
-     *
-     * <p>The datasource was validated a moment earlier; a removal in between fails the change closed
-     * as an introspection error rather than silently storing a rule.
-     *
-     * @param datasourceId the datasource id
-     * @return the pool
-     */
-    private DataSource resolveDatasource(String datasourceId) {
-        return datasources.resolve(datasourceId);
     }
 
     // --- mutation ---------------------------------------------------------------------------

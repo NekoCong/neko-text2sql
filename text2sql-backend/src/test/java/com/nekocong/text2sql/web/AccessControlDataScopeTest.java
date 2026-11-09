@@ -44,6 +44,9 @@ class AccessControlDataScopeTest {
 
     private static final String DATASOURCE = "campus";
 
+    /** A second configured datasource (dash in the id, same demo schema). */
+    private static final String SECOND_DATASOURCE = "erp-prod";
+
     @LocalServerPort
     private int port;
 
@@ -284,13 +287,60 @@ class AccessControlDataScopeTest {
         upsertRule("student", "ALL", null, null);
         upsertRule("class", "DENY", null, null);
         upsertRule("score", "FILTER", "student_id", "studentId");
+        // A second datasource ('erp-prod'): its rules must sort before 'campus' and, within it, by
+        // table.
+        upsertRule(SECOND_DATASOURCE, "student", "ALL", null, null);
+        upsertRule(SECOND_DATASOURCE, "score", "ALL", null, null);
 
-        assertThat(listRules()).extracting(rule -> rule.get("tableName"))
+        assertThat(listRules())
+                .extracting(rule -> rule.get("datasourceId") + "/" + rule.get("tableName"))
+                .containsExactly(
+                        "campus/class",
+                        "campus/score",
+                        "campus/student",
+                        "erp-prod/score",
+                        "erp-prod/student");
+
+        // The explicit datasource filter returns only that datasource's rows, in table order, and
+        // accepts the relaxed (dashed) id on the query parameter exactly as the body does.
+        assertThat(listRules("campus")).extracting(rule -> rule.get("tableName"))
                 .containsExactly("class", "score", "student");
-
-        // The explicit datasource filter returns only that datasource's rows.
-        assertThat(listRules("campus")).hasSize(3);
+        assertThat(listRules(SECOND_DATASOURCE)).extracting(rule -> rule.get("tableName"))
+                .containsExactly("score", "student");
         assertThat(listRules("elsewhere")).isEmpty();
+    }
+
+    @Test
+    void aDashedDatasourceIdIsAcceptedByTheQueryFilter() {
+        // ?datasourceId=erp-prod used to fail the SQL-identifier check with 400 while the PUT body
+        // accepted the same id.
+        client.get()
+                .uri(
+                        uri ->
+                                uri.path(DATA_SCOPES)
+                                        .queryParam("roleId", customRoleId)
+                                        .queryParam("datasourceId", SECOND_DATASOURCE)
+                                        .build())
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isOk()
+                .expectBodyList(new ParameterizedTypeReference<Map<String, Object>>() {})
+                .hasSize(0);
+
+        // An id outside the registry id space is still a 400.
+        client.get()
+                .uri(uri -> uri.path(DATA_SCOPES)
+                        .queryParam("roleId", customRoleId)
+                        .queryParam("datasourceId", "bad id!")
+                        .build())
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("数据源标识无效");
     }
 
     @Test
@@ -588,6 +638,16 @@ class AccessControlDataScopeTest {
     /** Upserts a rule for this test's role against the campus datasource. */
     private Map<String, Object> upsertRule(
             String tableName, String policy, String columnName, String principalAttribute) {
+        return upsertRule(DATASOURCE, tableName, policy, columnName, principalAttribute);
+    }
+
+    /** Upserts a rule for this test's role against {@code datasourceId}. */
+    private Map<String, Object> upsertRule(
+            String datasourceId,
+            String tableName,
+            String policy,
+            String columnName,
+            String principalAttribute) {
         Map<String, Object> response =
                 client.put()
                         .uri(DATA_SCOPES)
@@ -596,7 +656,7 @@ class AccessControlDataScopeTest {
                         .bodyValue(
                                 body(
                                         customRoleId,
-                                        DATASOURCE,
+                                        datasourceId,
                                         tableName,
                                         policy,
                                         columnName,

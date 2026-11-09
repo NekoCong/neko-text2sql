@@ -27,3 +27,14 @@ text2sql:
         password: ""
         dialect: H2
         seed: true
+      # A second datasource with a dash in its id: it lets tests exercise multi-datasource ordering
+      # and the datasource id space (ids are only ever bound, never interpolated). It is seeded with
+      # the same demo schema so metadata validation has real tables to check.
+      - id: erp-prod
+        name: ERP（H2）
+        driver: org.h2.Driver
+        url: "jdbc:h2:mem:erp;DB_CLOSE_DELAY=-1;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE"
+        username: sa
+        password: ""
+        dialect: H2
+        seed: true
