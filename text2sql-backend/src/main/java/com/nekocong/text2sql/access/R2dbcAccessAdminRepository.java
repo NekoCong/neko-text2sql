@@ -94,6 +94,58 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
+    public Mono<List<AccessPermission>> permissions() {
+        return client.sql("SELECT id, permission_key, module, action, description, built_in"
+                        + " FROM access_permission ORDER BY module, permission_key")
+                .map((row, meta) -> new AccessPermission(
+                        row.get("id", String.class),
+                        row.get("permission_key", String.class),
+                        row.get("module", String.class),
+                        row.get("action", String.class),
+                        row.get("description", String.class),
+                        Boolean.TRUE.equals(row.get("built_in", Boolean.class))))
+                .all()
+                .collectList();
+    }
+
+    @Override
+    public Mono<List<String>> permissionKeysOf(String roleId) {
+        return client.sql("SELECT p.permission_key"
+                        + " FROM access_permission p"
+                        + " JOIN access_role_permission rp ON rp.permission_id = p.id"
+                        + " WHERE rp.role_id = :roleId"
+                        + " ORDER BY p.permission_key")
+                .bind("roleId", roleId)
+                .map((row, meta) -> row.get("permission_key", String.class))
+                .all()
+                .collectList();
+    }
+
+    @Override
+    public Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds) {
+        Mono<Void> delete =
+                client.sql("DELETE FROM access_role_permission WHERE role_id = :roleId")
+                        .bind("roleId", roleId)
+                        .then();
+        if (permissionIds == null || permissionIds.isEmpty()) {
+            return delete;
+        }
+        // One INSERT ... SELECT per key keeps every value bound (no IN-list is built from client
+        // input). Duplicates are already removed by the service, so the primary key cannot collide.
+        Mono<Void> insert = Mono.empty();
+        for (String permissionId : List.copyOf(permissionIds)) {
+            insert =
+                    insert.then(
+                            client.sql("INSERT INTO access_role_permission (role_id, permission_id)"
+                                            + " VALUES (:roleId, :permissionId)")
+                                    .bind("roleId", roleId)
+                                    .bind("permissionId", permissionId)
+                                    .then());
+        }
+        return delete.then(insert);
+    }
+
+    @Override
     public Mono<Void> record(
             String actorId,
             String action,

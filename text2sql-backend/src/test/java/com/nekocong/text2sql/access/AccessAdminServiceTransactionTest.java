@@ -174,6 +174,21 @@ class AccessAdminServiceTransactionTest {
             }
 
             @Override
+            public Mono<List<AccessPermission>> permissions() {
+                return delegate.permissions();
+            }
+
+            @Override
+            public Mono<List<String>> permissionKeysOf(String roleId) {
+                return delegate.permissionKeysOf(roleId);
+            }
+
+            @Override
+            public Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds) {
+                return delegate.replaceRolePermissions(roleId, permissionIds);
+            }
+
+            @Override
             public Mono<Void> record(
                     String actorId,
                     String action,

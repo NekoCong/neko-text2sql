@@ -61,10 +61,40 @@ public interface AccessAdminRepository {
             String id, String name, String description, String parentId, boolean enabled);
 
     /**
+     * Lists the whole permission catalog, ordered by module then key.
+     *
+     * @return the catalog
+     */
+    Mono<List<AccessPermission>> permissions();
+
+    /**
+     * Loads the permission keys granted to one role directly, ordered by key.
+     *
+     * <p>Inherited permissions are not included: this is the role's own, editable set.
+     *
+     * @param roleId the role id
+     * @return the granted keys (empty when the role holds none)
+     */
+    Mono<List<String>> permissionKeysOf(String roleId);
+
+    /**
+     * Replaces one role's permission set.
+     *
+     * <p>Deletes every grant of the role, then inserts the given ones. Both statements must run in
+     * the caller's transaction so the set is replaced atomically.
+     *
+     * @param roleId the role id
+     * @param permissionIds the catalog ids to grant (already validated against the catalog)
+     * @return completion
+     */
+    Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds);
+
+    /**
      * Appends one audit row.
      *
      * @param actorId the acting user id
-     * @param action the action key ({@code role.create}, {@code role.update}, {@code role.disable})
+     * @param action the action key ({@code role.create}, {@code role.update}, {@code role.disable},
+     *     {@code role.permissions})
      * @param entityType the entity type ({@code ROLE})
      * @param entityId the affected role id, or {@code null}
      * @param beforeJson the serialized before state, or {@code null}
