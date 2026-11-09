@@ -396,6 +396,31 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
+    public Mono<List<RolePermissionLink>> rolePermissionLinks() {
+        return client.sql("SELECT rp.role_id, p.permission_key"
+                        + " FROM access_role_permission rp"
+                        + " JOIN access_permission p ON p.id = rp.permission_id")
+                .map((row, meta) -> new RolePermissionLink(
+                        row.get("role_id", String.class),
+                        row.get("permission_key", String.class)))
+                .all()
+                .collectList();
+    }
+
+    @Override
+    public Mono<List<UserRoleLink>> enabledUserRoles() {
+        return client.sql("SELECT ur.user_id, ur.role_id"
+                        + " FROM access_user_role ur"
+                        + " JOIN app_user u ON u.id = ur.user_id"
+                        + " WHERE u.enabled = TRUE")
+                .map((row, meta) -> new UserRoleLink(
+                        row.get("user_id", String.class),
+                        row.get("role_id", String.class)))
+                .all()
+                .collectList();
+    }
+
+    @Override
     public Mono<Void> record(
             String actorId,
             String action,

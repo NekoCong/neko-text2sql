@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.access;
 
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -54,6 +55,44 @@ public class AccessContextResolver {
                         roles ->
                                 repository.permissionKeys(
                                         effectiveRoleIds(roles.getT1(), roles.getT2())));
+    }
+
+    /**
+     * Computes the effective role ids of one user (the user's enabled direct roles plus their
+     * enabled ancestors), reusing the shared inheritance walk.
+     *
+     * <p>Used by the anti-escalation checks, which must ask "which roles does this actor hold,
+     * directly or through inheritance?" without failing on a disabled or stale account. An unknown
+     * user resolves to an empty list (fails closed).
+     *
+     * @param userId the user id
+     * @return the effective role ids
+     */
+    public Mono<List<String>> effectiveRoleIdsOf(String userId) {
+        return repository.rolesOf(userId).flatMap(this::effectiveRoleIdsFor);
+    }
+
+    /**
+     * Computes the effective role ids for the given direct roles (each enabled direct role plus its
+     * enabled ancestors), loading every role for the walk. Rejects a cycle.
+     *
+     * @param direct the directly assigned roles
+     * @return the effective role ids, including inherited ones
+     */
+    public Mono<List<String>> effectiveRoleIdsFor(Collection<AccessRole> direct) {
+        return repository
+                .allRoles()
+                .map(all -> effectiveRoleIds(direct == null ? List.of() : List.copyOf(direct), all));
+    }
+
+    /**
+     * Loads the union of permission keys for the given role ids (already the effective set).
+     *
+     * @param roleIds the effective role ids
+     * @return the permission keys
+     */
+    public Mono<Set<String>> effectivePermissionsForRoles(Collection<String> roleIds) {
+        return repository.permissionKeys(roleIds);
     }
 
     /**
@@ -117,10 +156,10 @@ public class AccessContextResolver {
     /**
      * Computes the ids of the enabled direct roles plus their enabled ancestors, rejecting cycles.
      *
-     * <p>The single inheritance walk shared by {@link #resolve} and {@link #effectivePermissions},
-     * so the lockout rule never reimplements it.
+     * <p>The single inheritance walk shared by {@link #resolve}, {@link #effectivePermissions} and
+     * the anti-escalation/lockout checks, so no caller reimplements it.
      */
-    private static List<String> effectiveRoleIds(
+    static List<String> effectiveRoleIds(
             List<AccessRole> direct, List<AccessRole> all) {
         Map<String, AccessRole> byId = new HashMap<>();
         for (AccessRole role : all) {

@@ -97,6 +97,7 @@ public class UserAdminService {
     private static final String REASON_DUPLICATE_USERNAME = "用户名已存在";
     private static final String REASON_USER_MISSING = "用户不存在";
     private static final String REASON_ROLE_MISSING = "角色不存在：";
+    private static final String REASON_ROLE_ESCALATION = "不能分配超出自身权限的角色：";
     private static final String REASON_LAST_ADMIN = "不能移除最后一个拥有 access.manage 的管理员";
     private static final String REASON_ROLE_REQUIRED = "至少需要一个角色";
     private static final String REASON_ROLES_BODY_MISSING = "roleIds 不能为空";
@@ -105,6 +106,7 @@ public class UserAdminService {
 
     private final AccessAdminRepository repository;
     private final AccessContextResolver access;
+    private final AccessEscalationService escalation;
     private final TransactionalOperator transactions;
     private final TransactionalOperator newTransactions;
     private final ObjectMapper objectMapper;
@@ -115,6 +117,7 @@ public class UserAdminService {
      *
      * @param repository the admin repository
      * @param access the access-context resolver, reused for the effective-permission lockout check
+     * @param escalation the shared anti-escalation component (role-assignment subset checks)
      * @param transactionManager the R2DBC reactive transaction manager
      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
      * @param passwordEncoder the encoder used to hash new passwords
@@ -122,11 +125,13 @@ public class UserAdminService {
     public UserAdminService(
             AccessAdminRepository repository,
             AccessContextResolver access,
+            AccessEscalationService escalation,
             ReactiveTransactionManager transactionManager,
             ObjectMapper objectMapper,
             PasswordEncoder passwordEncoder) {
         this.repository = repository;
         this.access = access;
+        this.escalation = escalation;
         this.transactions = TransactionalOperator.create(transactionManager);
         this.newTransactions =
                 TransactionalOperator.create(
@@ -246,7 +251,7 @@ public class UserAdminService {
                             String password = validatePassword(body.password());
                             String displayName = normalizeDisplayName(body.displayName());
                             List<String> roleIds = normalizeRoleIds(body.roleIds(), true);
-                            return resolveRoles(roleIds)
+                            return resolveAssignableRoles(actorId, roleIds)
                                     .onErrorResume(
                                             Denial.class,
                                             denial ->
@@ -493,7 +498,7 @@ public class UserAdminService {
     }
 
     private Mono<AccessUser> replaceRoles(String actorId, AccessUser before, List<String> roleIds) {
-        return resolveRoles(roleIds)
+        return resolveAssignableRoles(actorId, roleIds)
                 .onErrorResume(
                         Denial.class,
                         denial ->
@@ -601,6 +606,40 @@ public class UserAdminService {
             }
             return resolved;
         });
+    }
+
+    /**
+     * Resolves the requested role ids and rejects any whose effective permission set the actor does
+     * not fully hold (the built-in administrator is exempt). Both the unknown-role {@code 404} and the
+     * escalation {@code 403} are carried as a {@link Denial} so the caller audits exactly one {@code
+     * DENIED} row.
+     */
+    private Mono<List<AccessRole>> resolveAssignableRoles(String actorId, List<String> roleIds) {
+        return resolveRoles(roleIds).flatMap(roles -> ensureRolesAssignable(actorId, roles));
+    }
+
+    /**
+     * Requires each role's effective permission set to be a subset of the actor's, using the shared
+     * escalation component so the inheritance walk is never reimplemented here.
+     */
+    private Mono<List<AccessRole>> ensureRolesAssignable(String actorId, List<AccessRole> roles) {
+        return Flux.fromIterable(roles)
+                .concatMap(role -> requireAssignable(actorId, role).thenReturn(role))
+                .collectList();
+    }
+
+    private Mono<Void> requireAssignable(String actorId, AccessRole role) {
+        return escalation
+                .effectivePermissionsOfRoles(List.of(role))
+                .flatMap(required -> escalation.actorCovers(actorId, required))
+                .flatMap(
+                        allowed ->
+                                allowed
+                                        ? Mono.<Void>empty()
+                                        : Mono.error(
+                                                new Denial(
+                                                        REASON_ROLE_ESCALATION + role.code(),
+                                                        HttpStatus.FORBIDDEN)));
     }
 
     /**

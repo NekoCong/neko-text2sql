@@ -7,6 +7,7 @@ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
 import com.nekocong.text2sql.security.Roles;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
@@ -31,13 +32,13 @@ import reactor.core.publisher.Mono;
  *       immutable and unique afterwards.
  *   <li>{@code name} is required, at most {@value #MAX_NAME_LENGTH} characters; {@code description}
  *       is at most {@value #MAX_DESCRIPTION_LENGTH} characters (the column width).
- *   <li>{@code parentId} must reference an existing role and must not create a cycle. A disabled
- *       parent is allowed: it contributes nothing at resolution time.
- *   <li>The built-in administrator role may not be used as a parent until inheritance subset checks
- *       exist: a role holding {@code access.manage} would otherwise inherit
- *       {@code access.bypass_data_scope} from it.
- *   <li>Built-in roles keep their {@code code}; the built-in administrator role cannot be disabled.
- *       Other built-in roles may be renamed or disabled.
+ *   <li>{@code parentId} must reference an existing, enabled role, must not create a cycle, and the
+ *       parent's effective permission set must be a subset of the actor's (the built-in administrator
+ *       is exempt). A disabled parent is rejected: enabling it later would otherwise escalate the
+ *       child silently.
+ *   <li>The built-in administrator role cannot be reparented (its {@code parentId} stays {@code
+ *       null}), disabled, or renamed with a different {@code code}; it may still be used as a parent
+ *       by the built-in administrator (the subset rule, not a hard block, governs inheritance).
  * </ul>
  *
  * <p>Each mutation runs in one reactive transaction (the R2DBC {@code TransactionalOperator}): the
@@ -92,12 +93,17 @@ public class AccessAdminService {
     private static final String REASON_DUPLICATE_CODE = "角色编码已存在";
     private static final String REASON_IMMUTABLE_CODE = "角色编码不可修改";
     private static final String REASON_BUILT_IN_ADMIN = "内置管理员角色不能停用";
-    private static final String REASON_BUILT_IN_ADMIN_PARENT = "内置管理员角色不能作为父角色";
+    private static final String REASON_BUILT_IN_ADMIN_REPARENT = "内置管理员角色不能调整继承关系";
     private static final String REASON_CYCLE = "会形成循环继承";
     private static final String REASON_PARENT_MISSING = "父角色不存在";
+    private static final String REASON_PARENT_DISABLED = "父角色已停用";
+    private static final String REASON_PARENT_ESCALATION = "不能继承超出自身权限的角色：";
     private static final String REASON_ROLE_MISSING = "角色不存在";
+    private static final String REASON_LAST_ADMIN = "不能移除最后一个拥有 access.manage 的管理员";
 
     private final AccessAdminRepository repository;
+    private final AccessEscalationService escalation;
+    private final AccessLockoutService lockout;
     private final TransactionalOperator transactions;
     private final TransactionalOperator newTransactions;
     private final ObjectMapper objectMapper;
@@ -106,14 +112,20 @@ public class AccessAdminService {
      * Creates the service.
      *
      * @param repository the admin repository
+     * @param escalation the shared anti-escalation component (parent subset checks)
+     * @param lockout the shared last-administrator lockout component
      * @param transactionManager the R2DBC reactive transaction manager
      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
      */
     public AccessAdminService(
             AccessAdminRepository repository,
+            AccessEscalationService escalation,
+            AccessLockoutService lockout,
             ReactiveTransactionManager transactionManager,
             ObjectMapper objectMapper) {
         this.repository = repository;
+        this.escalation = escalation;
+        this.lockout = lockout;
         this.transactions = TransactionalOperator.create(transactionManager);
         this.newTransactions =
                 TransactionalOperator.create(
@@ -179,7 +191,7 @@ public class AccessAdminService {
 
     /** Validates the parent, inserts the role and appends its audit row. */
     private Mono<AccessRole> insert(String actorId, AccessRole requested) {
-        return requireUsableParent(requested.parentId())
+        return requireUsableParent(actorId, requested.parentId())
                 .onErrorResume(
                         Denial.class,
                         denial ->
@@ -308,12 +320,18 @@ public class AccessAdminService {
                         parentId,
                         before.builtIn(),
                         enabled);
+        // The built-in administrator role keeps its parent; disabling it was already rejected.
+        Mono<Void> builtInAdminCheck = requireBuiltInAdminParent(before, parentId);
         // Re-sending the current parent is a no-op; only a different one needs validating.
         Mono<Void> parentCheck =
                 parentId == null || parentId.equals(before.parentId())
                         ? Mono.empty()
-                        : validateParent(before, parentId);
-        return parentCheck
+                        : validateParent(actorId, before, parentId);
+        Mono<Void> lockout = lockoutCheck(before, parentId, enabled);
+        // Run the checks in order; the first denial short-circuits and is audited exactly once.
+        return builtInAdminCheck
+                .then(parentCheck)
+                .then(lockout)
                 .onErrorResume(
                         Denial.class,
                         denial ->
@@ -333,6 +351,39 @@ public class AccessAdminService {
                 .then(repository.role(before.id()))
                 .switchIfEmpty(Mono.error(new IllegalStateException("角色更新后丢失：" + before.id())))
                 .flatMap(after -> audit(actorId, action, before, after));
+    }
+
+    /** The built-in administrator role must never gain a parent. */
+    private static Mono<Void> requireBuiltInAdminParent(AccessRole before, String parentId) {
+        if (before.builtIn() && Roles.ADMIN.equals(before.code()) && parentId != null) {
+            return Mono.error(new Denial(REASON_BUILT_IN_ADMIN_REPARENT, HttpStatus.CONFLICT));
+        }
+        return Mono.empty();
+    }
+
+    /**
+     * Rejects a disable or reparent that would leave no enabled user holding {@code access.manage}.
+     */
+    private Mono<Void> lockoutCheck(AccessRole before, String parentId, boolean enabled) {
+        boolean disabling = before.enabled() && !enabled;
+        boolean reparenting = !Objects.equals(parentId, before.parentId());
+        Mono<Void> check = Mono.empty();
+        if (disabling) {
+            check = check.then(lockoutGate(before.id(), lockout.retainsAccessManageAfterDisable(before.id())));
+        }
+        if (reparenting) {
+            check =
+                    check.then(
+                            lockoutGate(
+                                    before.id(),
+                                    lockout.retainsAccessManageAfterReparent(before.id(), parentId)));
+        }
+        return check;
+    }
+
+    private static Mono<Void> lockoutGate(String roleId, Mono<Boolean> retains) {
+        return retains.flatMap(
+                safe -> safe ? Mono.empty() : Mono.error(new Denial(REASON_LAST_ADMIN, HttpStatus.CONFLICT)));
     }
 
     // --- validation -------------------------------------------------------------------------
@@ -385,32 +436,33 @@ public class AccessAdminService {
     }
 
     /**
-     * On create, a parent only has to exist and be a permitted parent; a new role cannot close a
-     * cycle.
+     * On create, a parent must exist, be enabled, and its effective permission set must be a subset
+     * of the actor's (a new role cannot close a cycle).
      *
+     * @param actorId the acting user id
      * @param parentId the requested parent, or {@code null}
      */
-    private Mono<Void> requireUsableParent(String parentId) {
+    private Mono<Void> requireUsableParent(String actorId, String parentId) {
         if (parentId == null) {
             return Mono.empty();
         }
         return repository
                 .role(parentId)
                 .switchIfEmpty(Mono.error(new Denial(REASON_PARENT_MISSING, HttpStatus.NOT_FOUND)))
-                .flatMap(AccessAdminService::permitParent);
+                .flatMap(parent -> requireEnabledParent(parent)
+                        .then(Mono.defer(() -> requireParentWithinActor(actorId, parent))));
     }
 
     /**
-     * On update, the parent must exist, be a permitted parent, and linking the role under it must
-     * keep the single-parent graph acyclic.
+     * On update, the parent must exist, be enabled, be within the actor's own effective permissions,
+     * and linking the role under it must keep the single-parent graph acyclic.
      *
      * <p>Walks up from the prospective parent, one lookup at a time, following the stored parent
      * chain. Reaching the role itself means the new link would close a cycle: its own id, any
-     * descendant, or an ancestor that already leads back. A disabled parent is fine (it contributes
-     * nothing at resolution time); a dangling or looping existing chain is refused rather than
-     * extended, so the stored configuration stays acyclic.
+     * descendant, or an ancestor that already leads back. A dangling or looping existing chain is
+     * refused rather than extended, so the stored configuration stays acyclic.
      */
-    private Mono<Void> validateParent(AccessRole role, String parentId) {
+    private Mono<Void> validateParent(String actorId, AccessRole role, String parentId) {
         if (parentId == null) {
             return Mono.empty();
         }
@@ -420,24 +472,38 @@ public class AccessAdminService {
         return repository
                 .role(parentId)
                 .switchIfEmpty(Mono.error(new Denial(REASON_PARENT_MISSING, HttpStatus.NOT_FOUND)))
-                .flatMap(AccessAdminService::permitParent)
+                .flatMap(parent -> requireEnabledParent(parent)
+                        .then(Mono.defer(() -> requireParentWithinActor(actorId, parent))))
                 .then(climbToRoot(role, parentId, parentId, new HashSet<>()));
     }
 
     /**
-     * Rejects the built-in administrator role as a parent. Inheriting it would hand
-     * {@code access.bypass_data_scope} to any role its holder can attach, so a caller with {@code
-     * access.manage} could grant themselves an uncontrolled scope; subset checks arrive in a later
-     * task.
-     *
-     * @param parent the prospective parent
-     * @return completion, or a denial
+     * Rejects a disabled parent: it contributes nothing today, but enabling it later would hand its
+     * permission set to the child silently (a reparent-time subset check cannot see the future).
      */
-    private static Mono<Void> permitParent(AccessRole parent) {
-        if (parent.builtIn() && Roles.ADMIN.equals(parent.code())) {
-            return Mono.error(new Denial(REASON_BUILT_IN_ADMIN_PARENT, HttpStatus.CONFLICT));
-        }
-        return Mono.empty();
+    private static Mono<Void> requireEnabledParent(AccessRole parent) {
+        return parent.enabled()
+                ? Mono.empty()
+                : Mono.error(new Denial(REASON_PARENT_DISABLED, HttpStatus.CONFLICT));
+    }
+
+    /**
+     * Rejects a parent whose effective permission set the actor does not fully hold (the built-in
+     * administrator is exempt). Uses the shared escalation component so the inheritance walk is never
+     * reimplemented here.
+     */
+    private Mono<Void> requireParentWithinActor(String actorId, AccessRole parent) {
+        return escalation
+                .effectivePermissionsOfRoles(List.of(parent))
+                .flatMap(required -> escalation.actorCovers(actorId, required))
+                .flatMap(
+                        allowed ->
+                                allowed
+                                        ? Mono.<Void>empty()
+                                        : Mono.error(
+                                                new Denial(
+                                                        REASON_PARENT_ESCALATION + parent.code(),
+                                                        HttpStatus.FORBIDDEN)));
     }
 
     /**

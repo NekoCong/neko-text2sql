@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+import com.nekocong.text2sql.security.Roles;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -45,9 +46,11 @@ import reactor.core.publisher.Mono;
  * <p>An omitted body or a {@code null} {@code permissions} field is <em>not</em> an empty set: only an
  * explicit {@code []} clears the role, so a client bug cannot silently revoke every grant.
  *
- * <p>The anti-escalation rule ("an administrator may not grant a permission they lack") is the
- * {@link PermissionEscalationGuard} seam; until it is implemented the permissive guard is used, and
- * a guard bean registered later takes its place automatically.
+ * <p>The anti-escalation rule ("an administrator may not grant a permission they lack") is enforced
+ * by the {@link PermissionEscalationGuard} bean ({@link DefaultPermissionEscalationGuard}); the
+ * built-in administrator role is exempt and additionally must keep {@code access.manage} and {@code
+ * access.bypass_data_scope}. The last-administrator lockout is shared with {@link
+ * AccessLockoutService}.
  */
 @Service
 public class RolePermissionService {
@@ -79,12 +82,16 @@ public class RolePermissionService {
     private static final String REASON_TOO_MANY_PERMISSIONS =
             "权限数量不能超过 " + MAX_PERMISSION_KEYS + " 个";
     private static final String REASON_MALFORMED_PERMISSIONS = "权限列表格式不正确";
+    private static final String REASON_BUILT_IN_ADMIN_PERMISSIONS =
+            "内置管理员角色必须保留 access.manage 和 access.bypass_data_scope";
+    private static final String REASON_LAST_ADMIN = "不能移除最后一个拥有 access.manage 的管理员";
 
     private final AccessAdminRepository repository;
     private final TransactionalOperator transactions;
     private final TransactionalOperator newTransactions;
     private final ObjectMapper objectMapper;
     private final PermissionEscalationGuard escalationGuard;
+    private final AccessLockoutService lockout;
 
     /**
      * Creates the service.
@@ -93,12 +100,14 @@ public class RolePermissionService {
      * @param transactionManager the R2DBC reactive transaction manager
      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
      * @param escalationGuards the anti-escalation guard bean, or none for the permissive default
+     * @param lockout the shared last-administrator lockout component
      */
     public RolePermissionService(
             AccessAdminRepository repository,
             ReactiveTransactionManager transactionManager,
             ObjectMapper objectMapper,
-            ObjectProvider<PermissionEscalationGuard> escalationGuards) {
+            ObjectProvider<PermissionEscalationGuard> escalationGuards,
+            AccessLockoutService lockout) {
         this.repository = repository;
         this.transactions = TransactionalOperator.create(transactionManager);
         this.newTransactions =
@@ -109,6 +118,7 @@ public class RolePermissionService {
         this.objectMapper = objectMapper;
         PermissionEscalationGuard guard = escalationGuards == null ? null : escalationGuards.getIfAvailable();
         this.escalationGuard = guard == null ? PermissionEscalationGuard.permitAll() : guard;
+        this.lockout = lockout;
     }
 
     /**
@@ -214,7 +224,18 @@ public class RolePermissionService {
                                                         HttpStatus.BAD_REQUEST));
                                     }
                                 }
-                                return guard(actorId, role.id(), requestedKeys)
+                                return requireBuiltInAdminPermissions(role, requestedKeys)
+                                        .onErrorResume(
+                                                Denial.class,
+                                                denial ->
+                                                        deny(
+                                                                        actorId,
+                                                                        role.id(),
+                                                                        beforeKeys,
+                                                                        requestedKeys,
+                                                                        denial)
+                                                                .then())
+                                        .then(guard(actorId, role.id(), requestedKeys))
                                         .flatMap(allowed ->
                                                 allowed
                                                         .map(
@@ -230,14 +251,61 @@ public class RolePermissionService {
                                                                                                 .FORBIDDEN)))
                                                         .orElseGet(
                                                                 () ->
-                                                                        apply(
-                                                                                actorId,
-                                                                                role.id(),
-                                                                                beforeKeys,
-                                                                                requestedKeys,
-                                                                                idByKey)));
+                                                                        requireNotLastAdmin(
+                                                                                        role.id(),
+                                                                                        requestedKeys)
+                                                                                .onErrorResume(
+                                                                                        Denial.class,
+                                                                                        denial ->
+                                                                                                deny(
+                                                                                                                actorId,
+                                                                                                                role
+                                                                                                                        .id(),
+                                                                                                                beforeKeys,
+                                                                                                                requestedKeys,
+                                                                                                                denial)
+                                                                                                        .then())
+                                                                                .then(
+                                                                                        apply(
+                                                                                                actorId,
+                                                                                                role
+                                                                                                        .id(),
+                                                                                                beforeKeys,
+                                                                                                requestedKeys,
+                                                                                                idByKey))));
                             });
                 });
+    }
+
+    /**
+     * The built-in administrator role is the bootstrap role: it must keep {@code access.manage} and
+     * {@code access.bypass_data_scope} so a permission edit can never brick the system's only
+     * guaranteed administrator.
+     */
+    private static Mono<Void> requireBuiltInAdminPermissions(AccessRole role, List<String> requestedKeys) {
+        if (!(role.builtIn() && Roles.ADMIN.equals(role.code()))) {
+            return Mono.empty();
+        }
+        if (!requestedKeys.contains(Permissions.ACCESS_MANAGE)
+                || !requestedKeys.contains(Permissions.BYPASS_DATA_SCOPE)) {
+            return Mono.error(
+                    new Denial(REASON_BUILT_IN_ADMIN_PERMISSIONS, HttpStatus.CONFLICT));
+        }
+        return Mono.empty();
+    }
+
+    /**
+     * Rejects a permission-set replacement that would remove the last enabled {@code access.manage}
+     * holder.
+     */
+    private Mono<Void> requireNotLastAdmin(String roleId, List<String> requestedKeys) {
+        return lockout
+                .retainsAccessManageAfterPermissionReplace(roleId, Set.copyOf(requestedKeys))
+                .flatMap(
+                        safe ->
+                                safe
+                                        ? Mono.empty()
+                                        : Mono.error(new Denial(REASON_LAST_ADMIN, HttpStatus.CONFLICT)));
     }
 
     /** Replaces the set and records the SUCCESS row, in the caller's transaction. */

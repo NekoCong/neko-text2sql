@@ -20,17 +20,15 @@ import reactor.core.publisher.Mono;
  *
  * <p>The contract is data-only on purpose: no exception type of this package appears in the
  * signature, so an implementation in any module (or a future bean) can be written without access to
- * this class's internals. {@link #permitAll()} is the default while the rule itself ("an
- * administrator may not grant a permission they lack") is unimplemented.
- *
- * <p>The intended implementation resolves the actor's {@link EffectiveAccess} for {@code actorId}
- * and denies any requested key absent from it.
+ * this class's internals. The production rule ("an administrator may not grant a permission they
+ * lack") is {@link DefaultPermissionEscalationGuard}; {@link #permitAll()} is the permissive
+ * fallback used by tests and by the service when no guard bean is registered.
  */
 @FunctionalInterface
 public interface PermissionEscalationGuard {
 
     /**
-     * The guard that permits every change (the anti-escalation rule is not implemented yet).
+     * The guard that permits every change.
      *
      * @return the permissive guard
      */

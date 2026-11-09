@@ -284,6 +284,22 @@ public interface AccessAdminRepository {
     Mono<List<String>> enabledUserIds();
 
     /**
+     * Loads every role → permission-key link, for the in-memory last-administrator lockout
+     * evaluation. Bound SQL only; no client input is interpolated.
+     *
+     * @return the role-permission links
+     */
+    Mono<List<RolePermissionLink>> rolePermissionLinks();
+
+    /**
+     * Loads every direct role assignment of every enabled user, for the in-memory last-administrator
+     * lockout evaluation. Bound SQL only; no client input is interpolated.
+     *
+     * @return the enabled users' role links
+     */
+    Mono<List<UserRoleLink>> enabledUserRoles();
+
+    /**
      * Appends one audit row.
      *
      * @param actorId the acting user id

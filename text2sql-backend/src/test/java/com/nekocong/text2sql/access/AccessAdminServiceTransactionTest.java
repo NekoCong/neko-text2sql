@@ -36,13 +36,19 @@ class AccessAdminServiceTransactionTest {
     @Autowired
     private DatabaseClient db;
 
+    @Autowired
+    private AccessEscalationService escalation;
+
+    @Autowired
+    private AccessLockoutService lockout;
+
     private AccessAdminService service;
 
     private String actorId;
 
     @BeforeEach
     void setUp() {
-        service = new AccessAdminService(repository, transactionManager, objectMapper);
+        service = new AccessAdminService(repository, escalation, lockout, transactionManager, objectMapper);
         actorId = "test-actor-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
     }
 
@@ -52,7 +58,7 @@ class AccessAdminServiceTransactionTest {
         AccessAdminRepository failing = failingAudit(repository);
 
         AccessAdminService failingService =
-                new AccessAdminService(failing, transactionManager, objectMapper);
+                new AccessAdminService(failing, escalation, lockout, transactionManager, objectMapper);
 
         assertThatThrownBy(
                         () ->
@@ -71,7 +77,7 @@ class AccessAdminServiceTransactionTest {
 
         AccessAdminRepository failing = failingAudit(repository);
         AccessAdminService failingService =
-                new AccessAdminService(failing, transactionManager, objectMapper);
+                new AccessAdminService(failing, escalation, lockout, transactionManager, objectMapper);
 
         assertThatThrownBy(
                         () ->
@@ -112,7 +118,7 @@ class AccessAdminServiceTransactionTest {
                     }
                 };
         AccessAdminService brokenService =
-                new AccessAdminService(repository, transactionManager, broken);
+                new AccessAdminService(repository, escalation, lockout, transactionManager, broken);
 
         String unknown = UUID.randomUUID().toString();
         // Unknown role -> 404 denial whose payload cannot be serialized.
@@ -286,6 +292,16 @@ class AccessAdminServiceTransactionTest {
             @Override
             public Mono<List<String>> enabledUserIds() {
                 return delegate.enabledUserIds();
+            }
+
+            @Override
+            public Mono<List<RolePermissionLink>> rolePermissionLinks() {
+                return delegate.rolePermissionLinks();
+            }
+
+            @Override
+            public Mono<List<UserRoleLink>> enabledUserRoles() {
+                return delegate.enabledUserRoles();
             }
 
             @Override

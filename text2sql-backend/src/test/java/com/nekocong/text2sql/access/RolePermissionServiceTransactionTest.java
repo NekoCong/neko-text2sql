@@ -114,7 +114,8 @@ class RolePermissionServiceTransactionTest {
                 repo,
                 transactionManager,
                 objectMapper,
-                beans.getBeanProvider(PermissionEscalationGuard.class));
+                beans.getBeanProvider(PermissionEscalationGuard.class),
+                new AccessLockoutService(repo));
     }
 
     /** Wraps the repository so only {@code record} fails, after the mutation statements have run. */
@@ -260,6 +261,16 @@ class RolePermissionServiceTransactionTest {
             @Override
             public Mono<List<String>> enabledUserIds() {
                 return delegate.enabledUserIds();
+            }
+
+            @Override
+            public Mono<List<RolePermissionLink>> rolePermissionLinks() {
+                return delegate.rolePermissionLinks();
+            }
+
+            @Override
+            public Mono<List<UserRoleLink>> enabledUserRoles() {
+                return delegate.enabledUserRoles();
             }
 
             @Override

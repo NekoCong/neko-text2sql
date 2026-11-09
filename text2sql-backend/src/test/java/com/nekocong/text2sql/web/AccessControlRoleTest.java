@@ -235,17 +235,19 @@ class AccessControlRoleTest {
     }
 
     @Test
-    void allowsADisabledParent() {
+    void rejectsADisabledParent() {
         String parentId = roleIdByCode(createRole("停用的父", null));
         put(parentId, Map.of("enabled", false)).expectStatus().isOk();
 
         String childId = roleIdByCode(createRole("停用父的子", null));
         put(childId, Map.of("parentId", parentId))
                 .expectStatus()
-                .isOk()
+                .isEqualTo(409)
                 .expectBody()
-                .jsonPath("$.parentId")
-                .isEqualTo(parentId);
+                .jsonPath("$.message")
+                .isEqualTo("父角色已停用");
+
+        assertThat(auditRows("role.update", childId, "DENIED")).isEqualTo(1);
     }
 
     @Test
@@ -316,35 +318,35 @@ class AccessControlRoleTest {
     }
 
     @Test
-    void rejectsTheBuiltInAdminRoleAsAParent() {
+    void builtInAdminMayBeAParentButCannotBeReparented() {
         String adminRoleId = roleIdByCode(Roles.ADMIN);
 
+        // The built-in administrator (exempt from the subset rule) may create a role under the
+        // built-in admin role; a non-admin would be rejected by the subset check (see
+        // AccessControlEscalationTest).
+        String childCode = unique("underadmin");
         client.post()
                 .uri(ROLES)
                 .header(HttpHeaders.AUTHORIZATION, bearer())
                 .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(
-                        Map.of(
-                                "code", unique("escalate"),
-                                "name", "越权",
-                                "parentId", adminRoleId))
+                .bodyValue(Map.of("code", childCode, "name", "子管理员", "parentId", adminRoleId))
                 .exchange()
                 .expectStatus()
-                .isEqualTo(409)
+                .isCreated()
                 .expectBody()
-                .jsonPath("$.message")
-                .isEqualTo("内置管理员角色不能作为父角色");
+                .jsonPath("$.parentId")
+                .isEqualTo(adminRoleId);
 
+        // The built-in admin role itself keeps a null parent.
         String ownId = roleIdByCode(createRole("自建角色", null));
-        put(ownId, Map.of("parentId", adminRoleId))
+        put(adminRoleId, Map.of("parentId", ownId))
                 .expectStatus()
                 .isEqualTo(409)
                 .expectBody()
                 .jsonPath("$.message")
-                .isEqualTo("内置管理员角色不能作为父角色");
+                .isEqualTo("内置管理员角色不能调整继承关系");
 
-        assertThat(auditRows("role.create", adminRoleId, "DENIED")).isEqualTo(1);
-        assertThat(auditRows("role.update", ownId, "DENIED")).isEqualTo(1);
+        assertThat(auditRows("role.update", adminRoleId, "DENIED")).isEqualTo(1);
     }
 
     @Test

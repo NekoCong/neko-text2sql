@@ -590,13 +590,13 @@ class AccessControlUserTest {
                 users.insert(username, passwordEncoder.encode(PASSWORD), "Manager", Roles.STUDENT).block();
         assignRoleDirectly(user.id(), manageRoleId);
         String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
-        String studentRoleId = roleIdByCode(Roles.STUDENT);
 
         client.get().uri(USERS).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isForbidden();
         client.get().uri(USERS + "/" + user.id()).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isForbidden();
 
         // Create a target user, then mutate the target (not self) so the acting token stays valid
-        // across the token-version-bumping operations.
+        // across the token-version-bumping operations. The manager holds only user.manage, so it may
+        // only assign roles whose permission set is a subset of its own — here its own role.
         Map<String, Object> created =
                 client.post()
                         .uri(USERS)
@@ -609,7 +609,7 @@ class AccessControlUserTest {
                                         "password",
                                         PASSWORD,
                                         "roleIds",
-                                        List.of(studentRoleId)))
+                                        List.of(manageRoleId)))
                         .exchange()
                         .expectStatus()
                         .isCreated()
@@ -647,7 +647,7 @@ class AccessControlUserTest {
                 .uri(USERS + "/" + targetId + "/roles")
                 .header(HttpHeaders.AUTHORIZATION, token)
                 .contentType(MediaType.APPLICATION_JSON)
-                .bodyValue(Map.of("roleIds", List.of(studentRoleId)))
+                .bodyValue(Map.of("roleIds", List.of(manageRoleId)))
                 .exchange()
                 .expectStatus()
                 .isOk();
