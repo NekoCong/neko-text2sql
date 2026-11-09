@@ -1,3 +1,4 @@
+import { isAxiosError } from 'axios'
 import { http } from './http'
 import type {
   AccessAuditPage,
@@ -16,15 +17,65 @@ import type {
   DataScope,
   DataScopeRequest,
   DatasourceMatrix,
+  DatasourceSchema,
   RoleDatasources,
 } from '@/types'
 
 /**
  * Typed client for the access-control admin API (`/api/admin/access-control`). Every route is
- * gated server-side by the `access.manage` permission; a caller without it gets a 401/403 from the
+ * gated server-side by the appropriate permission; a caller without it gets a 401/403 from the
  * shared `http` instance.
  */
 const BASE = '/admin/access-control'
+
+/**
+ * A normalized API failure: the HTTP status plus a readable message. The access-control endpoints
+ * report failures as `{"status": ..., "message": ...}` bodies, so surface that message whenever the
+ * body carries one.
+ */
+export interface AccessControlError {
+  status: number | null
+  message: string
+}
+
+/**
+ * Extracts a user-facing message and status from an access-control API failure. Backend validation
+ * and conflict failures are `{status, message}` bodies; plain-text bodies and common statuses are
+ * mapped to readable fallbacks.
+ *
+ * @param error error thrown by the API call
+ * @param fallback message used when the backend sent no readable body
+ * @returns the normalized failure
+ */
+export function normalizeAccessControlError(
+  error: unknown,
+  fallback: string,
+): AccessControlError {
+  if (isAxiosError(error)) {
+    const body: unknown = error.response?.data
+    if (body != null && typeof body === 'object' && 'message' in body) {
+      const message = (body as { message?: unknown }).message
+      if (typeof message === 'string' && message.trim().length > 0) {
+        return { status: error.response?.status ?? null, message }
+      }
+    }
+    if (typeof body === 'string' && body.trim().length > 0) {
+      return { status: error.response?.status ?? null, message: body }
+    }
+    const status = error.response?.status ?? null
+    if (status === 403) {
+      return { status, message: '没有权限执行该操作' }
+    }
+    if (status === 404) {
+      return { status, message: '目标不存在，可能已被删除' }
+    }
+    if (status === 400) {
+      return { status, message: '请求参数无效，请检查表单内容' }
+    }
+    return { status, message: fallback }
+  }
+  return { status: null, message: fallback }
+}
 
 // --- Roles --------------------------------------------------------------------------------------
 
@@ -42,7 +93,7 @@ export async function createRole(request: AccessRoleRequest): Promise<AccessRole
 
 /** Updates a role (`code` is immutable; omitted fields keep their current value). */
 export async function updateRole(id: string, request: AccessRoleRequest): Promise<AccessRole> {
-  const { data } = await http.put<AccessRole>(`${BASE}/roles/${id}`, request)
+  const { data } = await http.put<AccessRole>(`${BASE}/roles/${encodeURIComponent(id)}`, request)
   return data
 }
 
@@ -56,7 +107,9 @@ export async function listPermissions(): Promise<AccessPermission[]> {
 
 /** Reads a role's own permission set. */
 export async function getRolePermissions(roleId: string): Promise<AccessRolePermissions> {
-  const { data } = await http.get<AccessRolePermissions>(`${BASE}/roles/${roleId}/permissions`)
+  const { data } = await http.get<AccessRolePermissions>(
+    `${BASE}/roles/${encodeURIComponent(roleId)}/permissions`,
+  )
   return data
 }
 
@@ -65,9 +118,10 @@ export async function replaceRolePermissions(
   roleId: string,
   permissions: string[],
 ): Promise<AccessRolePermissions> {
-  const { data } = await http.put<AccessRolePermissions>(`${BASE}/roles/${roleId}/permissions`, {
-    permissions,
-  })
+  const { data } = await http.put<AccessRolePermissions>(
+    `${BASE}/roles/${encodeURIComponent(roleId)}/permissions`,
+    { permissions },
+  )
   return data
 }
 
@@ -93,7 +147,15 @@ export async function upsertDataScope(request: DataScopeRequest): Promise<DataSc
 
 /** Deletes one data-scope rule. */
 export async function deleteDataScope(id: string): Promise<void> {
-  await http.delete(`${BASE}/data-scopes/${id}`)
+  await http.delete(`${BASE}/data-scopes/${encodeURIComponent(id)}`)
+}
+
+/** Reads one datasource's live table/column metadata for the data-scope editor. */
+export async function getDatasourceSchema(datasourceId: string): Promise<DatasourceSchema> {
+  const { data } = await http.get<DatasourceSchema>(
+    `${BASE}/datasources/${encodeURIComponent(datasourceId)}/schema`,
+  )
+  return data
 }
 
 // --- Datasource matrix --------------------------------------------------------------------------
@@ -106,7 +168,9 @@ export async function getDatasourceMatrix(): Promise<DatasourceMatrix> {
 
 /** Reads a role's own datasource grant set. */
 export async function getRoleDatasources(roleId: string): Promise<RoleDatasources> {
-  const { data } = await http.get<RoleDatasources>(`${BASE}/roles/${roleId}/datasources`)
+  const { data } = await http.get<RoleDatasources>(
+    `${BASE}/roles/${encodeURIComponent(roleId)}/datasources`,
+  )
   return data
 }
 
@@ -115,9 +179,10 @@ export async function replaceRoleDatasources(
   roleId: string,
   datasourceIds: string[],
 ): Promise<RoleDatasources> {
-  const { data } = await http.put<RoleDatasources>(`${BASE}/roles/${roleId}/datasources`, {
-    datasourceIds,
-  })
+  const { data } = await http.put<RoleDatasources>(
+    `${BASE}/roles/${encodeURIComponent(roleId)}/datasources`,
+    { datasourceIds },
+  )
   return data
 }
 
@@ -140,7 +205,7 @@ export async function listUsers(params: ListUsersParams = {}): Promise<AccessUse
 
 /** Reads one user. */
 export async function getUser(id: string): Promise<AccessUser> {
-  const { data } = await http.get<AccessUser>(`${BASE}/users/${id}`)
+  const { data } = await http.get<AccessUser>(`${BASE}/users/${encodeURIComponent(id)}`)
   return data
 }
 
@@ -155,7 +220,7 @@ export async function updateUserDisplayName(
   id: string,
   request: AccessUserDisplayNameRequest,
 ): Promise<AccessUser> {
-  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}`, request)
+  const { data } = await http.put<AccessUser>(`${BASE}/users/${encodeURIComponent(id)}`, request)
   return data
 }
 
@@ -164,7 +229,10 @@ export async function updateUserStatus(
   id: string,
   request: AccessUserStatusRequest,
 ): Promise<AccessUser> {
-  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}/status`, request)
+  const { data } = await http.put<AccessUser>(
+    `${BASE}/users/${encodeURIComponent(id)}/status`,
+    request,
+  )
   return data
 }
 
@@ -173,7 +241,7 @@ export async function resetUserPassword(
   id: string,
   request: AccessUserPasswordRequest,
 ): Promise<void> {
-  await http.post(`${BASE}/users/${id}/reset-password`, request)
+  await http.post(`${BASE}/users/${encodeURIComponent(id)}/reset-password`, request)
 }
 
 /** Replaces a user's role assignments. */
@@ -181,7 +249,10 @@ export async function replaceUserRoles(
   id: string,
   request: AccessUserRolesRequest,
 ): Promise<AccessUser> {
-  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}/roles`, request)
+  const { data } = await http.put<AccessUser>(
+    `${BASE}/users/${encodeURIComponent(id)}/roles`,
+    request,
+  )
   return data
 }
 
@@ -192,3 +263,4 @@ export async function listAudit(filters: AuditFilters = {}): Promise<AccessAudit
   const { data } = await http.get<AccessAuditPage>(`${BASE}/audit`, { params: filters })
   return data
 }
+

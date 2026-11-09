@@ -8,6 +8,8 @@ declare module 'vue-router' {
     public?: boolean
     /** Routes only administrators may open. */
     admin?: boolean
+    /** Routes gated by a specific permission key, checked via `auth.can(...)`. */
+    permission?: string
   }
 }
 
@@ -45,6 +47,12 @@ const router = createRouter({
       meta: { title: '数据源权限', admin: true },
     },
     {
+      path: '/admin/access-control',
+      name: 'access-control',
+      component: () => import('@/views/AccessControlView.vue'),
+      meta: { title: '权限管理', permission: 'access.manage' },
+    },
+    {
       path: '/knowledge',
       name: 'knowledge',
       component: () => import('@/views/KnowledgeView.vue'),
@@ -56,7 +64,9 @@ const router = createRouter({
 })
 
 // Session guard: rehydrate the auth store (so a page refresh keeps the session), send
-// guests to /login and keep signed-in users out of it.
+// guests to /login and keep signed-in users out of it. A route carrying `meta.permission`
+// refreshes the profile first, so a stale localStorage snapshot can never grant (or deny)
+// access against the server's current permission set.
 router.beforeEach(async (to) => {
   const auth = useAuthStore()
   await auth.restore()
@@ -65,6 +75,12 @@ router.beforeEach(async (to) => {
   }
   if (to.meta.public === true && auth.isAuthenticated) {
     return { name: 'chat' }
+  }
+  if (to.meta.permission) {
+    await auth.refreshProfile()
+    if (!auth.can(to.meta.permission)) {
+      return { name: 'chat' }
+    }
   }
   if (to.meta.admin === true && auth.user?.role !== 'admin') {
     return { name: 'chat' }

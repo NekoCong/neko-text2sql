@@ -15,6 +15,9 @@ export const useAuthStore = defineStore('auth', () => {
   const token = ref<string | null>(readToken())
   const user = ref<AuthUser | null>(readUser())
 
+  /** In-flight profile refresh, coalescing concurrent callers. */
+  let profileRefresh: Promise<void> | null = null
+
   /** True when a token is on record; the backend rejects it if it has expired. */
   const isAuthenticated = computed(() => token.value !== null)
 
@@ -89,6 +92,39 @@ export const useAuthStore = defineStore('auth', () => {
     }
   }
 
+  /**
+   * Re-fetches the profile from `me()` and applies it, so `can()`/`isAdmin` reflect the server's
+   * current permission set rather than a stale localStorage snapshot. An explicit 401 clears the
+   * session; any other failure keeps the stored profile (fail closed on the caller's side).
+   *
+   * <p>Concurrent callers share one in-flight request. Used on app boot (fire-and-forget, so the
+   * app is not blocked) and by the router guard before a permission-gated route is rendered.
+   */
+  function refreshProfile(): Promise<void> {
+    if (!token.value) {
+      return Promise.resolve()
+    }
+    if (profileRefresh) {
+      return profileRefresh
+    }
+    profileRefresh = (async () => {
+      try {
+        const current = await me()
+        user.value = current
+        if (token.value) {
+          writeAuth(token.value, current)
+        }
+      } catch (error) {
+        if (isAxiosError(error) && error.response?.status === 401) {
+          logout()
+        }
+      } finally {
+        profileRefresh = null
+      }
+    })()
+    return profileRefresh
+  }
+
   return {
     token,
     user,
@@ -99,5 +135,6 @@ export const useAuthStore = defineStore('auth', () => {
     register,
     logout,
     restore,
+    refreshProfile,
   }
 })

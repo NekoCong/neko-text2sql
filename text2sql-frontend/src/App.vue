@@ -115,6 +115,10 @@ function onMediaChange(event: MediaQueryListEvent): void {
 onMounted(() => {
   narrowQuery.addEventListener('change', onMediaChange)
   document.addEventListener('keydown', onKeydown)
+  // Refresh the profile in the background so the permission-aware navigation reflects the
+  // server's current permission set, not a stale localStorage snapshot. Not awaited: the app
+  // must not block on it, and a failure simply keeps the stored profile.
+  void auth.refreshProfile()
 })
 
 onBeforeUnmount(() => {
@@ -214,6 +218,9 @@ watch(
         <el-menu-item index="/datasources">数据源</el-menu-item>
         <el-menu-item v-if="auth.user?.role === 'admin'" index="/admin/datasource-access">
           数据源权限
+        </el-menu-item>
+        <el-menu-item v-if="auth.can('access.manage')" index="/admin/access-control">
+          权限管理
         </el-menu-item>
         <el-menu-item v-if="auth.user?.role === 'admin'" index="/knowledge">知识库</el-menu-item>
       </el-menu>

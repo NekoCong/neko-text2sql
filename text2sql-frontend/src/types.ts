@@ -318,6 +318,24 @@ export interface DatasourceMatrix {
   datasources: DatasourceMatrixDatasource[]
 }
 
+/** One column of a datasource's live metadata, for the data-scope editor's selectors. */
+export interface DatasourceSchemaColumn {
+  name: string
+  typeName: string
+}
+
+/** One table of a datasource's live metadata. */
+export interface DatasourceSchemaTable {
+  name: string
+  columns: DatasourceSchemaColumn[]
+}
+
+/** A datasource's live table/column metadata, never including connection secrets. */
+export interface DatasourceSchema {
+  datasourceId: string
+  tables: DatasourceSchemaTable[]
+}
+
 /** A user as returned to admin clients (never any password material). */
 export interface AccessUser {
   id: string
