@@ -5,8 +5,12 @@ export interface AuthUser {
   id: string
   username: string
   displayName: string | null
-  /** Backend role: `admin` | `student` | `counselor`. */
+  /** Backend role: `admin` | `student` | `counselor`. Display-only. */
   role?: string
+  /** Effective role codes (enabled direct roles + ancestors), sorted. */
+  roles?: string[]
+  /** Effective permission keys, sorted. */
+  permissions?: string[]
 }
 
 /** Successful `register` / `login` response: the JWT plus the resolved user. */
@@ -224,4 +228,182 @@ export interface ModelConfigPayload {
   apiKey?: string
   baseUrl?: string
   isDefault?: boolean
+}
+
+// --- Configurable access control (mirrors the backend DTOs under access/api/dto) ----------------
+
+/** A role in the access-control catalog. */
+export interface AccessRole {
+  id: string
+  code: string
+  name: string
+  description: string | null
+  parentId: string | null
+  builtIn: boolean
+  enabled: boolean
+}
+
+/** Request body for creating or updating a role. On update, omitted fields keep their value. */
+export interface AccessRoleRequest {
+  code?: string
+  name?: string
+  description?: string
+  parentId?: string
+  enabled?: boolean
+}
+
+/** An entry of the permission catalog. */
+export interface AccessPermission {
+  id: string
+  key: string
+  module: string
+  action: string
+  description: string | null
+  builtIn: boolean
+}
+
+/** One role's permission set, as permission keys. */
+export interface AccessRolePermissions {
+  roleId: string
+  permissions: string[]
+}
+
+/** A data-scope rule. */
+export interface DataScope {
+  id: string
+  roleId: string
+  datasourceId: string
+  tableName: string
+  policy: 'ALL' | 'FILTER' | 'DENY'
+  columnName: string | null
+  principalAttribute: string | null
+}
+
+/** Request body for upserting one data-scope rule. */
+export interface DataScopeRequest {
+  roleId: string
+  datasourceId: string
+  tableName: string
+  policy: 'ALL' | 'FILTER' | 'DENY'
+  columnName?: string
+  principalAttribute?: string
+}
+
+/** One role's datasource grant set, as datasource ids. */
+export interface RoleDatasources {
+  roleId: string
+  datasourceIds: string[]
+}
+
+/** One role row of the role → datasource matrix. */
+export interface DatasourceMatrixRole {
+  id: string
+  code: string
+  name: string
+  builtIn: boolean
+  enabled: boolean
+  datasourceIds: string[]
+}
+
+/** One datasource row of the role → datasource matrix. */
+export interface DatasourceMatrixDatasource {
+  id: string
+  name: string
+  default: boolean
+}
+
+/** The role → datasource matrix (roles + datasources). */
+export interface DatasourceMatrix {
+  roles: DatasourceMatrixRole[]
+  datasources: DatasourceMatrixDatasource[]
+}
+
+/** A user as returned to admin clients (never any password material). */
+export interface AccessUser {
+  id: string
+  username: string
+  displayName: string | null
+  enabled: boolean
+  roles: AccessUserRole[]
+  createdAt: number
+}
+
+/** A role reference inside an {@link AccessUser}. */
+export interface AccessUserRole {
+  id: string
+  code: string
+  name: string
+}
+
+/** A page of access-control users. */
+export interface AccessUserPage {
+  items: AccessUser[]
+  total: number
+  page: number
+  size: number
+}
+
+/** Request body for creating a user. */
+export interface AccessUserCreateRequest {
+  username: string
+  password: string
+  displayName?: string
+  roleIds: string[]
+}
+
+/** Request body for editing a user's display name. */
+export interface AccessUserDisplayNameRequest {
+  displayName: string | null
+}
+
+/** Request body for enabling or disabling a user. */
+export interface AccessUserStatusRequest {
+  enabled: boolean
+}
+
+/** Request body for resetting a user's password. */
+export interface AccessUserPasswordRequest {
+  password: string
+}
+
+/** Request body for replacing a user's role assignments. */
+export interface AccessUserRolesRequest {
+  roleIds: string[]
+}
+
+/** One access-control audit entry. */
+export interface AccessAudit {
+  id: string
+  actorId: string
+  action: string
+  entityType: string
+  entityId: string | null
+  before: unknown
+  after: unknown
+  result: string
+  reason: string | null
+  createdAt: number
+}
+
+/** A page of the access-control audit trail. */
+export interface AccessAuditPage {
+  items: AccessAudit[]
+  total: number
+  page: number
+  size: number
+}
+
+/** Optional filters for the audit listing. */
+export interface AuditFilters {
+  actorId?: string
+  action?: string
+  entityType?: string
+  entityId?: string
+  result?: 'SUCCESS' | 'DENIED'
+  /** Inclusive lower time bound (epoch millis). */
+  from?: number
+  /** Exclusive upper time bound (epoch millis). */
+  to?: number
+  page?: number
+  size?: number
 }

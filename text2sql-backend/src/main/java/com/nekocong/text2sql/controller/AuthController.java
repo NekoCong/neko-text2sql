@@ -1,5 +1,6 @@
 package com.nekocong.text2sql.controller;
 
+import com.nekocong.text2sql.access.AccessContextResolver;
 import com.nekocong.text2sql.controller.dto.AuthResponse;
 import com.nekocong.text2sql.controller.dto.LoginRequest;
 import com.nekocong.text2sql.controller.dto.RegisterRequest;
@@ -25,14 +26,17 @@ import reactor.core.publisher.Mono;
 public class AuthController {
 
     private final AuthService authService;
+    private final AccessContextResolver accessContext;
 
     /**
      * Creates the controller.
      *
      * @param authService the authentication service
+     * @param accessContext the resolver that computes the caller's effective roles/permissions
      */
-    public AuthController(AuthService authService) {
+    public AuthController(AuthService authService, AccessContextResolver accessContext) {
         this.authService = authService;
+        this.accessContext = accessContext;
     }
 
     /**
@@ -46,7 +50,7 @@ public class AuthController {
     public Mono<AuthResponse> register(@RequestBody RegisterRequest request) {
         return authService
                 .register(request.username(), request.password(), request.displayName())
-                .map(AuthController::toResponse);
+                .flatMap(this::toResponse);
     }
 
     /**
@@ -57,7 +61,7 @@ public class AuthController {
      */
     @PostMapping("/login")
     public Mono<AuthResponse> login(@RequestBody LoginRequest request) {
-        return authService.login(request.username(), request.password()).map(AuthController::toResponse);
+        return authService.login(request.username(), request.password()).flatMap(this::toResponse);
     }
 
     /**
@@ -70,13 +74,28 @@ public class AuthController {
     public Mono<UserView> me(@AuthenticationPrincipal Jwt jwt) {
         return authService
                 .requireUser(jwt.getSubject())
-                .map(user -> new UserView(user.id(), user.username(), user.displayName(), user.role()));
+                .flatMap(user -> toView(user.id(), user.username(), user.displayName(), user.role()));
     }
 
-    private static AuthResponse toResponse(AuthResult result) {
-        return new AuthResponse(
-                result.token(),
-                result.expiresIn(),
-                new UserView(result.userId(), result.username(), result.displayName(), result.role()));
+    /**
+     * Resolves the caller's effective roles and permissions from the access-control tables and
+     * builds the enriched view, keeping the legacy {@code role} field display-only.
+     */
+    private Mono<UserView> toView(String userId, String username, String displayName, String role) {
+        return Mono.zip(
+                        accessContext.effectiveRoleCodes(userId),
+                        accessContext.effectivePermissions(userId))
+                .map(tuple -> new UserView(
+                        userId,
+                        username,
+                        displayName,
+                        role,
+                        tuple.getT1(),
+                        tuple.getT2().stream().sorted().toList()));
+    }
+
+    private Mono<AuthResponse> toResponse(AuthResult result) {
+        return toView(result.userId(), result.username(), result.displayName(), result.role())
+                .map(view -> new AuthResponse(result.token(), result.expiresIn(), view));
     }
 }

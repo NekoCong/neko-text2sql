@@ -5,6 +5,7 @@ import type { AuthResponse, AuthUser } from '@/types'
 import { login as loginRequest, me, register as registerRequest } from '@/api/auth'
 import type { LoginPayload, RegisterPayload } from '@/api/auth'
 import { clearStoredAuth, readToken, readUser, writeAuth } from '@/utils/authStorage'
+import { hasAdminPermission, hasPermission } from '@/utils/permissions'
 
 /**
  * Session state for the auth flow: the JWT, the current user and the localStorage
@@ -16,6 +17,12 @@ export const useAuthStore = defineStore('auth', () => {
 
   /** True when a token is on record; the backend rejects it if it has expired. */
   const isAuthenticated = computed(() => token.value !== null)
+
+  /**
+   * True when the current user holds the `access.manage` permission. Backed by the effective
+   * permission set from the profile, never the display-only `role` field.
+   */
+  const isAdmin = computed(() => hasAdminPermission(user.value?.permissions))
 
   /** Applies a register/login response to the store and to localStorage. */
   function applySession(response: AuthResponse): void {
@@ -50,6 +57,16 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   /**
+   * Reports whether the current user holds the given permission, backed by the effective permission
+   * set from the profile. Returns `false` when no profile is loaded (fails closed).
+   *
+   * @param permission the permission key to check (e.g. `access.manage`)
+   */
+  function can(permission: string): boolean {
+    return hasPermission(user.value?.permissions, permission)
+  }
+
+  /**
    * Rehydrates the session after a page reload. When only the JWT survived (the user
    * entry is missing or corrupted) the profile is fetched via `me()`.
    */
@@ -76,6 +93,8 @@ export const useAuthStore = defineStore('auth', () => {
     token,
     user,
     isAuthenticated,
+    isAdmin,
+    can,
     login,
     register,
     logout,

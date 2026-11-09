@@ -1,5 +1,8 @@
 package com.nekocong.text2sql.web;
 
+import static org.assertj.core.api.Assertions.assertThat;
+
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import com.nekocong.text2sql.access.AccessControlRepository;
@@ -13,6 +16,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
@@ -34,6 +38,9 @@ class AuthControllerTest {
 
     @Autowired
     private AccessControlRepository access;
+
+    @Autowired
+    private DatabaseClient db;
 
     private WebTestClient client;
 
@@ -136,5 +143,115 @@ class AuthControllerTest {
     @Test
     void protectedEndpointRequiresToken() {
         client.get().uri("/api/conversations").exchange().expectStatus().isUnauthorized();
+    }
+
+    @Test
+    void meReturnsEffectiveRolesAndPermissionsForAdmin() {
+        String username = unique("adm");
+        AppUser admin = users.insert(username, passwordEncoder.encode("secret123"), "Admin", Roles.ADMIN).block();
+        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
+
+        String token = TestAuth.login(client, username, "secret123");
+
+        client.get()
+                .uri("/api/auth/me")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.roles[0]")
+                .isEqualTo("admin")
+                .jsonPath("$.permissions")
+                .value(value -> assertThat((List<Object>) value)
+                        .contains("access.manage", "user.manage", "audit.read"))
+                .jsonPath("$.password")
+                .doesNotExist()
+                .jsonPath("$.passwordHash")
+                .doesNotExist();
+    }
+
+    @Test
+    void registrationReturnsStudentRoleAndPermissions() {
+        String username = unique("u");
+        client.post()
+                .uri("/api/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("username", username, "password", "secret123", "displayName", "Alice"))
+                .exchange()
+                .expectStatus()
+                .isCreated()
+                .expectBody()
+                .jsonPath("$.token")
+                .isNotEmpty()
+                .jsonPath("$.user.username")
+                .isEqualTo(username)
+                .jsonPath("$.user.roles")
+                .value(value -> assertThat((List<Object>) value).containsExactly("student"))
+                .jsonPath("$.user.permissions")
+                .value(value -> assertThat((List<Object>) value).containsExactly("chat.use", "datasource.read"))
+                .jsonPath("$.user.password")
+                .doesNotExist()
+                .jsonPath("$.user.passwordHash")
+                .doesNotExist();
+    }
+
+    @Test
+    void meReflectsARoleChangeOnTheNextCall() {
+        String username = unique("u");
+        client.post()
+                .uri("/api/auth/register")
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of("username", username, "password", "secret123"))
+                .exchange()
+                .expectStatus()
+                .isCreated();
+
+        String token = TestAuth.login(client, username, "secret123");
+        String userId = TestAuth.currentUserId(client, token);
+
+        // A freshly registered account starts as a student.
+        client.get()
+                .uri("/api/auth/me")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.roles[0]")
+                .isEqualTo("student")
+                .jsonPath("$.permissions")
+                .value(value -> assertThat((List<Object>) value).doesNotContain("access.manage"));
+
+        // The administrator reassigns the account to the admin role.
+        replaceRole(userId, Roles.ADMIN);
+
+        // The very next /me reflects the new role and its permissions.
+        client.get()
+                .uri("/api/auth/me")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.roles[0]")
+                .isEqualTo("admin")
+                .jsonPath("$.permissions")
+                .value(value -> assertThat((List<Object>) value)
+                        .contains("access.manage", "user.manage", "audit.read"));
+    }
+
+    /** Replaces every role assignment of a user with the single role carrying the given code. */
+    private void replaceRole(String userId, String roleCode) {
+        db.sql("DELETE FROM access_user_role WHERE user_id = :userId")
+                .bind("userId", userId)
+                .fetch()
+                .rowsUpdated()
+                .block();
+        access.assignRoleByCode(userId, roleCode).block();
+    }
+
+    private static String unique(String prefix) {
+        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
     }
 }

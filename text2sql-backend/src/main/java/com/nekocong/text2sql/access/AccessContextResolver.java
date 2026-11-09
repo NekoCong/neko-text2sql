@@ -73,6 +73,27 @@ public class AccessContextResolver {
     }
 
     /**
+     * Computes the effective role codes of one user (the user's enabled direct roles plus their
+     * enabled ancestors), reusing the same roles-of + inheritance walk as {@link #resolve}. Codes are
+     * sorted for a stable, testable order.
+     *
+     * <p>Unlike {@link #resolve}, this never fails on a disabled or stale account: an unknown user, or
+     * a user without enabled roles, resolves to an empty list (fails closed). It is used to surface
+     * the caller's roles in the profile, where an identity problem must not break the {@code /me}
+     * shape.
+     *
+     * @param userId the user id
+     * @return the effective role codes, sorted
+     */
+    public Mono<List<String>> effectiveRoleCodes(String userId) {
+        return repository
+                .rolesOf(userId)
+                .zipWith(repository.allRoles())
+                .map(roles -> effectiveRoles(roles.getT1(), roles.getT2()))
+                .map(roles -> roles.stream().map(AccessRole::code).sorted().toList());
+    }
+
+    /**
      * Computes the effective role ids for the given direct roles (each enabled direct role plus its
      * enabled ancestors), loading every role for the walk. Rejects a cycle.
      *
