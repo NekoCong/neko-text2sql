@@ -189,6 +189,39 @@ class AccessAdminServiceTransactionTest {
             }
 
             @Override
+            public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
+                return delegate.dataScopesOf(roleId, datasourceId);
+            }
+
+            @Override
+            public Mono<DataScopeRule> dataScope(
+                    String roleId, String datasourceId, String tableName) {
+                return delegate.dataScope(roleId, datasourceId, tableName);
+            }
+
+            @Override
+            public Mono<DataScopeRule> dataScopeById(String id) {
+                return delegate.dataScopeById(id);
+            }
+
+            @Override
+            public Mono<DataScopeRule> upsertDataScope(
+                    String roleId,
+                    String datasourceId,
+                    String tableName,
+                    DataScopePolicy policy,
+                    String columnName,
+                    String principalAttribute) {
+                return delegate.upsertDataScope(
+                        roleId, datasourceId, tableName, policy, columnName, principalAttribute);
+            }
+
+            @Override
+            public Mono<Long> deleteDataScope(String id) {
+                return delegate.deleteDataScope(id);
+            }
+
+            @Override
             public Mono<Void> record(
                     String actorId,
                     String action,

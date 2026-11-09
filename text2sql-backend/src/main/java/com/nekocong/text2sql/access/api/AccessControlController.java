@@ -1,12 +1,15 @@
 package com.nekocong.text2sql.access.api;
 
 import com.nekocong.text2sql.access.AccessAdminService;
+import com.nekocong.text2sql.access.DataScopeService;
 import com.nekocong.text2sql.access.RolePermissionService;
 import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
 import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
+import com.nekocong.text2sql.access.api.dto.DataScopeView;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -15,12 +18,14 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.ReactiveSecurityContextHolder;
 import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
@@ -43,26 +48,34 @@ import reactor.core.publisher.Mono;
  *
  * <p>The permission catalog and the role-permission matrix live next to the role routes but are
  * mapped on a separate base path ({@code /api/admin/access-control}), because {@code /permissions}
- * is not a role resource. Both are gated by the same {@code access.manage} route rule.
+ * is not a role resource. Both are gated by the same {@code access.manage} route rule. The
+ * data-scope routes ({@code /data-scopes}) share that base path and rule.
  */
 @RestController
 public class AccessControlController {
 
     private static final String ROLES = "/api/admin/access-control/roles";
 
+    private static final String DATA_SCOPES = "/api/admin/access-control/data-scopes";
+
     private final AccessAdminService service;
     private final RolePermissionService permissions;
+    private final DataScopeService dataScopes;
 
     /**
      * Creates the controller.
      *
      * @param service the role administration service
      * @param permissions the permission catalog and role-permission matrix service
+     * @param dataScopes the data-scope policy service
      */
     public AccessControlController(
-            AccessAdminService service, RolePermissionService permissions) {
+            AccessAdminService service,
+            RolePermissionService permissions,
+            DataScopeService dataScopes) {
         this.service = service;
         this.permissions = permissions;
+        this.dataScopes = dataScopes;
     }
 
     /**
@@ -147,6 +160,46 @@ public class AccessControlController {
                 .flatMap(actor ->
                         permissions.replacePermissions(
                                 actor, id, request == null ? null : request.permissions()));
+    }
+
+    /**
+     * Lists a role's data-scope rules, ordered by datasource then table.
+     *
+     * @param roleId the role id (required)
+     * @param datasourceId the datasource to filter by, or omitted for all
+     * @return the rules
+     */
+    @GetMapping(path = DATA_SCOPES)
+    public Mono<List<DataScopeView>> listDataScopes(
+            @RequestParam String roleId,
+            @RequestParam(required = false) String datasourceId) {
+        return dataScopes.list(roleId, datasourceId);
+    }
+
+    /**
+     * Inserts or updates the rule for a role, datasource and table.
+     *
+     * <p>There is no raw predicate: a {@code FILTER} rule names a validated column and one entry of
+     * the closed principal-attribute catalog.
+     *
+     * @param request the rule
+     * @return the stored rule
+     */
+    @PutMapping(path = DATA_SCOPES)
+    public Mono<DataScopeView> upsertDataScope(@RequestBody DataScopeRequest request) {
+        return actorId().flatMap(actor -> dataScopes.upsert(actor, request));
+    }
+
+    /**
+     * Deletes one data-scope rule.
+     *
+     * @param id the rule id
+     * @return no content
+     */
+    @DeleteMapping(path = DATA_SCOPES + "/{id}")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public Mono<Void> deleteDataScope(@PathVariable String id) {
+        return actorId().flatMap(actor -> dataScopes.delete(actor, id));
     }
 
     /** Converts the service's audited rejection into the status exception the handler renders. */

@@ -18,6 +18,9 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     private static final String ROLE_COLUMNS =
             "id, code, name, description, parent_id, built_in, enabled";
 
+    private static final String DATA_SCOPE_COLUMNS =
+            "id, role_id, datasource_id, table_name, policy, column_name, principal_attribute";
+
     private final DatabaseClient client;
 
     /**
@@ -146,6 +149,92 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
+    public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
+        if (datasourceId == null) {
+            return client.sql("SELECT " + DATA_SCOPE_COLUMNS + " FROM access_data_scope"
+                            + " WHERE role_id = :roleId"
+                            + " ORDER BY datasource_id, table_name")
+                    .bind("roleId", roleId)
+                    .map((row, meta) -> dataScope(row))
+                    .all()
+                    .collectList();
+        }
+        return client.sql("SELECT " + DATA_SCOPE_COLUMNS + " FROM access_data_scope"
+                        + " WHERE role_id = :roleId AND datasource_id = :datasourceId"
+                        + " ORDER BY datasource_id, table_name")
+                .bind("roleId", roleId)
+                .bind("datasourceId", datasourceId)
+                .map((row, meta) -> dataScope(row))
+                .all()
+                .collectList();
+    }
+
+    @Override
+    public Mono<DataScopeRule> dataScope(String roleId, String datasourceId, String tableName) {
+        return client.sql("SELECT " + DATA_SCOPE_COLUMNS + " FROM access_data_scope"
+                        + " WHERE role_id = :roleId AND datasource_id = :datasourceId"
+                        + " AND table_name = :tableName")
+                .bind("roleId", roleId)
+                .bind("datasourceId", datasourceId)
+                .bind("tableName", tableName)
+                .map((row, meta) -> dataScope(row))
+                .one();
+    }
+
+    @Override
+    public Mono<DataScopeRule> dataScopeById(String id) {
+        return client.sql("SELECT " + DATA_SCOPE_COLUMNS + " FROM access_data_scope WHERE id = :id")
+                .bind("id", id)
+                .map((row, meta) -> dataScope(row))
+                .one();
+    }
+
+    @Override
+    public Mono<DataScopeRule> upsertDataScope(
+            String roleId,
+            String datasourceId,
+            String tableName,
+            DataScopePolicy policy,
+            String columnName,
+            String principalAttribute) {
+        // The unique key drives the upsert, so an existing row keeps its id and created_at. A plain
+        // UPDATE-then-INSERT would race two concurrent admins; the key resolves it in one statement.
+        long now = System.currentTimeMillis();
+        DatabaseClient.GenericExecuteSpec spec =
+                client.sql("INSERT INTO access_data_scope"
+                                + " (id, role_id, datasource_id, table_name, policy, column_name,"
+                                + " principal_attribute, created_at, updated_at)"
+                                + " VALUES (:id, :roleId, :datasourceId, :tableName, :policy,"
+                                + " :columnName, :principalAttribute, :createdAt, :updatedAt)"
+                                + " ON DUPLICATE KEY UPDATE policy = :policy,"
+                                + " column_name = :columnName,"
+                                + " principal_attribute = :principalAttribute, updated_at = :updatedAt")
+                        .bind("id", UUID.randomUUID().toString())
+                        .bind("roleId", roleId)
+                        .bind("datasourceId", datasourceId)
+                        .bind("tableName", tableName)
+                        .bind("policy", policy.name())
+                        .bind("createdAt", now)
+                        .bind("updatedAt", now);
+        spec = bindNullable(spec, "columnName", columnName);
+        spec = bindNullable(spec, "principalAttribute", principalAttribute);
+        return spec.then()
+                .then(
+                        Mono.defer(
+                                () -> dataScope(roleId, datasourceId, tableName)))
+                .switchIfEmpty(
+                        Mono.error(new IllegalStateException("数据范围写入后丢失")));
+    }
+
+    @Override
+    public Mono<Long> deleteDataScope(String id) {
+        return client.sql("DELETE FROM access_data_scope WHERE id = :id")
+                .bind("id", id)
+                .fetch()
+                .rowsUpdated();
+    }
+
+    @Override
     public Mono<Void> record(
             String actorId,
             String action,
@@ -188,5 +277,34 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
                 row.get("parent_id", String.class),
                 Boolean.TRUE.equals(row.get("built_in", Boolean.class)),
                 Boolean.TRUE.equals(row.get("enabled", Boolean.class)));
+    }
+
+    /**
+     * Maps a row to a rule. A stored policy outside the enum cannot be produced by this service, but
+     * the column is free-form: an unknown value fails closed as {@code DENY} (the policy engine
+     * would deny it anyway) instead of throwing on a read.
+     */
+    private static DataScopeRule dataScope(io.r2dbc.spi.Row row) {
+        String policy = row.get("policy", String.class);
+        return new DataScopeRule(
+                row.get("id", String.class),
+                row.get("role_id", String.class),
+                row.get("datasource_id", String.class),
+                row.get("table_name", String.class),
+                parsePolicy(policy),
+                row.get("column_name", String.class),
+                row.get("principal_attribute", String.class));
+    }
+
+    private static DataScopePolicy parsePolicy(String policy) {
+        if (policy == null) {
+            return DataScopePolicy.DENY;
+        }
+        for (DataScopePolicy value : DataScopePolicy.values()) {
+            if (value.name().equalsIgnoreCase(policy.trim())) {
+                return value;
+            }
+        }
+        return DataScopePolicy.DENY;
     }
 }
