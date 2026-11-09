@@ -40,7 +40,7 @@
 
 ## 6. Frontend access-control area
 
-- [ ] 6.1 Add TypeScript types and API client functions for roles, permissions, data scopes, users, datasource grants, and audit. Verify the client compiles and each function maps to the backend route.
+- [x] 6.1 Add TypeScript types and API client functions for roles, permissions, data scopes, users, datasource grants, and audit. Verify the client compiles and each function maps to the backend route.
 - [ ] 6.2 Add `/admin/access-control` route, navigation entry, and a permission-aware route guard based on `access.manage`; keep the API as the security boundary. Verify a non-admin cannot see the entry or render the page, and a direct API call returns 403.
 - [ ] 6.3 Build the Roles tab: list, create, edit, disable, parent-role selector, built-in badge. Verify create/edit/disable and cycle errors surface inline.
 - [ ] 6.4 Build the Permissions tab: grouped permission catalog and role-permission matrix with save feedback. Verify toggling a permission persists and reloads correctly.
