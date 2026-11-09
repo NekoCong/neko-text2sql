@@ -2,23 +2,15 @@ package com.nekocong.text2sql.access;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
-import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
 import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRoleView;
 import com.nekocong.text2sql.security.Roles;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 import java.util.Set;
-import java.util.TreeSet;
 import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.ReactiveTransactionManager;
@@ -93,13 +85,6 @@ public class AccessAdminService {
     private static final String ACTION_CREATE = "role.create";
     private static final String ACTION_UPDATE = "role.update";
     private static final String ACTION_DISABLE = "role.disable";
-    private static final String ACTION_PERMISSIONS = "role.permissions";
-
-    /** Matches {@code access_permission.permission_key VARCHAR(128)}. */
-    private static final int MAX_PERMISSION_KEY_LENGTH = 128;
-
-    /** Upper bound on keys per replace request, so a huge body cannot drive unbounded work. */
-    private static final int MAX_PERMISSION_KEYS = 256;
 
     private static final String RESULT_SUCCESS = "SUCCESS";
     private static final String RESULT_DENIED = "DENIED";
@@ -111,50 +96,23 @@ public class AccessAdminService {
     private static final String REASON_CYCLE = "会形成循环继承";
     private static final String REASON_PARENT_MISSING = "父角色不存在";
     private static final String REASON_ROLE_MISSING = "角色不存在";
-    private static final String REASON_TOO_MANY_PERMISSIONS =
-            "权限数量不能超过 " + MAX_PERMISSION_KEYS + " 个";
-    private static final String REASON_MALFORMED_PERMISSIONS = "权限列表格式不正确";
 
     private final AccessAdminRepository repository;
     private final TransactionalOperator transactions;
     private final TransactionalOperator newTransactions;
     private final ObjectMapper objectMapper;
-    private final PermissionEscalationGuard escalationGuard;
 
     /**
      * Creates the service.
      *
-     * <p>Spring constructs the service through this constructor; the guard defaults to the
-     * permissive one because the anti-escalation rule is not implemented yet. The four-argument
-     * overload exists so a future implementation (or a test) can supply the real guard.
-     *
      * @param repository the admin repository
      * @param transactionManager the R2DBC reactive transaction manager
      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
      */
-    @Autowired
     public AccessAdminService(
             AccessAdminRepository repository,
             ReactiveTransactionManager transactionManager,
             ObjectMapper objectMapper) {
-        this(repository, transactionManager, objectMapper, PermissionEscalationGuard.permitAll());
-    }
-
-    /**
-     * Creates the service with an explicit anti-escalation guard.
-     *
-     * @param repository the admin repository
-     * @param transactionManager the R2DBC reactive transaction manager
-     * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
-     * @param escalationGuard the guard consulted before a permission set is applied, or {@code null}
-     *     for the permissive one
-     */
-    public AccessAdminService(
-            AccessAdminRepository repository,
-            ReactiveTransactionManager transactionManager,
-            ObjectMapper objectMapper,
-            PermissionEscalationGuard escalationGuard) {
-
         this.repository = repository;
         this.transactions = TransactionalOperator.create(transactionManager);
         this.newTransactions =
@@ -163,8 +121,6 @@ public class AccessAdminService {
                         new DefaultTransactionDefinition(
                                 TransactionDefinition.PROPAGATION_REQUIRES_NEW));
         this.objectMapper = objectMapper;
-        this.escalationGuard =
-                escalationGuard == null ? PermissionEscalationGuard.permitAll() : escalationGuard;
     }
 
     /**
@@ -174,259 +130,6 @@ public class AccessAdminService {
      */
     public Mono<List<AccessRoleView>> list() {
         return repository.roles().map(roles -> roles.stream().map(AccessRoleView::of).toList());
-    }
-
-    /**
-     * Lists the permission catalog, ordered by module then key.
-     *
-     * @return the catalog
-     */
-    public Mono<List<AccessPermissionView>> permissions() {
-        return repository
-                .permissions()
-                .map(catalog -> catalog.stream().map(AccessPermissionView::of).toList());
-    }
-
-    /**
-     * Reads one role's own permission set (the keys it holds directly, not inherited ones).
-     *
-     * @param roleId the role id
-     * @return the role's keys, ordered
-     */
-    public Mono<AccessRolePermissionsView> permissionsOf(String roleId) {
-        return Mono.defer(
-                () -> {
-                    requireIdentifier(roleId);
-                    return repository
-                            .role(roleId)
-                            .switchIfEmpty(
-                                    Mono.error(
-                                            new ResponseStatusException(
-                                                    HttpStatus.NOT_FOUND, REASON_ROLE_MISSING)))
-                            .then(repository.permissionKeysOf(roleId))
-                            .map(keys -> new AccessRolePermissionsView(roleId, sortedKeys(keys)));
-                });
-    }
-
-    /**
-     * Replaces one role's permission set.
-     *
-     * <p>The <em>whole</em> set is replaced: a previously held key that is absent from the request is
-     * revoked. An empty or {@code null} list clears the role. Duplicates are de-duplicated; every key
-     * must exist in the catalog.
-     *
-     * <p>The set replacement and its {@code role.permissions} audit row commit in one transaction, so
-     * a failed audit insert also rolls the change back. Every rejection decided against the loaded
-     * role writes a {@code DENIED} row in its own transaction; a malformed request (bad path id, too
-     * many keys) fails with {@code 400} before the role is loaded and is not audited, matching the
-     * rule in this class's documentation.
-     *
-     * <p>Built-in roles are editable; the last-{@code access.manage} lockout rule is not enforced
-     * here.
-     *
-     * @param actorId the acting user id
-     * @param roleId the role id
-     * @param request the complete new set ({@code null} means empty)
-     * @return the stored set
-     */
-    public Mono<AccessRolePermissionsView> replacePermissions(
-            String actorId, String roleId, List<String> request) {
-        return Mono.defer(
-                        () -> {
-                            // Shape-only checks first: they need no entity, so they are not audited.
-                            requireIdentifier(roleId);
-                            List<String> requestedKeys = normalizeKeys(request);
-                            Mono<AccessRole> loaded =
-                                    repository
-                                            .role(roleId)
-                                            .switchIfEmpty(
-                                                    Mono.defer(
-                                                            () ->
-                                                                    denyPermissions(
-                                                                                    actorId,
-                                                                                    roleId,
-                                                                                    List.of(),
-                                                                                    requestedKeys,
-                                                                                    new Denial(
-                                                                                            REASON_ROLE_MISSING,
-                                                                                            HttpStatus
-                                                                                                    .NOT_FOUND))
-                                                                            .cast(AccessRole.class)));
-                            return loaded.flatMap(
-                                    role -> replacePermissions(actorId, role, requestedKeys));
-                        })
-                .as(transactions::transactional)
-                .map(keys -> new AccessRolePermissionsView(roleId, keys));
-    }
-
-    /** Applies a validated replace request to a loaded role. */
-    private Mono<List<String>> replacePermissions(
-            String actorId, AccessRole role, List<String> requestedKeys) {
-        return repository
-                .permissions()
-                .flatMap(catalog -> {
-                    Map<String, String> idByKey =
-                            catalog.stream()
-                                    .collect(
-                                            Collectors.toMap(
-                                                    AccessPermission::key,
-                                                    AccessPermission::id,
-                                                    (first, second) -> first));
-                    for (String key : requestedKeys) {
-                        if (!idByKey.containsKey(key)) {
-                            return denyPermissions(
-                                    actorId,
-                                    role.id(),
-                                    List.of(),
-                                    requestedKeys,
-                                    new Denial("未知权限：" + key, HttpStatus.BAD_REQUEST));
-                        }
-                    }
-                    return repository
-                            .permissionKeysOf(role.id())
-                            .flatMap(before -> {
-                                List<String> beforeKeys = sortedKeys(before);
-                                Mono<Void> replaced =
-                                        Mono.defer(
-                                                () ->
-                                                        repository.replaceRolePermissions(
-                                                                role.id(),
-                                                                requestedKeys.stream()
-                                                                        .map(idByKey::get)
-                                                                        .toList()));
-                                // Anti-escalation seam: reject a grant the actor does not hold. This
-                                // guard permits everything until that rule is implemented.
-                                Mono<Boolean> allowed =
-                                        escalationGuard
-                                                .check(actorId, role, beforeKeys, requestedKeys)
-                                                .onErrorResume(
-                                                        Denial.class,
-                                                        denial ->
-                                                                denyPermissions(
-                                                                                actorId,
-                                                                                role.id(),
-                                                                                beforeKeys,
-                                                                                requestedKeys,
-                                                                                denial)
-                                                                        .then(Mono.empty()))
-                                                .thenReturn(Boolean.TRUE);
-                                return allowed.flatMap(
-                                        granted ->
-                                                replaced.then(
-                                                        recordPermissionChange(
-                                                                actorId,
-                                                                role.id(),
-                                                                beforeKeys,
-                                                                requestedKeys)));
-                            });
-                });
-    }
-
-    /**
-     * Validates the shape of a requested key set: trims each key, rejects an over-long or
-     * over-populated list, and removes duplicates while keeping the canonical key order.
-     *
-     * <p>Key existence is checked against the catalog afterwards (in {@link #replacePermissions}),
-     * because that denial is decided against the loaded role and is audited.
-     */
-    private static List<String> normalizeKeys(List<String> request) {
-        if (request == null || request.isEmpty()) {
-            return List.of();
-        }
-        if (request.size() > MAX_PERMISSION_KEYS) {
-            throw badRequest(REASON_TOO_MANY_PERMISSIONS);
-        }
-        TreeSet<String> keys = new TreeSet<>();
-        for (String raw : request) {
-            if (raw == null) {
-                throw badRequest(REASON_MALFORMED_PERMISSIONS);
-            }
-            String key = raw.trim();
-            if (key.isEmpty()) {
-                throw badRequest(REASON_MALFORMED_PERMISSIONS);
-            }
-            if (key.length() > MAX_PERMISSION_KEY_LENGTH) {
-                throw badRequest("未知权限：" + key);
-            }
-            keys.add(key);
-        }
-        return List.copyOf(keys);
-    }
-
-    private static List<String> sortedKeys(List<String> keys) {
-        if (keys == null || keys.isEmpty()) {
-            return List.of();
-        }
-        return keys.stream().filter(Objects::nonNull).distinct().sorted().toList();
-    }
-
-    /** Appends the SUCCESS row for a replaced permission set, then returns its key list. */
-    private Mono<List<String>> recordPermissionChange(
-            String actorId, String roleId, List<String> before, List<String> after) {
-        return repository
-                .record(
-                        actorId,
-                        ACTION_PERMISSIONS,
-                        ENTITY_TYPE,
-                        roleId,
-                        jsonKeys(before),
-                        jsonKeys(after),
-                        RESULT_SUCCESS,
-                        null)
-                .thenReturn(after);
-    }
-
-    /**
-     * Appends a DENIED row for a rejected permission-set change, in its own transaction, then fails
-     * with the rejection. Mirrors {@link #deny} for role edits.
-     */
-    private Mono<List<String>> denyPermissions(
-            String actorId,
-            String roleId,
-            List<String> before,
-            List<String> requestedKeys,
-            Denial denial) {
-        Mono<Void> record =
-                repository
-                        .record(
-                                actorId,
-                                ACTION_PERMISSIONS,
-                                ENTITY_TYPE,
-                                roleId,
-                                jsonKeysForDenial(before),
-                                jsonKeysForDenial(requestedKeys),
-                                RESULT_DENIED,
-                                truncate(denial.getMessage()))
-                        .onErrorResume(
-                                error -> {
-                                    log.error(
-                                            "Failed to append the DENIED audit row {}",
-                                            ACTION_PERMISSIONS,
-                                            error);
-                                    return Mono.empty();
-                                });
-        return record.as(newTransactions::transactional).then(Mono.error(denial));
-    }
-
-    /** Serializes a key array for the DENIED payload; never fails the rejection. */
-    private String jsonKeysForDenial(List<String> keys) {
-        try {
-            return jsonKeys(keys);
-        } catch (IllegalStateException ex) {
-            log.warn("Failed to serialize the DENIED audit payload; storing null instead", ex);
-            return null;
-        }
-    }
-
-    private String jsonKeys(List<String> keys) {
-        if (keys == null) {
-            return null;
-        }
-        try {
-            return objectMapper.writeValueAsString(keys);
-        } catch (JsonProcessingException ex) {
-            throw new IllegalStateException("Failed to serialize the access-audit payload", ex);
-        }
     }
 
     /**

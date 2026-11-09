@@ -130,7 +130,7 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
         if (permissionIds == null || permissionIds.isEmpty()) {
             return delete;
         }
-        // One INSERT ... SELECT per key keeps every value bound (no IN-list is built from client
+        // One INSERT ... VALUES per key keeps every value bound (no IN-list is built from client
         // input). Duplicates are already removed by the service, so the primary key cannot collide.
         Mono<Void> insert = Mono.empty();
         for (String permissionId : List.copyOf(permissionIds)) {

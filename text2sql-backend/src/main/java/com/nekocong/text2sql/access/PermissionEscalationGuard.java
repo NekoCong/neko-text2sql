@@ -1,41 +1,51 @@
 package com.nekocong.text2sql.access;
 
-import java.util.List;
+import java.util.Optional;
+import java.util.Set;
 import reactor.core.publisher.Mono;
 
 /**
  * Seam for the anti-escalation rule of the permission-set endpoint.
  *
- * <p>Consulted by {@link AccessAdminService#replacePermissions} after the request has been validated
- * against the catalog and the role's current set has been loaded, and before the set is written.
- * Returning an error (a {@link AccessAdminService.Denial}) rejects the change and writes its {@code
- * DENIED} audit row. The default is the permissive instance: the rule itself ("an administrator may
- * not grant a permission they do not hold") is not implemented yet.
+ * <p>Consulted by the permission-matrix service after the request has been validated against the
+ * catalog and before the set is written. The guard answers whether the change may be applied:
  *
- * <p>The intended implementation resolves the actor's {@link EffectiveAccess} and rejects any
- * requested key absent from it. It receives the actor id rather than the context so it can resolve
- * lazily and stay usable outside a request (for example in tests).
+ * <ul>
+ *   <li>{@code Mono.just(Optional.empty())} allows the change;
+ *   <li>{@code Mono.just(Optional.of(reason))} denies it with that human-readable reason, which is
+ *       returned to the caller as {@code 403} and recorded in the {@code DENIED} audit row;
+ *   <li>an error denies the change too, but a guard should return a reason so the outcome is
+ *       auditable: an error is <em>not</em> caught as a denial.
+ * </ul>
+ *
+ * <p>The contract is data-only on purpose: no exception type of this package appears in the
+ * signature, so an implementation in any module (or a future bean) can be written without access to
+ * this class's internals. {@link #permitAll()} is the default while the rule itself ("an
+ * administrator may not grant a permission they lack") is unimplemented.
+ *
+ * <p>The intended implementation resolves the actor's {@link EffectiveAccess} for {@code actorId}
+ * and denies any requested key absent from it.
  */
 @FunctionalInterface
 public interface PermissionEscalationGuard {
 
     /**
-     * This instance, which permits every change (no anti-escalation rule yet).
+     * The guard that permits every change (the anti-escalation rule is not implemented yet).
      *
      * @return the permissive guard
      */
     static PermissionEscalationGuard permitAll() {
-        return (actorId, role, before, after) -> Mono.empty();
+        return (actorId, roleId, requestedKeys) -> Mono.just(Optional.empty());
     }
 
     /**
      * Decides whether a permission-set change may be applied.
      *
-     * @param actorId the acting user id
-     * @param role the role whose set is being replaced
-     * @param before the role's current keys, sorted
-     * @param after the requested keys, sorted and de-duplicated
-     * @return completion when the change is allowed, or an error rejecting it
+     * @param actorId the acting user id (the JWT subject)
+     * @param roleId the role whose set is being replaced
+     * @param requestedKeys the requested keys, already trimmed, de-duplicated and validated against
+     *     the catalog
+     * @return an empty {@link Optional} to allow the change, or the denial reason
      */
-    Mono<Void> check(String actorId, AccessRole role, List<String> before, List<String> after);
+    Mono<Optional<String>> check(String actorId, String roleId, Set<String> requestedKeys);
 }

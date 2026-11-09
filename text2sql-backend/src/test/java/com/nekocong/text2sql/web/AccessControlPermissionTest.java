@@ -105,10 +105,17 @@ class AccessControlPermissionTest {
                         Permissions.AUDIT_READ,
                         Permissions.BYPASS_DATA_SCOPE);
 
-        // Ordered by module then key.
-        List<String> ordering =
-                catalog.stream().map(row -> row.get("module") + "." + row.get("key")).toList();
-        assertThat(ordering).isSorted();
+        // Ordered by module, then by key within each module.
+        List<String> modules = catalog.stream().map(row -> (String) row.get("module")).toList();
+        assertThat(modules).isSorted();
+        List<String> entries =
+                catalog.stream()
+                        .map(row -> row.get("module") + "\u0000" + row.get("key"))
+                        .toList();
+        List<String> expected = entries.stream().sorted().toList();
+        assertThat(entries)
+                .as("entries are ordered by module, then by key inside the module")
+                .containsExactlyElementsOf(expected);
 
         // Every entry carries its module/action split and an id.
         assertThat(catalog).allSatisfy(row -> {
@@ -185,6 +192,89 @@ class AccessControlPermissionTest {
     }
 
     @Test
+    void aMissingBodyDoesNotClearTheSet() {
+        putPermissions(List.of(Permissions.CHAT_USE)).expectStatus().isOk();
+
+        client.put()
+                .uri(ROLES + "/" + customRoleId + "/permissions")
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("permissions 不能为空");
+
+        assertThat(getPermissions())
+                .as("omitting the body must not revoke every grant")
+                .containsExactly(Permissions.CHAT_USE);
+        assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(1);
+    }
+
+    @Test
+    void aNullPermissionsFieldDoesNotClearTheSet() {
+        putPermissions(List.of(Permissions.CHAT_USE)).expectStatus().isOk();
+
+        client.put()
+                .uri(ROLES + "/" + customRoleId + "/permissions")
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(Map.of())
+                .exchange()
+                .expectStatus()
+                .isBadRequest()
+                .expectBody()
+                .jsonPath("$.message")
+                .isEqualTo("permissions 不能为空");
+
+        client.put()
+                .uri(ROLES + "/" + customRoleId + "/permissions")
+                .header(HttpHeaders.AUTHORIZATION, bearer())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue("{\"permissions\": null}")
+                .exchange()
+                .expectStatus()
+                .isBadRequest();
+
+        assertThat(getPermissions()).containsExactly(Permissions.CHAT_USE);
+    }
+
+    @Test
+    void anOverLongKeyIsRejectedWithABoundedMessage() {
+        String key = "a".repeat(500);
+
+        String message =
+                client.put()
+                        .uri(ROLES + "/" + customRoleId + "/permissions")
+                        .header(HttpHeaders.AUTHORIZATION, bearer())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .bodyValue(Map.of("permissions", List.of(key)))
+                        .exchange()
+                        .expectStatus()
+                        .isBadRequest()
+                        .expectBody(Map.class)
+                        .returnResult()
+                        .getResponseBody()
+                        .get("message")
+                        .toString();
+
+        assertThat(message).hasSizeLessThan(80).startsWith("未知权限：aaa");
+    }
+
+    @Test
+    void aDuplicateHeavyRequestIsCappedAfterDeduplication() {
+        // Far more entries than the cap, but only one distinct key: not rejected.
+        List<String> repeated = java.util.Collections.nCopies(300, Permissions.CHAT_USE);
+
+        putPermissions(repeated)
+                .expectStatus()
+                .isOk()
+                .expectBody()
+                .jsonPath("$.permissions.length()")
+                .isEqualTo(1);
+    }
+
+    @Test
     void anUnknownRoleIsNotFoundAndAudited() {
         String unknown = UUID.randomUUID().toString();
 
@@ -212,7 +302,9 @@ class AccessControlPermissionTest {
 
     @Test
     void anUnknownKeyIsRejectedAndAudited() {
-        putPermissions(List.of(Permissions.CHAT_USE)).expectStatus().isOk();
+        putPermissions(List.of(Permissions.CHAT_USE, Permissions.DATASOURCE_READ))
+                .expectStatus()
+                .isOk();
         long successBefore = auditRows(customRoleId, "SUCCESS");
 
         putPermissions(List.of(Permissions.CHAT_USE, "chat.nope"))
@@ -224,9 +316,18 @@ class AccessControlPermissionTest {
 
         assertThat(getPermissions())
                 .as("a rejected request does not change the set")
-                .containsExactly(Permissions.CHAT_USE);
+                .containsExactly(Permissions.CHAT_USE, Permissions.DATASOURCE_READ);
         assertThat(auditRows(customRoleId, "DENIED")).isEqualTo(1);
         assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(successBefore);
+
+        // The DENIED row's before state is the role's real current set, not [].
+        assertThat(auditDistinct(customRoleId, "DENIED", "before_json"))
+                .containsExactly(
+                        "[\""
+                                + Permissions.CHAT_USE
+                                + "\",\""
+                                + Permissions.DATASOURCE_READ
+                                + "\"]");
     }
 
     @Test
@@ -275,14 +376,18 @@ class AccessControlPermissionTest {
                 .isOk();
 
         assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(2);
-
-        Map<String, Object> latest = latestAuditRow(customRoleId, "SUCCESS");
-        assertThat(String.valueOf(latest.get("action"))).isEqualTo("role.permissions");
-        assertThat(String.valueOf(latest.get("entity_type"))).isEqualTo("ROLE");
-        assertThat(String.valueOf(latest.get("before_json")))
-                .isEqualTo("[\"" + Permissions.CHAT_USE + "\",\"" + Permissions.USER_READ + "\"]");
-        assertThat(String.valueOf(latest.get("after_json")))
-                .isEqualTo("[\"" + Permissions.USER_READ + "\"]");
+        assertThat(auditDistinct(customRoleId, "SUCCESS", "action")).containsExactly("role.permissions");
+        assertThat(auditDistinct(customRoleId, "SUCCESS", "entity_type")).containsExactly("ROLE");
+        assertThat(auditTransitions(customRoleId, "SUCCESS"))
+                .containsExactlyInAnyOrder(
+                        "[] -> [\"" + Permissions.CHAT_USE + "\",\"" + Permissions.USER_READ + "\"]",
+                        "[\""
+                                + Permissions.CHAT_USE
+                                + "\",\""
+                                + Permissions.USER_READ
+                                + "\"] -> [\""
+                                + Permissions.USER_READ
+                                + "\"]");
     }
 
     @Test
@@ -392,23 +497,42 @@ class AccessControlPermissionTest {
         return count == null ? 0L : count;
     }
 
-    private Map<String, Object> latestAuditRow(String entityId, String result) {
+    /**
+     * The distinct values of one audit column, for this test's actor and the given result.
+     *
+     * <p>Asserted on content rather than on row order: two rows written in the same millisecond have
+     * no stable order (the id is a random UUID).
+     */
+    private List<String> auditDistinct(String entityId, String result, String column) {
         return db.sql(
-                        "SELECT action, entity_type, before_json, after_json, result FROM access_audit"
+                        "SELECT DISTINCT " + column + " AS audit_value FROM access_audit"
                                 + " WHERE actor_id = :actorId AND action = :action"
-                                + " AND entity_id = :entityId AND result = :result"
-                                + " ORDER BY created_at DESC, id DESC LIMIT 1")
+                                + " AND entity_id = :entityId AND result = :result")
                 .bind("actorId", adminId)
                 .bind("action", "role.permissions")
                 .bind("entityId", entityId)
                 .bind("result", result)
-                .map((row, meta) -> Map.<String, Object>of(
-                        "action", String.valueOf(row.get("action", String.class)),
-                        "entity_type", String.valueOf(row.get("entity_type", String.class)),
-                        "before_json", String.valueOf(row.get("before_json", String.class)),
-                        "after_json", String.valueOf(row.get("after_json", String.class)),
-                        "result", String.valueOf(row.get("result", String.class))))
-                .one()
+                .map((row, meta) -> row.get("audit_value", String.class))
+                .all()
+                .collectList()
+                .block();
+    }
+
+    /** The distinct before -> after transitions recorded for the role. */
+    private List<String> auditTransitions(String entityId, String result) {
+        return db.sql(
+                        "SELECT DISTINCT before_json, after_json FROM access_audit"
+                                + " WHERE actor_id = :actorId AND action = :action"
+                                + " AND entity_id = :entityId AND result = :result")
+                .bind("actorId", adminId)
+                .bind("action", "role.permissions")
+                .bind("entityId", entityId)
+                .bind("result", result)
+                .map((row, meta) -> row.get("before_json", String.class)
+                        + " -> "
+                        + row.get("after_json", String.class))
+                .all()
+                .collectList()
                 .block();
     }
 

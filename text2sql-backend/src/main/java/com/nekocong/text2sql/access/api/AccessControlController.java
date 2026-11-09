@@ -1,6 +1,7 @@
 package com.nekocong.text2sql.access.api;
 
 import com.nekocong.text2sql.access.AccessAdminService;
+import com.nekocong.text2sql.access.RolePermissionService;
 import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
@@ -50,14 +51,18 @@ public class AccessControlController {
     private static final String ROLES = "/api/admin/access-control/roles";
 
     private final AccessAdminService service;
+    private final RolePermissionService permissions;
 
     /**
      * Creates the controller.
      *
      * @param service the role administration service
+     * @param permissions the permission catalog and role-permission matrix service
      */
-    public AccessControlController(AccessAdminService service) {
+    public AccessControlController(
+            AccessAdminService service, RolePermissionService permissions) {
         this.service = service;
+        this.permissions = permissions;
     }
 
     /**
@@ -109,7 +114,7 @@ public class AccessControlController {
      */
     @GetMapping(path = "/api/admin/access-control/permissions")
     public Mono<List<AccessPermissionView>> permissions() {
-        return service.permissions();
+        return permissions.permissions();
     }
 
     /**
@@ -120,24 +125,28 @@ public class AccessControlController {
      */
     @GetMapping(path = ROLES + "/{id}/permissions")
     public Mono<AccessRolePermissionsView> rolePermissions(@PathVariable String id) {
-        return service.permissionsOf(id).onErrorMap(AccessControlController::asStatusException);
+        return permissions.permissionsOf(id);
     }
 
     /**
      * Replaces a role's permission set with the complete requested set.
      *
+     * <p>The body is <em>required</em>: a missing body, or a body without a {@code permissions}
+     * array, is a {@code 400} rather than an empty set, so a malformed client cannot silently revoke
+     * every grant. Only an explicit {@code {"permissions": []}} clears the role.
+     *
      * @param id the role id
-     * @param request the new set (an empty list clears it); a missing body clears it too
+     * @param request the new set
      * @return the stored set
      */
     @PutMapping(path = ROLES + "/{id}/permissions")
     public Mono<AccessRolePermissionsView> replaceRolePermissions(
             @PathVariable String id,
             @RequestBody(required = false) AccessRolePermissionsRequest request) {
-        List<String> permissions = request == null ? null : request.permissions();
         return actorId()
-                .flatMap(actor -> service.replacePermissions(actor, id, permissions))
-                .onErrorMap(AccessControlController::asStatusException);
+                .flatMap(actor ->
+                        permissions.replacePermissions(
+                                actor, id, request == null ? null : request.permissions()));
     }
 
     /** Converts the service's audited rejection into the status exception the handler renders. */
