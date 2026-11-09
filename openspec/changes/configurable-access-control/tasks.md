@@ -24,9 +24,9 @@
 
 ## 4. SQL rewriting and CTE fix
 
-- [ ] 4.1 Fix CTE scoping in `DataScopeRewriter`: a non-recursive CTE's own name is not visible inside its body, only previously defined CTEs are; reject CTE names that collide with protected tables; reject recursive CTEs in this phase. Verify tests for same-name masking, schema-qualified body, nested CTE, legal CTE, and recursive rejection.
-- [ ] 4.2 Harden the row-predicate builder: quote identifiers, escape string values consistently with MySQL, and reject unknown/unsafe identifiers. Verify tests for quote/backslash handling and identifier rejection.
-- [ ] 4.3 Add a regression test that a restricted user's `WITH ... AS (SELECT * FROM protected_table)` query is rejected or filtered and returns no out-of-scope rows.
+- [x] 4.1 Fix CTE scoping in `DataScopeRewriter`: a non-recursive CTE's own name is not visible inside its body, only previously defined CTEs are; reject CTE names that collide with protected tables; reject recursive CTEs in this phase. Verify tests for same-name masking, schema-qualified body, nested CTE, legal CTE, and recursive rejection.
+- [x] 4.2 Harden the row-predicate builder: quote identifiers, escape string values consistently with MySQL, and reject unknown/unsafe identifiers. Verify tests for quote/backslash handling and identifier rejection.
+- [x] 4.3 Add a regression test that a restricted user's `WITH ... AS (SELECT * FROM protected_table)` query is rejected or filtered and returns no out-of-scope rows.
 
 ## 5. Admin API
 
