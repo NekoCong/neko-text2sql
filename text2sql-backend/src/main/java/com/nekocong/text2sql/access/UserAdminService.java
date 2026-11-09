@@ -16,6 +16,7 @@ import java.util.Objects;
 import java.util.regex.Pattern;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
@@ -161,19 +162,24 @@ public class UserAdminService {
                             String password = validatePassword(body.password());
                             String displayName = normalizeDisplayName(body.displayName());
                             List<String> roleIds = normalizeRoleIds(body.roleIds(), true);
-                            AuditUser requested =
-                                    requestedUser(username, displayName, true, roleIds);
                             return resolveRoles(roleIds)
                                     .onErrorResume(
                                             Denial.class,
                                             denial ->
-                                                    deny(
-                                                                    actorId,
-                                                                    ACTION_CREATE,
-                                                                    null,
-                                                                    null,
-                                                                    requested,
-                                                                    denial)
+                                                    knownRoleCodes(roleIds)
+                                                            .flatMap(
+                                                                    codes ->
+                                                                            deny(
+                                                                                    actorId,
+                                                                                    ACTION_CREATE,
+                                                                                    null,
+                                                                                    null,
+                                                                                    requestedUser(
+                                                                                            username,
+                                                                                            displayName,
+                                                                                            true,
+                                                                                            codes),
+                                                                                    denial))
                                                             .then(Mono.<List<AccessRole>>empty()))
                                     .flatMap(
                                             roles ->
@@ -203,7 +209,7 @@ public class UserAdminService {
                                         existing.id(),
                                         null,
                                         requested,
-                                        new Denial(REASON_DUPLICATE_USERNAME, HttpStatus.CONFLICT)))
+                                        duplicate()))
                 .switchIfEmpty(
                         Mono.defer(
                                 () ->
@@ -215,7 +221,50 @@ public class UserAdminService {
                                                                         hash,
                                                                         displayName,
                                                                         roleIdsOf(roles)))
+                                                // The pre-read above handles the friendly duplicate
+                                                // path; this only fires on a concurrent insert that
+                                                // loses the unique-username race.
+                                                .onErrorResume(
+                                                        DuplicateKeyException.class,
+                                                        error ->
+                                                                duplicateRace(
+                                                                        actorId,
+                                                                        username,
+                                                                        displayName,
+                                                                        roles))
                                                 .flatMap(user -> audit(actorId, ACTION_CREATE, null, user))));
+    }
+
+    /**
+     * Answers a concurrent duplicate-username race: reloads the winning row to reference it in the
+     * {@code DENIED} audit row, then fails with {@code 409}. When the winning row cannot be located
+     * the conflict is logged and still answered {@code 409}, without an audit row.
+     */
+    private Mono<AccessUser> duplicateRace(
+            String actorId, String username, String displayName, List<AccessRole> roles) {
+        AuditUser requested = requestedUser(username, displayName, true, codesOf(roles));
+        return Mono.defer(
+                        () ->
+                                repository
+                                        .userByUsername(username)
+                                        .flatMap(
+                                                existing ->
+                                                        deny(
+                                                                actorId,
+                                                                ACTION_CREATE,
+                                                                existing.id(),
+                                                                null,
+                                                                requested,
+                                                                duplicate()))
+                                        .switchIfEmpty(
+                                                Mono.defer(
+                                                        () -> {
+                                                            log.error(
+                                                                    "用户名插入冲突，但无法定位已存在的用户：{}",
+                                                                    username);
+                                                            return Mono.error(duplicate());
+                                                        })))
+                .as(newTransactions::transactional);
     }
 
     /**
@@ -364,17 +413,20 @@ public class UserAdminService {
                 .onErrorResume(
                         Denial.class,
                         denial ->
-                                deny(
-                                                actorId,
-                                                ACTION_ROLES,
-                                                before.id(),
-                                                auditUser(before),
-                                                requestedUser(
-                                                        before.username(),
-                                                        before.displayName(),
-                                                        before.enabled(),
-                                                        roleIds),
-                                                denial)
+                                knownRoleCodes(roleIds)
+                                        .flatMap(
+                                                codes ->
+                                                        deny(
+                                                                actorId,
+                                                                ACTION_ROLES,
+                                                                before.id(),
+                                                                auditUser(before),
+                                                                requestedUser(
+                                                                        before.username(),
+                                                                        before.displayName(),
+                                                                        before.enabled(),
+                                                                        codes),
+                                                                denial))
                                         .then(Mono.<List<AccessRole>>empty()))
                 .flatMap(
                         roles ->
@@ -464,6 +516,27 @@ public class UserAdminService {
                 resolved.add(role);
             }
             return resolved;
+        });
+    }
+
+    /**
+     * Maps the requested role ids to the codes of the roles that exist, dropping any unknown id, so a
+     * {@code DENIED} audit payload's {@code roleCodes} field is honest (codes, not ids).
+     */
+    private Mono<List<String>> knownRoleCodes(List<String> roleIds) {
+        return repository.roles().map(all -> {
+            Map<String, AccessRole> byId = new HashMap<>();
+            for (AccessRole role : all) {
+                byId.put(role.id(), role);
+            }
+            return roleIds.stream()
+                    .map(byId::get)
+                    .filter(Objects::nonNull)
+                    .map(AccessRole::code)
+                    .filter(Objects::nonNull)
+                    .distinct()
+                    .sorted()
+                    .toList();
         });
     }
 
@@ -676,6 +749,10 @@ public class UserAdminService {
 
     private static Denial lastAdmin() {
         return new Denial(REASON_LAST_ADMIN, HttpStatus.CONFLICT);
+    }
+
+    private static Denial duplicate() {
+        return new Denial(REASON_DUPLICATE_USERNAME, HttpStatus.CONFLICT);
     }
 
     private static Denial missing() {
