@@ -324,4 +324,26 @@ public interface AccessAdminRepository {
             String afterJson,
             String result,
             String reason);
+
+    /**
+     * Lists the audit trail, newest first, matching the given (all-optional) filters.
+     *
+     * <p>Every filter in {@code query} is bound as a parameter; only static fragments are
+     * concatenated. The page is applied in SQL ({@code LIMIT}/{@code OFFSET}), never in memory. Rows
+     * are ordered by {@code created_at DESC, id DESC} so same-millisecond ties are deterministic.
+     *
+     * @param query the validated, normalized filters (a {@code null} field means "any")
+     * @param size the page size (already validated, at least 1)
+     * @param offset the zero-based offset of the page (already validated, at least 0)
+     * @return the matching audit rows, newest first
+     */
+    Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset);
+
+    /**
+     * Counts the audit rows matching the given filters (the {@code total} of a page query).
+     *
+     * @param query the validated, normalized filters (a {@code null} field means "any")
+     * @return the matching row count
+     */
+    Mono<Long> countAudit(AuditQuery query);
 }

@@ -31,6 +31,10 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     private static final String DATA_SCOPE_COLUMNS =
             "id, role_id, datasource_id, table_name, policy, column_name, principal_attribute";
 
+    private static final String AUDIT_COLUMNS =
+            "id, actor_id, action, entity_type, entity_id, before_json, after_json, result, reason,"
+                    + " created_at";
+
     private final DatabaseClient client;
 
     /**
@@ -447,6 +451,105 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
         spec = bindNullable(spec, "afterJson", afterJson);
         spec = bindNullable(spec, "reason", reason);
         return spec.then();
+    }
+
+    @Override
+    public Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset) {
+        AuditWhere where = auditWhere(query);
+        String sql = "SELECT " + AUDIT_COLUMNS + " FROM access_audit" + where.sql
+                + " ORDER BY created_at DESC, id DESC"
+                + " LIMIT :size OFFSET :offset";
+        DatabaseClient.GenericExecuteSpec spec = bindAuditWhere(client.sql(sql), where);
+        spec = spec.bind("size", size).bind("offset", offset);
+        return spec.map((row, meta) -> audit(row)).all().collectList();
+    }
+
+    @Override
+    public Mono<Long> countAudit(AuditQuery query) {
+        AuditWhere where = auditWhere(query);
+        String sql = "SELECT COUNT(*) AS n FROM access_audit" + where.sql;
+        return bindAuditWhere(client.sql(sql), where)
+                .map(
+                        (row, meta) -> {
+                            Long count = row.get("n", Long.class);
+                            return count == null ? 0L : count;
+                        })
+                .one();
+    }
+
+    /** Builds the shared audit-list/count {@code WHERE} fragment from the validated filters. */
+    private static AuditWhere auditWhere(AuditQuery query) {
+        List<String> conditions = new ArrayList<>();
+        if (query.actorId() != null) {
+            conditions.add("actor_id = :actorId");
+        }
+        if (query.action() != null) {
+            conditions.add("action = :action");
+        }
+        if (query.entityType() != null) {
+            conditions.add("entity_type = :entityType");
+        }
+        if (query.entityId() != null) {
+            conditions.add("entity_id = :entityId");
+        }
+        if (query.result() != null) {
+            conditions.add("result = :result");
+        }
+        if (query.from() != null) {
+            conditions.add("created_at >= :from");
+        }
+        if (query.to() != null) {
+            conditions.add("created_at < :to");
+        }
+        String sql = conditions.isEmpty() ? "" : " WHERE " + String.join(" AND ", conditions);
+        return new AuditWhere(sql, query);
+    }
+
+    /** Binds the {@link AuditQuery} values to a statement (skipping the absent filters). */
+    private static DatabaseClient.GenericExecuteSpec bindAuditWhere(
+            DatabaseClient.GenericExecuteSpec spec, AuditWhere where) {
+        DatabaseClient.GenericExecuteSpec bound = spec;
+        AuditQuery query = where.query;
+        if (query.actorId() != null) {
+            bound = bound.bind("actorId", query.actorId());
+        }
+        if (query.action() != null) {
+            bound = bound.bind("action", query.action());
+        }
+        if (query.entityType() != null) {
+            bound = bound.bind("entityType", query.entityType());
+        }
+        if (query.entityId() != null) {
+            bound = bound.bind("entityId", query.entityId());
+        }
+        if (query.result() != null) {
+            bound = bound.bind("result", query.result());
+        }
+        if (query.from() != null) {
+            bound = bound.bind("from", query.from());
+        }
+        if (query.to() != null) {
+            bound = bound.bind("to", query.to());
+        }
+        return bound;
+    }
+
+    /** The audit-list/count filter state: the SQL fragment plus the values to bind. */
+    private record AuditWhere(String sql, AuditQuery query) {}
+
+    private static AccessAudit audit(io.r2dbc.spi.Row row) {
+        Long createdAt = row.get("created_at", Long.class);
+        return new AccessAudit(
+                row.get("id", String.class),
+                row.get("actor_id", String.class),
+                row.get("action", String.class),
+                row.get("entity_type", String.class),
+                row.get("entity_id", String.class),
+                row.get("before_json", String.class),
+                row.get("after_json", String.class),
+                row.get("result", String.class),
+                row.get("reason", String.class),
+                createdAt == null ? 0L : createdAt);
     }
 
     private static DatabaseClient.GenericExecuteSpec bindNullable(

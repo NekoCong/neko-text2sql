@@ -109,6 +109,14 @@ public class SecurityConfig {
                                                 "/api/admin/access-control/users",
                                                 "/api/admin/access-control/users/**")
                                         .access(userManage())
+                                        // The audit trail is read-only and gated by audit.read, not
+                                        // access.manage, so an auditor can review changes without
+                                        // being able to make them. Must precede the generic
+                                        // /api/admin/** access.manage rule below.
+                                        .pathMatchers(
+                                                HttpMethod.GET,
+                                                "/api/admin/access-control/audit")
+                                        .access(auditRead())
                                         .pathMatchers("/api/admin/**")
                                         .access(accessManage())
                                         // The three knowledge collections, their documents and the
@@ -176,6 +184,15 @@ public class SecurityConfig {
      */
     static ReactiveAuthorizationManager<AuthorizationContext> userManage() {
         return PermissionAuthorizationManager.permission(Permissions.USER_MANAGE);
+    }
+
+    /**
+     * Requires the {@code audit.read} permission (read-only audit-trail access).
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> auditRead() {
+        return PermissionAuthorizationManager.permission(Permissions.AUDIT_READ);
     }
 
     /**

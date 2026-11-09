@@ -1,10 +1,12 @@
 package com.nekocong.text2sql.access.api;
 
 import com.nekocong.text2sql.access.AccessAdminService;
+import com.nekocong.text2sql.access.AuditQueryService;
 import com.nekocong.text2sql.access.DataScopeService;
 import com.nekocong.text2sql.access.RoleDatasourceService;
 import com.nekocong.text2sql.access.RolePermissionService;
 import com.nekocong.text2sql.access.UserAdminService;
+import com.nekocong.text2sql.access.api.dto.AccessAuditPageView;
 import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
@@ -79,6 +81,7 @@ public class AccessControlController {
     private final DataScopeService dataScopes;
     private final UserAdminService users;
     private final RoleDatasourceService roleDatasources;
+    private final AuditQueryService auditService;
 
     /**
      * Creates the controller.
@@ -88,18 +91,21 @@ public class AccessControlController {
      * @param dataScopes the data-scope policy service
      * @param users the user lifecycle service
      * @param roleDatasources the role → datasource matrix service
+     * @param auditService the read-only audit-trail service
      */
     public AccessControlController(
             AccessAdminService service,
             RolePermissionService permissions,
             DataScopeService dataScopes,
             UserAdminService users,
-            RoleDatasourceService roleDatasources) {
+            RoleDatasourceService roleDatasources,
+            AuditQueryService auditService) {
         this.service = service;
         this.permissions = permissions;
         this.dataScopes = dataScopes;
         this.users = users;
         this.roleDatasources = roleDatasources;
+        this.auditService = auditService;
     }
 
     /**
@@ -110,6 +116,39 @@ public class AccessControlController {
     @GetMapping(path = ROLES)
     public Mono<List<AccessRoleView>> list() {
         return service.list();
+    }
+
+    /**
+     * Lists the access-control audit trail, newest first, paginated and filtered.
+     *
+     * <p>Read-only: there are no write/delete audit endpoints. An unknown filter value (for the
+     * exact-match filters) simply matches nothing; only an invalid {@code result}, an inverted {@code
+     * from}/{@code to} range, or bad pagination is a {@code 400} (rendered in the controller's {@code
+     * {status,message}} shape).
+     *
+     * @param actorId the exact actor filter, or omitted for all
+     * @param action the exact action filter, or omitted for all
+     * @param entityType the exact entity-type filter, or omitted for all
+     * @param entityId the exact entity-id filter, or omitted for all
+     * @param result {@code SUCCESS}/{@code DENIED}, or omitted for both
+     * @param from the inclusive lower time bound (epoch millis), or omitted
+     * @param to the exclusive upper time bound (epoch millis), or omitted
+     * @param page the zero-based page number (default 0)
+     * @param size the page size (default 50; capped at the service maximum)
+     * @return the page of entries with the total count
+     */
+    @GetMapping(path = "/api/admin/access-control/audit")
+    public Mono<AccessAuditPageView> audit(
+            @RequestParam(required = false) String actorId,
+            @RequestParam(required = false) String action,
+            @RequestParam(required = false) String entityType,
+            @RequestParam(required = false) String entityId,
+            @RequestParam(required = false) String result,
+            @RequestParam(required = false) String from,
+            @RequestParam(required = false) String to,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "50") int size) {
+        return auditService.list(actorId, action, entityType, entityId, result, from, to, page, size);
     }
 
     /**

@@ -316,6 +316,16 @@ class AccessAdminServiceTransactionTest {
                     String reason) {
                 return Mono.error(new IllegalStateException("audit unavailable"));
             }
+
+            @Override
+            public Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset) {
+                return delegate.audit(query, size, offset);
+            }
+
+            @Override
+            public Mono<Long> countAudit(AuditQuery query) {
+                return delegate.countAudit(query);
+            }
         };
     }
 
