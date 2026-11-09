@@ -222,6 +222,47 @@ class AccessAdminServiceTransactionTest {
             }
 
             @Override
+            public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
+                return delegate.users(query, enabled, roleId);
+            }
+
+            @Override
+            public Mono<AccessUser> user(String id) {
+                return delegate.user(id);
+            }
+
+            @Override
+            public Mono<AccessUser> userByUsername(String username) {
+                return delegate.userByUsername(username);
+            }
+
+            @Override
+            public Mono<AccessUser> insertUser(
+                    String username, String passwordHash, String displayName, List<String> roleIds) {
+                return delegate.insertUser(username, passwordHash, displayName, roleIds);
+            }
+
+            @Override
+            public Mono<Void> updateUserStatus(String id, boolean enabled) {
+                return delegate.updateUserStatus(id, enabled);
+            }
+
+            @Override
+            public Mono<Void> updateUserPassword(String id, String passwordHash) {
+                return delegate.updateUserPassword(id, passwordHash);
+            }
+
+            @Override
+            public Mono<Void> replaceUserRoles(String userId, List<String> roleIds) {
+                return delegate.replaceUserRoles(userId, roleIds);
+            }
+
+            @Override
+            public Mono<List<String>> enabledUserIds() {
+                return delegate.enabledUserIds();
+            }
+
+            @Override
             public Mono<Void> record(
                     String actorId,
                     String action,

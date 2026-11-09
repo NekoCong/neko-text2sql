@@ -148,13 +148,98 @@ public interface AccessAdminRepository {
     Mono<Long> deleteDataScope(String id);
 
     /**
+     * Lists users, ordered by username, with each user's directly assigned roles attached.
+     *
+     * <p>Every filter is optional; a {@code null} filter means "any". The {@code query} matches
+     * username and display name case-insensitively (contains); {@code roleId} keeps only users
+     * directly assigned that role.
+     *
+     * @param query the case-insensitive username/display-name contains filter, or {@code null}
+     * @param enabled keep only enabled/disabled users, or {@code null} for both
+     * @param roleId keep only users directly holding this role, or {@code null}
+     * @return the matching users, ordered by username
+     */
+    Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId);
+
+    /**
+     * Finds one user by id, with directly assigned roles.
+     *
+     * @param id the user id
+     * @return the user, or empty
+     */
+    Mono<AccessUser> user(String id);
+
+    /**
+     * Finds one user by username, with directly assigned roles.
+     *
+     * @param username the username
+     * @return the user, or empty
+     */
+    Mono<AccessUser> userByUsername(String username);
+
+    /**
+     * Inserts a user and its role assignments.
+     *
+     * <p>The legacy {@code role} column is left to its {@code 'student'} default and {@code enabled}
+     * / {@code token_version} to their column defaults; the client cannot set them.
+     *
+     * @param username the unique username
+     * @param passwordHash the BCrypt hash
+     * @param displayName the display name, or {@code null}
+     * @param roleIds the role ids to assign (already validated)
+     * @return the inserted user with its roles
+     */
+    Mono<AccessUser> insertUser(
+            String username, String passwordHash, String displayName, List<String> roleIds);
+
+    /**
+     * Updates a user's enabled flag and bumps {@code token_version} in the same statement, so every
+     * token issued before the change is rejected.
+     *
+     * @param id the user id
+     * @param enabled the new flag
+     * @return completion
+     */
+    Mono<Void> updateUserStatus(String id, boolean enabled);
+
+    /**
+     * Replaces a user's password hash and bumps {@code token_version} in the same statement.
+     *
+     * @param id the user id
+     * @param passwordHash the new BCrypt hash
+     * @return completion
+     */
+    Mono<Void> updateUserPassword(String id, String passwordHash);
+
+    /**
+     * Replaces one user's role assignments.
+     *
+     * <p>Deletes every assignment of the user, then inserts the given ones. Both must run in the
+     * caller's transaction so the set is replaced atomically.
+     *
+     * @param userId the user id
+     * @param roleIds the complete new set (already validated)
+     * @return completion
+     */
+    Mono<Void> replaceUserRoles(String userId, List<String> roleIds);
+
+    /**
+     * Lists the ids of every enabled user, for the last-administrator lockout check.
+     *
+     * @return the enabled user ids
+     */
+    Mono<List<String>> enabledUserIds();
+
+    /**
      * Appends one audit row.
      *
      * @param actorId the acting user id
      * @param action the action key ({@code role.create}, {@code role.update}, {@code role.disable},
-     *     {@code role.permissions}, {@code data_scope.upsert}, {@code data_scope.delete})
-     * @param entityType the entity type ({@code ROLE}, {@code DATA_SCOPE})
-     * @param entityId the affected role id, or {@code null}
+     *     {@code role.permissions}, {@code data_scope.upsert}, {@code data_scope.delete}, {@code
+     *     user.create}, {@code user.enable}, {@code user.disable}, {@code user.password_reset}, {@code
+     *     user.roles})
+     * @param entityType the entity type ({@code ROLE}, {@code DATA_SCOPE}, {@code USER})
+     * @param entityId the affected id, or {@code null}
      * @param beforeJson the serialized before state, or {@code null}
      * @param afterJson the serialized after state, or {@code null}
      * @param result {@code SUCCESS} or {@code DENIED}

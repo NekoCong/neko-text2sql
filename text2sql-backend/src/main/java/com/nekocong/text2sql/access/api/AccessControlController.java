@@ -3,11 +3,17 @@ package com.nekocong.text2sql.access.api;
 import com.nekocong.text2sql.access.AccessAdminService;
 import com.nekocong.text2sql.access.DataScopeService;
 import com.nekocong.text2sql.access.RolePermissionService;
+import com.nekocong.text2sql.access.UserAdminService;
 import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
 import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
 import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
+import com.nekocong.text2sql.access.api.dto.AccessUserView;
 import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
 import com.nekocong.text2sql.access.api.dto.DataScopeView;
 import java.util.List;
@@ -58,9 +64,12 @@ public class AccessControlController {
 
     private static final String DATA_SCOPES = "/api/admin/access-control/data-scopes";
 
+    private static final String USERS = "/api/admin/access-control/users";
+
     private final AccessAdminService service;
     private final RolePermissionService permissions;
     private final DataScopeService dataScopes;
+    private final UserAdminService users;
 
     /**
      * Creates the controller.
@@ -68,14 +77,17 @@ public class AccessControlController {
      * @param service the role administration service
      * @param permissions the permission catalog and role-permission matrix service
      * @param dataScopes the data-scope policy service
+     * @param users the user lifecycle service
      */
     public AccessControlController(
             AccessAdminService service,
             RolePermissionService permissions,
-            DataScopeService dataScopes) {
+            DataScopeService dataScopes,
+            UserAdminService users) {
         this.service = service;
         this.permissions = permissions;
         this.dataScopes = dataScopes;
+        this.users = users;
     }
 
     /**
@@ -213,9 +225,88 @@ public class AccessControlController {
         return actorId().flatMap(actor -> dataScopes.delete(actor, id));
     }
 
+    /**
+     * Lists users, ordered by username.
+     *
+     * @param query the case-insensitive username/display-name filter, or omitted for all
+     * @param enabled keep only enabled/disabled users, or omitted for both
+     * @param roleId keep only users directly assigned that role, or omitted for all
+     * @return the users
+     */
+    @GetMapping(path = USERS)
+    public Mono<List<AccessUserView>> listUsers(
+            @RequestParam(required = false) String query,
+            @RequestParam(required = false) Boolean enabled,
+            @RequestParam(required = false) String roleId) {
+        return users.list(query, enabled, roleId);
+    }
+
+    /**
+     * Creates a user.
+     *
+     * @param request the user
+     * @return the created user
+     */
+    @PostMapping(path = USERS)
+    @ResponseStatus(HttpStatus.CREATED)
+    public Mono<AccessUserView> createUser(@RequestBody(required = false) AccessUserCreateRequest request) {
+        return actorId()
+                .flatMap(actor -> users.create(actor, request))
+                .onErrorMap(AccessControlController::asStatusException);
+    }
+
+    /**
+     * Enables or disables a user.
+     *
+     * @param id the user id
+     * @param request the new status
+     * @return the updated user
+     */
+    @PutMapping(path = USERS + "/{id}/status")
+    public Mono<AccessUserView> updateUserStatus(
+            @PathVariable String id, @RequestBody(required = false) AccessUserStatusRequest request) {
+        return actorId()
+                .flatMap(actor -> users.updateStatus(actor, id, request))
+                .onErrorMap(AccessControlController::asStatusException);
+    }
+
+    /**
+     * Resets a user's password.
+     *
+     * @param id the user id
+     * @param request the new password
+     * @return no content
+     */
+    @PostMapping(path = USERS + "/{id}/reset-password")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public Mono<Void> resetPassword(
+            @PathVariable String id, @RequestBody(required = false) AccessUserPasswordRequest request) {
+        return actorId()
+                .flatMap(actor -> users.resetPassword(actor, id, request))
+                .onErrorMap(AccessControlController::asStatusException);
+    }
+
+    /**
+     * Replaces a user's role assignments.
+     *
+     * @param id the user id
+     * @param request the complete new set
+     * @return the updated user
+     */
+    @PutMapping(path = USERS + "/{id}/roles")
+    public Mono<AccessUserView> replaceUserRoles(
+            @PathVariable String id, @RequestBody(required = false) AccessUserRolesRequest request) {
+        return actorId()
+                .flatMap(actor -> users.replaceRoles(actor, id, request))
+                .onErrorMap(AccessControlController::asStatusException);
+    }
+
     /** Converts the service's audited rejection into the status exception the handler renders. */
     private static Throwable asStatusException(Throwable error) {
         ResponseStatusException mapped = AccessAdminService.toResponseStatusException(error);
+        if (mapped == null) {
+            mapped = UserAdminService.toResponseStatusException(error);
+        }
         return mapped == null ? error : mapped;
     }
 

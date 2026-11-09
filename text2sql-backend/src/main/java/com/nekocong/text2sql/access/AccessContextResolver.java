@@ -34,6 +34,29 @@ public class AccessContextResolver {
     }
 
     /**
+     * Computes the effective permission keys of one user id, reusing the same roles-of + inheritance
+     * + permission-keys query path as {@link #resolve} but without the account enabled/token-version
+     * gate.
+     *
+     * <p>Used by the user-admin lockout rule, which must ask "does this user hold {@code
+     * access.manage}, directly or through inherited roles?" without failing on a disabled or stale
+     * account. An unknown user, or a user without enabled roles, resolves to an empty set (fails
+     * closed).
+     *
+     * @param userId the user id
+     * @return the effective permission keys
+     */
+    public Mono<Set<String>> effectivePermissions(String userId) {
+        return repository
+                .rolesOf(userId)
+                .zipWith(repository.allRoles())
+                .flatMap(
+                        roles ->
+                                repository.permissionKeys(
+                                        effectiveRoleIds(roles.getT1(), roles.getT2())));
+    }
+
+    /**
      * Resolves the caller's effective access.
      *
      * @param userId the authenticated user id
@@ -85,13 +108,31 @@ public class AccessContextResolver {
         for (AccessRole role : all) {
             byId.put(role.id(), role);
         }
+        return effectiveRoleIds(direct, all).stream()
+                .map(byId::get)
+                .filter(Objects::nonNull)
+                .toList();
+    }
+
+    /**
+     * Computes the ids of the enabled direct roles plus their enabled ancestors, rejecting cycles.
+     *
+     * <p>The single inheritance walk shared by {@link #resolve} and {@link #effectivePermissions},
+     * so the lockout rule never reimplements it.
+     */
+    private static List<String> effectiveRoleIds(
+            List<AccessRole> direct, List<AccessRole> all) {
+        Map<String, AccessRole> byId = new HashMap<>();
+        for (AccessRole role : all) {
+            byId.put(role.id(), role);
+        }
         Set<String> ids = new LinkedHashSet<>();
         for (AccessRole role : direct) {
             if (role.enabled()) {
                 addWithParents(role, byId, ids, new LinkedHashSet<>());
             }
         }
-        return ids.stream().map(byId::get).filter(Objects::nonNull).toList();
+        return List.copyOf(ids);
     }
 
     private static void addWithParents(

@@ -1,6 +1,10 @@
 package com.nekocong.text2sql.access;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.UUID;
 import org.springframework.r2dbc.core.DatabaseClient;
 import org.springframework.stereotype.Repository;
@@ -17,6 +21,12 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
 
     private static final String ROLE_COLUMNS =
             "id, code, name, description, parent_id, built_in, enabled";
+
+    private static final String USER_ROLE_COLUMNS =
+            "r.id, r.code, r.name, r.description, r.parent_id, r.built_in, r.enabled";
+
+    private static final String USER_COLUMNS =
+            "u.id, u.username, u.display_name, u.enabled, u.created_at";
 
     private static final String DATA_SCOPE_COLUMNS =
             "id, role_id, datasource_id, table_name, policy, column_name, principal_attribute";
@@ -235,6 +245,115 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
     }
 
     @Override
+    public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
+        boolean hasQuery = query != null && !query.isBlank();
+        boolean hasEnabled = enabled != null;
+        boolean hasRole = roleId != null && !roleId.isBlank();
+        List<String> where = new ArrayList<>();
+        if (hasQuery) {
+            where.add("(LOWER(u.username) LIKE :query OR LOWER(u.display_name) LIKE :query)");
+        }
+        if (hasEnabled) {
+            where.add("u.enabled = :enabled");
+        }
+        if (hasRole) {
+            where.add(
+                    "EXISTS (SELECT 1 FROM access_user_role ur"
+                            + " WHERE ur.user_id = u.id AND ur.role_id = :roleId)");
+        }
+        StringBuilder sql = new StringBuilder("SELECT " + USER_COLUMNS + " FROM app_user u");
+        if (!where.isEmpty()) {
+            sql.append(" WHERE ").append(String.join(" AND ", where));
+        }
+        sql.append(" ORDER BY u.username");
+
+        DatabaseClient.GenericExecuteSpec spec = client.sql(sql.toString());
+        if (hasQuery) {
+            spec = spec.bind("query", "%" + query.trim().toLowerCase(Locale.ROOT) + "%");
+        }
+        if (hasEnabled) {
+            spec = spec.bind("enabled", enabled);
+        }
+        if (hasRole) {
+            spec = spec.bind("roleId", roleId.trim());
+        }
+        return spec.map((row, meta) -> baseUser(row)).all().collectList().flatMap(this::attachRoles);
+    }
+
+    @Override
+    public Mono<AccessUser> user(String id) {
+        return client.sql("SELECT " + USER_COLUMNS + " FROM app_user u WHERE u.id = :id")
+                .bind("id", id)
+                .map((row, meta) -> baseUser(row))
+                .one()
+                .flatMap(this::withRoles);
+    }
+
+    @Override
+    public Mono<AccessUser> userByUsername(String username) {
+        return client.sql("SELECT " + USER_COLUMNS + " FROM app_user u WHERE u.username = :username")
+                .bind("username", username)
+                .map((row, meta) -> baseUser(row))
+                .one()
+                .flatMap(this::withRoles);
+    }
+
+    @Override
+    public Mono<AccessUser> insertUser(
+            String username, String passwordHash, String displayName, List<String> roleIds) {
+        String id = UUID.randomUUID().toString();
+        long now = System.currentTimeMillis();
+        // role, enabled and token_version are left to the column defaults ('student' / TRUE / 0).
+        DatabaseClient.GenericExecuteSpec spec =
+                client.sql("INSERT INTO app_user"
+                                + " (id, username, password_hash, display_name, created_at)"
+                                + " VALUES (:id, :username, :passwordHash, :displayName, :createdAt)")
+                        .bind("id", id)
+                        .bind("username", username)
+                        .bind("passwordHash", passwordHash)
+                        .bind("createdAt", now);
+        spec = bindNullable(spec, "displayName", displayName);
+        return spec.then().then(assignRoles(id, roleIds)).then(user(id));
+    }
+
+    @Override
+    public Mono<Void> updateUserStatus(String id, boolean enabled) {
+        return client.sql(
+                        "UPDATE app_user SET enabled = :enabled, token_version = token_version + 1"
+                                + " WHERE id = :id")
+                .bind("id", id)
+                .bind("enabled", enabled)
+                .then();
+    }
+
+    @Override
+    public Mono<Void> updateUserPassword(String id, String passwordHash) {
+        return client.sql(
+                        "UPDATE app_user SET password_hash = :passwordHash,"
+                                + " token_version = token_version + 1 WHERE id = :id")
+                .bind("id", id)
+                .bind("passwordHash", passwordHash)
+                .then();
+    }
+
+    @Override
+    public Mono<Void> replaceUserRoles(String userId, List<String> roleIds) {
+        Mono<Void> delete =
+                client.sql("DELETE FROM access_user_role WHERE user_id = :userId")
+                        .bind("userId", userId)
+                        .then();
+        return delete.then(assignRoles(userId, roleIds));
+    }
+
+    @Override
+    public Mono<List<String>> enabledUserIds() {
+        return client.sql("SELECT id FROM app_user WHERE enabled = TRUE")
+                .map((row, meta) -> row.get("id", String.class))
+                .all()
+                .collectList();
+    }
+
+    @Override
     public Mono<Void> record(
             String actorId,
             String action,
@@ -267,6 +386,102 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
             DatabaseClient.GenericExecuteSpec spec, String name, String value) {
         return value == null ? spec.bindNull(name, String.class) : spec.bind(name, value);
     }
+
+    /** The account columns of a user row, without its roles. */
+    private static UserBase baseUser(io.r2dbc.spi.Row row) {
+        return new UserBase(
+                row.get("id", String.class),
+                row.get("username", String.class),
+                row.get("display_name", String.class),
+                Boolean.TRUE.equals(row.get("enabled", Boolean.class)),
+                row.get("created_at", Long.class) == null ? 0L : row.get("created_at", Long.class));
+    }
+
+    /** Attaches directly assigned roles to a single user. */
+    private Mono<AccessUser> withRoles(UserBase base) {
+        return attachRoles(List.of(base)).map(list -> list.get(0));
+    }
+
+    /**
+     * Attaches directly assigned roles to a list of users with one follow-up query, keyed by user id.
+     * Roles are ordered by code for a stable view.
+     */
+    private Mono<List<AccessUser>> attachRoles(List<UserBase> users) {
+        if (users.isEmpty()) {
+            return Mono.just(List.of());
+        }
+        List<String> ids = users.stream().map(UserBase::id).toList();
+        String sql = "SELECT ur.user_id, " + USER_ROLE_COLUMNS
+                + " FROM access_role r"
+                + " JOIN access_user_role ur ON ur.role_id = r.id"
+                + " WHERE ur.user_id IN (" + placeholders(ids.size()) + ")"
+                + " ORDER BY r.code";
+        return bind(client.sql(sql), ids)
+                .map((row, meta) -> new UserRole(row.get("user_id", String.class), role(row)))
+                .all()
+                .collectList()
+                .map(rows -> {
+                    Map<String, List<AccessRole>> byUser = new HashMap<>();
+                    for (UserRole row : rows) {
+                        byUser.computeIfAbsent(row.userId, key -> new ArrayList<>()).add(row.role);
+                    }
+                    return users.stream()
+                            .map(base -> new AccessUser(
+                                    base.id,
+                                    base.username,
+                                    base.displayName,
+                                    base.enabled,
+                                    base.createdAt,
+                                    byUser.getOrDefault(base.id, List.of())))
+                            .toList();
+                });
+    }
+
+    /** Inserts the given role assignments (de-duplicated by the caller). */
+    private Mono<Void> assignRoles(String userId, List<String> roleIds) {
+        if (roleIds == null || roleIds.isEmpty()) {
+            return Mono.empty();
+        }
+        Mono<Void> insert = Mono.empty();
+        for (String roleId : List.copyOf(roleIds)) {
+            insert =
+                    insert.then(
+                            client.sql("INSERT INTO access_user_role (user_id, role_id, created_at)"
+                                            + " VALUES (:userId, :roleId, :createdAt)")
+                                    .bind("userId", userId)
+                                    .bind("roleId", roleId)
+                                    .bind("createdAt", System.currentTimeMillis())
+                                    .then());
+        }
+        return insert;
+    }
+
+    private static String placeholders(int count) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < count; i++) {
+            if (i > 0) {
+                builder.append(',');
+            }
+            builder.append(":uid").append(i);
+        }
+        return builder.toString();
+    }
+
+    private static DatabaseClient.GenericExecuteSpec bind(
+            DatabaseClient.GenericExecuteSpec spec, List<String> ids) {
+        DatabaseClient.GenericExecuteSpec bound = spec;
+        for (int i = 0; i < ids.size(); i++) {
+            bound = bound.bind("uid" + i, ids.get(i));
+        }
+        return bound;
+    }
+
+    /** A user's account columns, before its roles are attached. */
+    private record UserBase(
+            String id, String username, String displayName, boolean enabled, long createdAt) {}
+
+    /** One role assignment row from the follow-up join. */
+    private record UserRole(String userId, AccessRole role) {}
 
     private static AccessRole role(io.r2dbc.spi.Row row) {
         return new AccessRole(
