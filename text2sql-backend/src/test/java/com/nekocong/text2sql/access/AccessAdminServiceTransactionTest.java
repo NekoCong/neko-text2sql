@@ -96,6 +96,53 @@ class AccessAdminServiceTransactionTest {
         assertThat(auditCount(actorId)).isEqualTo(1);
     }
 
+    /**
+     * A serializer that blows up while writing a DENIED payload must not turn the 409/404 into a 500
+     * and must not drop the row: the rejection's status still reaches the caller and the row is
+     * written with a {@code null} payload.
+     */
+    @Test
+    void anUnserializableDeniedPayloadStillRecordsTheRowAndKeepsTheStatus() {
+        ObjectMapper broken =
+                new ObjectMapper() {
+                    @Override
+                    public String writeValueAsString(Object value)
+                            throws com.fasterxml.jackson.core.JsonProcessingException {
+                        throw new com.fasterxml.jackson.core.JsonProcessingException("boom") {};
+                    }
+                };
+        AccessAdminService brokenService =
+                new AccessAdminService(repository, transactionManager, broken);
+
+        String unknown = UUID.randomUUID().toString();
+        // Unknown role -> 404 denial whose payload cannot be serialized.
+        assertThatThrownBy(
+                        () ->
+                                brokenService
+                                        .update(
+                                                actorId,
+                                                unknown,
+                                                new AccessRoleRequest(null, "x", null, null, null))
+                                        .block())
+                // The rejection stays a denial (the controller maps it), not a 500 from serialization.
+                .satisfies(
+                        error ->
+                                assertThat(AccessAdminService.toResponseStatusException(error))
+                                        .isNotNull()
+                                        .extracting(
+                                                e ->
+                                                        ((org.springframework.web.server
+                                                                        .ResponseStatusException)
+                                                                e)
+                                                                .getStatusCode()
+                                                                .value())
+                                        .isEqualTo(404));
+
+        assertThat(auditCount(actorId))
+                .as("the DENIED row is written even though its payload was null")
+                .isEqualTo(1);
+    }
+
     /** Wraps the repository so only {@code record} fails, after any mutation statement has run. */
     private static AccessAdminRepository failingAudit(AccessAdminRepository delegate) {
         return new AccessAdminRepository() {

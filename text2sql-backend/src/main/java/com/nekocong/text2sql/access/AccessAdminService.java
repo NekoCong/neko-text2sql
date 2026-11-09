@@ -45,10 +45,19 @@ import reactor.core.publisher.Mono;
  * also rolls the mutation back. A rejected mutation writes exactly one {@code DENIED} row in its own
  * transaction before the rejection is returned.
  *
- * <p>Request validation that runs before a role or parent can be identified (a malformed code, a
- * missing name, an oversized description, a malformed path id) writes no audit row: there is no
- * entity to reference. Every rejection that names an existing entity, or a parent id supplied by the
- * client, is audited.
+ * <p>Not every rejection is audited, and the rule is <em>validation first, audit second</em>:
+ *
+ * <ul>
+ *   <li>Field validation (a malformed code, a missing or over-long name, an oversized description, a
+ *       malformed path id) fails with {@code 400} before the target entity is even loaded, so it
+ *       writes no row — there is no entity to attribute the attempt to.
+ *   <li>Every rejection decided <em>against a loaded entity</em> is audited as {@code DENIED}: an
+ *       unknown role id, an unknown or forbidden parent, a cycle, an immutable code change, a
+ *       duplicate code, and disabling the built-in administrator.
+ * </ul>
+ *
+ * <p>So a {@code 400} on an existing role is not audited; it is a malformed request rather than a
+ * denial of an identifiable change. The audit trail records attempts that reached the entity.
  */
 @Service
 public class AccessAdminService {
@@ -159,7 +168,7 @@ public class AccessAdminService {
                                                             existing.id(),
                                                             null,
                                                             requested,
-                                                            REASON_DUPLICATE_CODE))
+                                                            new Denial(REASON_DUPLICATE_CODE, HttpStatus.CONFLICT)))
                                     .switchIfEmpty(
                                             Mono.defer(
                                                     () -> insert(actorId, requested)))
@@ -180,7 +189,7 @@ public class AccessAdminService {
                                                 requested.parentId(),
                                                 null,
                                                 requested,
-                                                denial.getMessage())
+                                                denial)
                                         .then())
                 .then(
                         Mono.defer(
@@ -229,7 +238,7 @@ public class AccessAdminService {
                                                                             body.parentId(),
                                                                             false,
                                                                             body.enabled()),
-                                                                    REASON_ROLE_MISSING)))
+                                                                    new Denial(REASON_ROLE_MISSING, HttpStatus.NOT_FOUND))))
                                     .flatMap(before -> update(actorId, before, body))
                                     .map(AccessRoleView::of);
                         })
@@ -257,7 +266,7 @@ public class AccessAdminService {
                             body.parentId(),
                             before.builtIn(),
                             body.enabled()),
-                    REASON_IMMUTABLE_CODE);
+                    new Denial(REASON_IMMUTABLE_CODE, HttpStatus.CONFLICT));
         }
         boolean enabled = body.enabled() == null ? before.enabled() : body.enabled();
         if (before.builtIn() && Roles.ADMIN.equals(before.code()) && !enabled) {
@@ -274,7 +283,7 @@ public class AccessAdminService {
                             before.parentId(),
                             true,
                             false),
-                    REASON_BUILT_IN_ADMIN);
+                    new Denial(REASON_BUILT_IN_ADMIN, HttpStatus.CONFLICT));
         }
         return applyUpdate(actorId, before, body);
     }
@@ -314,7 +323,7 @@ public class AccessAdminService {
                                                 before.id(),
                                                 before,
                                                 requested,
-                                                denial.getMessage())
+                                                denial)
                                         .then())
                 .then(
                         Mono.defer(
@@ -517,7 +526,7 @@ public class AccessAdminService {
     }
 
     /**
-     * Appends a DENIED row for a rejected mutation, then fails with the matching HTTP status.
+     * Appends a DENIED row for a rejected mutation, then fails with that rejection.
      *
      * <p>Runs in its own nested transaction so the row survives the outer mutation transaction
      * rolling back with the rejection.
@@ -528,8 +537,7 @@ public class AccessAdminService {
             String entityId,
             AccessRole before,
             AccessRole requested,
-            String reason) {
-        Denial denial = new Denial(reason, statusFor(reason));
+            Denial denial) {
         Mono<Void> record =
                 repository
                         .record(
@@ -537,10 +545,10 @@ public class AccessAdminService {
                                 action,
                                 ENTITY_TYPE,
                                 entityId,
-                                json(before),
-                                json(requested),
+                                jsonForDenial(before),
+                                jsonForDenial(requested),
                                 RESULT_DENIED,
-                                truncate(reason))
+                                truncate(denial.getMessage()))
                         .onErrorResume(
                                 error -> {
                                     log.error(
@@ -554,10 +562,21 @@ public class AccessAdminService {
         return record.as(newTransactions::transactional).then(Mono.error(denial));
     }
 
-    private static HttpStatus statusFor(String reason) {
-        return REASON_PARENT_MISSING.equals(reason) || REASON_ROLE_MISSING.equals(reason)
-                ? HttpStatus.NOT_FOUND
-                : HttpStatus.CONFLICT;
+    /**
+     * Serializes an audit payload for a <em>rejected</em> request.
+     *
+     * <p>Unlike the success path, this must never fail: the rejection's status (409/404) has to reach
+     * the client and the DENIED row must still be written. A serialization failure is logged and the
+     * payload is written as {@code null} rather than turning the response into a 500 or dropping the
+     * row.
+     */
+    private String jsonForDenial(AccessRole role) {
+        try {
+            return json(role);
+        } catch (IllegalStateException ex) {
+            log.warn("Failed to serialize the DENIED audit payload; storing null instead", ex);
+            return null;
+        }
     }
 
     private static String actionFor(AccessRole before, boolean enabled) {
@@ -641,7 +660,4 @@ public class AccessAdminService {
         return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
     }
 
-    private static ResponseStatusException notFound(String message) {
-        return new ResponseStatusException(HttpStatus.NOT_FOUND, message);
-    }
 }

@@ -124,6 +124,38 @@ class ConversationControllerTest {
                 .isNotFound();
     }
 
+    /**
+     * Guards the shared error contract: a {@link ResponseStatusException} from an unrelated endpoint
+     * keeps Spring's default body ({@code timestamp/status/error/message/path}), not the
+     * {@code {status, message}} shape the role admin API uses. If a global
+     * {@code @ExceptionHandler(ResponseStatusException.class)} is ever added to the application advice
+     * again, this fails.
+     */
+    @Test
+    void unknownConversationKeepsTheDefaultErrorBodyShape() {
+        String id = createConversation();
+        String otherToken = TestAuth.registerAndLogin(client);
+
+        client.get()
+                .uri("/api/conversations/{id}/messages", id)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + otherToken)
+                .exchange()
+                .expectStatus()
+                .isNotFound()
+                .expectBody()
+                // The default Spring error body carries these; the role API's shape does not.
+                .jsonPath("$.timestamp")
+                .exists()
+                .jsonPath("$.status")
+                .isEqualTo(404)
+                .jsonPath("$.error")
+                .isEqualTo("Not Found")
+                .jsonPath("$.path")
+                .exists()
+                .jsonPath("$.message")
+                .doesNotExist();
+    }
+
     @Test
     void historyEmbedsRowsAndChartAsRealJson() {
         String id = createConversation();
