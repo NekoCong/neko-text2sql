@@ -254,7 +254,7 @@ public class Text2SqlController {
     }
 
     private static ServerSentEvent<String> sse(String event, String data) {
-        return ServerSentEvent.<String>builder(data).event(event).build();
+        return ServerSentEvent.builder(data).event(event).build();
     }
 
     private String json(Object value) {
