@@ -274,10 +274,11 @@ set MINERU_TOKEN=...
 （`file-urls/batch` → PUT → 轮询 → `full_zip_url`），产出 `full.md`、规范化 `content.json`
 与图片，`page_idx+1` 作为 1-based 页码，bbox 保持 0–1000 归一化。
 
-管理员界面：`/knowledge`（顶部导航「知识库」，`meta.admin` 守卫）。页面提供三类分栏、条目 CRUD、
-元数据同步、文档上传/网页导入、解析状态与失败重试、术语映射、检索调试，以及原文预览高亮。
+管理员界面：`/knowledge`（顶部导航「知识库」，`access.manage` 权限守卫；`/api/text2sql/knowledge/**`
+同样要求 `access.manage`，旧接口 `/api/text2sql/knowledge/legacy/**` 仍只要求登录）。页面提供三类分栏、
+条目 CRUD、元数据同步、文档上传/网页导入、解析状态与失败重试、术语映射、检索调试，以及原文预览高亮。
 
-管理接口（全部要求管理员）：
+管理接口（全部要求 `access.manage`）：
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
