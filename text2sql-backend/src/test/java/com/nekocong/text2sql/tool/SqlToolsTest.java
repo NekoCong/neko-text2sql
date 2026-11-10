@@ -2,6 +2,7 @@ package com.nekocong.text2sql.tool;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
@@ -41,6 +42,9 @@ class SqlToolsTest {
     @Autowired
     private DatasourceAccessGuard guard;
 
+    @Autowired
+    private ObjectMapper objectMapper;
+
     private SqlTools tools(AtomicReference<DataScope> captured) {
         Text2SqlPipelineService stub =
                 new Text2SqlPipelineService(null, null, null, null, null, null, null, null, null) {
@@ -73,6 +77,43 @@ class SqlToolsTest {
 
         assertThat(captured.get()).isSameAs(scope);
         assertThat(json).contains("\"sql\":\"SELECT 1\"");
+    }
+
+    @Test
+    void queryDatabaseWrapsTheResultWithTheRangeMetadata() throws Exception {
+        DataScope scope = studentScope();
+
+        JsonNode json =
+                objectMapper.readTree(
+                        tools(new AtomicReference<>())
+                                .queryDatabase("我的成绩", null, scope, ExecutionListener.noop()));
+
+        // The SQL stays where the model already reads it: inside the result envelope.
+        assertThat(json.get("result").get("sql").asText()).isEqualTo("SELECT 1");
+        assertThat(json.get("result").get("result").get("rowCount").asInt()).isZero();
+        JsonNode dataScope = json.get("dataScope");
+        assertThat(dataScope.get("restricted").asBoolean()).isTrue();
+        assertThat(dataScope.get("role").asText()).isEqualTo("student");
+        assertThat(dataScope.get("summary").asText())
+                .isEqualTo("学生（仅本人：学号 2023001，班级 1）")
+                // Nothing outside the caller's own range leaks into the metadata.
+                .doesNotContain("2 班")
+                .doesNotContain("2023002")
+                .doesNotContain("class");
+    }
+
+    @Test
+    void queryDatabaseReportsAnUnrestrictedRangeForAnAdmin() throws Exception {
+        JsonNode json =
+                objectMapper.readTree(
+                        tools(new AtomicReference<>())
+                                .queryDatabase("所有人", null, AccessFixtures.admin(), ExecutionListener.noop()));
+
+        JsonNode dataScope = json.get("dataScope");
+        assertThat(dataScope.get("restricted").asBoolean()).isFalse();
+        assertThat(dataScope.get("role").asText()).isEqualTo("admin");
+        assertThat(dataScope.get("summary").asText()).isEqualTo("全量数据，不受范围限制");
+        assertThat(json.get("result").get("sql").asText()).isEqualTo("SELECT 1");
     }
 
     @Test

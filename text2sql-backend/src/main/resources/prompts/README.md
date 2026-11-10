@@ -6,7 +6,7 @@
 
 | 文件 | 用途 | 占位符 |
 |------|------|--------|
-| `agent-system.md` | AgentScope Agent 的系统提示词（人格） | — |
+| `agent-system.md` | AgentScope Agent 的系统提示词（人格 + 调用者数据范围） | `{{data_scope}}` |
 | `nl2sql-system.md` | 确定性 NL2SQL 流水线的系统提示词 | `{{dialect}}` |
 | `nl2sql-user.md` | NL2SQL 用户提示词（注入 schema 与问题） | `{{dialect}}` `{{schema}}` `{{question}}` |
 

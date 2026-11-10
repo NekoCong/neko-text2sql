@@ -27,4 +27,18 @@ class HarnessAgentFactorySubagentsTest {
                 .containsExactly("schema_explorer", "sql_runner", "report_writer");
         assertThat(declarations).allSatisfy(d -> assertThat(d.getDescription()).isNotBlank());
     }
+
+    @Test
+    void theSqlRunnerReadsSqlAndRowsFromTheResultEnvelope() {
+        SubagentDeclaration runner =
+                factory.subagentDeclarations().stream()
+                        .filter(d -> "sql_runner".equals(d.getName()))
+                        .findFirst()
+                        .orElseThrow();
+
+        assertThat(runner.getInlineAgentsBody())
+                .contains("result")
+                .contains("dataScope")
+                .contains("result.result");
+    }
 }

@@ -14,12 +14,15 @@ import com.nekocong.text2sql.nl2sql.Text2SqlResult;
 import com.nekocong.text2sql.security.DataScope;
 import com.nekocong.text2sql.security.DataScopeResolver;
 import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.security.ScopeAnswerGuard;
 import com.nekocong.text2sql.security.TokenClaims;
 import com.nekocong.text2sql.service.ConversationService;
 import com.nekocong.text2sql.service.Text2SqlAgentService;
 import com.nekocong.text2sql.service.Text2SqlPipelineService;
+import io.agentscope.core.event.AgentEvent;
 import io.agentscope.core.event.TextBlockDeltaEvent;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
@@ -45,12 +48,19 @@ import reactor.core.publisher.Mono;
 @RequestMapping("/api/text2sql")
 public class Text2SqlController {
 
+    /** SSE event carrying one token (or the appended range clarification) of the answer. */
+    static final String DELTA = "delta";
+
+    /** SSE event terminating the agent stream; always the last event. */
+    static final String DONE = "done";
+
     private final Text2SqlPipelineService pipeline;
     private final Text2SqlAgentService agentService;
     private final ConversationService conversations;
     private final DataScopeResolver scopes;
     private final AgentEventPresenter presenter;
     private final ObjectMapper objectMapper;
+    private final ScopeAnswerGuard answerGuard = new ScopeAnswerGuard();
 
     /**
      * Creates the controller.
@@ -180,11 +190,44 @@ public class Text2SqlController {
                 .resolve(userId, jwt.getClaimAsString(Roles.CLAIM), TokenClaims.tokenVersion(jwt))
                 .flatMapMany(
                         scope ->
-                                agentService
-                                        .stream(message, scopedSessionId, scope)
-                                        .flatMap(event -> Mono.justOrEmpty(presenter.present(event))))
-                .concatWith(Mono.just(sse("done", "[DONE]")))
+                                agentStream(scope, agentService.stream(message, scopedSessionId, scope)))
                 .onErrorResume(ex -> Flux.just(sse("error", errorMessage(ex))));
+    }
+
+    /**
+     * Maps the agent events onto SSE, appending the data-scope clarification (when the guard asks
+     * for one) before the terminating {@code done} event.
+     *
+     * <p>Only the answer text is accumulated, never buffered as a whole: each {@code delta} is
+     * forwarded as it arrives, so the stream keeps its incremental behaviour. Package-private so the
+     * ordering contract can be tested without an agent or a model.
+     *
+     * @param scope the caller's data scope
+     * @param events the agent's event stream
+     * @return the SSE stream, ending with exactly one {@code done}
+     */
+    Flux<ServerSentEvent<String>> agentStream(DataScope scope, Flux<AgentEvent> events) {
+        StringBuilder answer = new StringBuilder();
+        return events
+                .flatMap(
+                        event -> {
+                            Optional<ServerSentEvent<String>> presented = presenter.present(event);
+                            presented.ifPresent(
+                                    sse -> {
+                                        if (DELTA.equals(sse.event()) && sse.data() != null) {
+                                            answer.append(sse.data());
+                                        }
+                                    });
+                            return Mono.justOrEmpty(presented);
+                        })
+                .concatWith(Mono.defer(() -> clarificationEvent(scope, answer.toString())))
+                .concatWith(Mono.just(sse(DONE, "[DONE]")));
+    }
+
+    /** The clarification delta the guard asks for, or nothing when the answer is already scoped. */
+    private Mono<ServerSentEvent<String>> clarificationEvent(DataScope scope, String answer) {
+        String clarification = answerGuard.clarification(scope, answer);
+        return clarification == null ? Mono.empty() : Mono.just(sse(DELTA, clarification));
     }
 
     /**

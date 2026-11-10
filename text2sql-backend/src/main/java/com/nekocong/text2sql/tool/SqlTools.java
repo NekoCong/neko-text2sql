@@ -10,6 +10,7 @@ import com.nekocong.text2sql.schema.SchemaIntrospector;
 import com.nekocong.text2sql.schema.SchemaRenderer;
 import com.nekocong.text2sql.schema.model.TableSchema;
 import com.nekocong.text2sql.security.DataScope;
+import com.nekocong.text2sql.security.DataScopeDescriber;
 import com.nekocong.text2sql.security.TablePolicy;
 import com.nekocong.text2sql.service.Text2SqlPipelineService;
 import io.agentscope.core.tool.Tool;
@@ -42,6 +43,7 @@ public class SqlTools {
     private final TablePolicy policy;
     private final DatasourceAccessGuard datasourceGuard;
     private final ObjectMapper objectMapper;
+    private final DataScopeDescriber describer = new DataScopeDescriber();
 
     /**
      * Creates the tools.
@@ -142,8 +144,9 @@ public class SqlTools {
             name = "query_database",
             description =
                     "Answer a natural-language data question by generating and executing a read-only "
-                            + "SQL query, returning the SQL and result rows as JSON. Prefer this over "
-                            + "writing SQL yourself.",
+                            + "SQL query. Returns JSON {\"result\": {sql, result, chart, ...}, "
+                            + "\"dataScope\": {restricted, role, summary}}: read the SQL and rows from "
+                            + "result and the range from dataScope. Prefer this over writing SQL yourself.",
             readOnly = true,
             concurrencySafe = false)
     public String queryDatabase(
@@ -158,9 +161,11 @@ public class SqlTools {
             ExecutionListener listener) {
         Text2SqlResult result = pipeline.runBlocking(scope, datasourceId, question, listener);
         try {
-            return objectMapper.writeValueAsString(result);
+            return objectMapper.writeValueAsString(ScopedQueryResult.of(result, scope, describer));
         } catch (JsonProcessingException ex) {
-            return "{\"sql\":\"" + result.sql().replace("\"", "'") + "\",\"error\":\"failed to serialize result\"}";
+            return "{\"result\":{\"sql\":\""
+                    + result.sql().replace("\"", "'")
+                    + "\",\"error\":\"failed to serialize result\"}}";
         }
     }
 

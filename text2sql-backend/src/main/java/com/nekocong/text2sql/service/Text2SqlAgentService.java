@@ -70,7 +70,7 @@ public class Text2SqlAgentService {
                                             ctx.put(ExecutionListener.class, side.listener());
                                             return side.merge(
                                                     agentFactory
-                                                            .create(model)
+                                                            .create(model, scope)
                                                             .streamEvents(new UserMessage(message), ctx));
                                         }))
                 .subscribeOn(Schedulers.boundedElastic());

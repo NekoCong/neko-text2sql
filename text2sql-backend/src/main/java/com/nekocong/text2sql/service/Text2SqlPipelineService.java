@@ -21,6 +21,7 @@ import com.nekocong.text2sql.nl2sql.Text2SqlEvent;
 import com.nekocong.text2sql.nl2sql.Text2SqlResult;
 import com.nekocong.text2sql.schema.SchemaProvider;
 import com.nekocong.text2sql.security.DataScope;
+import com.nekocong.text2sql.security.DataScopeDescriber;
 import com.nekocong.text2sql.sql.DataScopeRewriter;
 import com.nekocong.text2sql.sql.SqlExecutor;
 import com.nekocong.text2sql.sql.SqlSafetyValidator;
@@ -334,41 +335,20 @@ public class Text2SqlPipelineService {
     }
 
     /**
+     * The caller block injected into the generation prompt, shared with the agent prompt so the two
+     * paths describe a scope identically.
+     */
+    private static final DataScopeDescriber DESCRIBER = new DataScopeDescriber();
+
+    /**
      * Describes the caller to the generation model, so first-person questions resolve to the
      * caller's own identifiers instead of being guessed from the question text.
      *
-     * <p>The wording is derived from the resolved access: a bypass (administrator) is unrestricted;
-     * otherwise the effective role display names are used with the caller's principal identifiers.
+     * <p>The wording lives in {@link DataScopeDescriber#promptBlock(DataScope)}; this delegates so
+     * the pipeline and the chat agent cannot drift apart.
      */
     private static String callerContext(DataScope scope) {
-        if (scope == null || scope.access() == null) {
-            return "当前账号未解析出数据范围，只能看到空结果。";
-        }
-        if (scope.bypassesDataScope()) {
-            return "管理员：可见全部数据，不需要按调用者过滤。";
-        }
-        List<String> roleNames = scope.access().roles().stream().map(role -> role.name()).toList();
-        String description =
-                roleNames.isEmpty()
-                        ? scope.access().roleCodes().toString()
-                        : String.join("、", roleNames);
-        StringBuilder context = new StringBuilder(description).append("：");
-        if (scope.studentNo() != null) {
-            context.append("本人学号 ")
-                    .append(scope.studentNo())
-                    .append("，所属班级 id ")
-                    .append(scope.classIds().stream().sorted().toList())
-                    .append("。问题中的“我/我的”指该学生本人，用 student_no = '")
-                    .append(scope.studentNo())
-                    .append("' 过滤。");
-        } else if (!scope.classIds().isEmpty()) {
-            context.append("管理班级 id ")
-                    .append(scope.classIds().stream().sorted().toList())
-                    .append("。问题中的“我管理的班/本班”指这些班级，用 class_id IN (...) 过滤。");
-        } else {
-            context.append("数据范围由当前账号的访问策略决定，只能查询策略允许的数据。");
-        }
-        return context.toString();
+        return DESCRIBER.promptBlock(scope);
     }
 
     /**

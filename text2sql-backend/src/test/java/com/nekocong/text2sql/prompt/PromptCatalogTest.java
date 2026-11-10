@@ -3,6 +3,7 @@ package com.nekocong.text2sql.prompt;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import com.nekocong.text2sql.nl2sql.PromptAssembler;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 
 /**
@@ -34,7 +35,29 @@ class PromptCatalogTest {
 
     @Test
     void loadsAgentSystemPrompt() {
-        String prompt = catalog.render("prompts/agent-system.md");
+        String prompt =
+                new PromptCatalog()
+                        .render(
+                                "prompts/agent-system.md",
+                                Map.of("data_scope", "学生：本人学号 2023001。"));
         assertThat(prompt).contains("query_database").contains("简体中文");
+        assertThat(prompt).contains("学生：本人学号 2023001。");
+        assertThat(prompt).doesNotContain("{{");
+    }
+
+    @Test
+    void theAgentPromptDeclaresTheScopePlaceholderAndTheAnswerRules() {
+        String prompt = new PromptCatalog().render("prompts/agent-system.md");
+
+        // The scope is injected per request, never hard-coded.
+        assertThat(prompt).contains("{{data_scope}}");
+        // Rule 1: a permission filter is never reported as missing data.
+        assertThat(prompt).contains("数据库中不存在").contains("当前数据范围内没有可见记录");
+        // Rule 2: never probe for out-of-range existence.
+        assertThat(prompt).contains("存在性检查");
+        // Rule 3: an administrator gets no disclaimer.
+        assertThat(prompt).contains("免责声明");
+        // The tool envelope: SQL and rows live under result, the range under dataScope.
+        assertThat(prompt).contains("result").contains("dataScope");
     }
 }

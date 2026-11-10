@@ -77,6 +77,11 @@ class Text2SqlPipelineServiceTest {
     private SqlExecutor sqlExecutor;
 
     private Text2SqlPipelineService pipelineReturning(String sql, String explanation) {
+        return pipelineReturning(sql, explanation, null);
+    }
+
+    private Text2SqlPipelineService pipelineReturning(
+            String sql, String explanation, java.util.concurrent.atomic.AtomicReference<String> caller) {
         SqlGenerationService stub =
                 new SqlGenerationService(new PromptAssembler(new PromptCatalog()), new SqlResultParser(new ObjectMapper())) {
                     @Override
@@ -86,6 +91,9 @@ class Text2SqlPipelineServiceTest {
                             String schema,
                             String question,
                             String callerContext) {
+                        if (caller != null) {
+                            caller.set(callerContext);
+                        }
                         return Mono.just(new SqlGeneration(sql, explanation));
                     }
                 };
@@ -164,6 +172,19 @@ class Text2SqlPipelineServiceTest {
 
         RowsEvent rows = (RowsEvent) events.get(rowsIndex);
         assertThat(rows.result().rowCount()).isEqualTo(1);
+    }
+
+    @Test
+    void theCallerContextKeepsTheOriginalFilterHints() {
+        java.util.concurrent.atomic.AtomicReference<String> context =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        pipelineReturning("SELECT COUNT(*) AS student_count FROM student", "counts", context)
+                .runBlocking(studentScope(), null, "我的成绩");
+
+        assertThat(context.get())
+                .contains("本人学号 2023001")
+                .contains("问题中的“我/我的”指该学生本人")
+                .contains("student_no = '2023001'");
     }
 
     private static DataScope studentScope() {
