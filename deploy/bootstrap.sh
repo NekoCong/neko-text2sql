@@ -126,6 +126,18 @@ docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build --remove-
 # 03-app-migrate.sql covers the pre-existing column additions; 04-access-control.sql adds
 # app_user.enabled/token_version, the seven access_* tables, indexes and the built-in seed/backfill.
 log "Applying idempotent application-database migrations"
+# The exec below fails while MySQL is still initialising, and `set -e` would abort the deploy.
+mysql_ready=0
+for _ in $(seq 1 60); do
+    if docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
+        sh -c 'mysqladmin ping -h 127.0.0.1 -uroot -p"$MYSQL_ROOT_PASSWORD" --silent' >/dev/null 2>&1; then
+        mysql_ready=1
+        break
+    fi
+    sleep 2
+done
+[[ "$mysql_ready" -eq 1 ]] || fail "MySQL did not become ready in time; inspect: docker compose -f $COMPOSE_FILE logs mysql"
+
 for script in 03-app-migrate.sql 04-access-control.sql; do
     docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
         sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" \"\$MYSQL_DATABASE\" < /docker-entrypoint-initdb.d/$script"
