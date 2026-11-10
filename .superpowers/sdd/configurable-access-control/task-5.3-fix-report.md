@@ -75,3 +75,12 @@ on `master`; covering class `AccessControlDataScopeTest` is now 20 tests.
   table_name)` is case-sensitive in MySQL's default collation on H2; a pre-existing row stored
   with a non-canonical spelling (only possible from a manual insert) is not normalised by this
   change.
+
+## Fix round 2 (orchestrator, after the fixer session hit an upstream 429)
+
+- equireDatasource now passes the resolved DataSource into equireTableAndColumnAndType/inspect; the registry is resolved once per upsert. Javadoc corrected (no reuse overclaim, no slash claim).
+- Removed the dead Optional/empty fall-through: onErrorResume returns deny(...).then(Mono.<DataSource>empty()) with a comment that deny always errors.
+- inspect no longer carries an unreachable unknown-attribute branch (validated in checkIdentifiers).
+- GET ?datasourceId= uses the relaxed datasource-id pattern (same as PUT).
+- Multi-datasource ordering test: added a second seeded test datasource erp-prod (dash in id; seeded with the demo schema) and asserted full (datasource_id, table_name) ordering plus the relaxed query filter.
+- Full suite: 315 tests, 0 failures, BUILD SUCCESS (no DASHSCOPE_API_KEY).
