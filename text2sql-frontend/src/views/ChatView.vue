@@ -6,6 +6,7 @@ import { conversationErrorMessage } from '@/api/conversations'
 import type { Citation } from '@/api/knowledge'
 import { useChatStore } from '@/stores/chat'
 import { useConversationStore } from '@/stores/conversation'
+import { useAuthStore } from '@/stores/auth'
 import CitationBadge from '@/components/CitationBadge.vue'
 import CitationDrawer from '@/components/CitationDrawer.vue'
 import ResultChart from '@/components/ResultChart.vue'
@@ -20,8 +21,10 @@ import type {
 import { copyText } from '@/utils/clipboard'
 import { parseSegments } from '@/utils/markdown'
 
+const auth = useAuthStore()
 const chat = useChatStore()
 const conversation = useConversationStore()
+const canUseChat = computed(() => auth.can('chat.use'))
 const draft = ref('')
 const scrollRef = ref<HTMLElement | null>(null)
 /** True while a stored conversation history is being fetched. */
@@ -65,13 +68,18 @@ const examples = [
   '统计每个班的考勤异常次数',
 ]
 
-const canSend = computed(() => draft.value.trim().length > 0 && !chat.streaming)
+const canSend = computed(
+  () => canUseChat.value && draft.value.trim().length > 0 && !chat.streaming,
+)
 
 const selectedDatasource = computed(
   () => chat.datasources.find((item) => item.id === chat.datasourceId) ?? null,
 )
 
 onMounted(() => {
+  if (!canUseChat.value) {
+    return
+  }
   void chat.loadDatasources()
   if (conversation.activeId && !chat.streaming) {
     void loadConversation(conversation.activeId)
@@ -83,6 +91,9 @@ onMounted(() => {
 watch(
   () => conversation.activeId,
   (id) => {
+    if (!canUseChat.value) {
+      return
+    }
     if (id === null) {
       chat.stop()
       chat.reset()
@@ -300,7 +311,7 @@ watch(
           <p class="chat__subtitle">用自然语言描述问题，自动生成 SQL、执行并返回结果。</p>
         </div>
 
-        <div class="chat__controls">
+        <div v-if="canUseChat" class="chat__controls">
           <el-select
             v-model="chat.datasourceId"
             class="chat__datasource"
@@ -355,8 +366,10 @@ watch(
         <div v-if="chat.messages.length === 0" class="empty">
           <span class="empty__mark" aria-hidden="true">T2S</span>
           <h2 class="empty__title">今天想了解校园里的哪些数据？</h2>
-          <p class="empty__text">选择一个示例，或直接输入你的问题。</p>
-          <div class="empty__chips">
+          <p class="empty__text">
+            {{ canUseChat ? '选择一个示例，或直接输入你的问题。' : '当前账号仅可查看已有对话内容。' }}
+          </p>
+          <div v-if="canUseChat" class="empty__chips">
             <button
               v-for="example in examples"
               :key="example"
@@ -489,7 +502,7 @@ watch(
       </div>
 
       <footer class="chat__composer">
-        <div v-if="chat.messages.length > 0" class="chat__examples">
+        <div v-if="canUseChat && chat.messages.length > 0" class="chat__examples">
           <button
             v-for="example in examples"
             :key="example"
@@ -501,7 +514,7 @@ watch(
           </button>
         </div>
 
-        <div class="composer" :class="{ 'composer--busy': chat.streaming }">
+        <div v-if="canUseChat" class="composer" :class="{ 'composer--busy': chat.streaming }">
           <el-input
             v-model="draft"
             class="composer__input"
@@ -523,6 +536,15 @@ watch(
             </div>
           </div>
         </div>
+        <el-alert
+          v-else
+          class="chat__permission"
+          type="info"
+          :closable="false"
+          show-icon
+          title="当前账号没有对话权限"
+          description="你可以查看已有内容，但不能发送问题或新建查询。如需使用对话，请联系管理员。"
+        />
       </footer>
     </section>
 

@@ -13,6 +13,11 @@ import {
   updateDatasource,
 } from '@/api/datasources'
 import type { ConnectionTestResult, DatasourceDetail, DatasourcePayload } from '@/types'
+import { useAuthStore } from '@/stores/auth'
+
+const auth = useAuthStore()
+/** Read access is route-gated; every credential-bearing/write control also requires this key. */
+const canWrite = computed(() => auth.can('datasource.write'))
 
 const DIALECTS = ['H2', 'MySQL', 'PostgreSQL', 'SQLite', 'OTHER']
 
@@ -201,12 +206,14 @@ onMounted(() => {
       <div>
         <h1 class="ac-page-title">数据源</h1>
         <p class="ac-page-description">
-          登记可供智能体查询的业务数据库，可在此测试连接、编辑配置或移除不再使用的数据源。
+          查看可供智能体查询的业务数据库；具备维护权限的账号可测试连接、编辑配置或移除数据源。
         </p>
       </div>
       <div class="ac-action-bar">
         <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
-        <el-button type="primary" :icon="Plus" @click="openCreate">新增数据源</el-button>
+        <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openCreate">
+          新增数据源
+        </el-button>
       </div>
     </header>
 
@@ -228,7 +235,7 @@ onMounted(() => {
             <span v-else class="ac-muted">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="250" fixed="right">
+        <el-table-column v-if="canWrite" label="操作" width="250" fixed="right">
           <template #default="{ row }">
             <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
             <el-button
@@ -266,7 +273,11 @@ onMounted(() => {
           <div class="ac-empty-state">
             <span class="ac-empty-state__title">暂无数据源</span>
             <span class="ac-empty-state__text">
-              新增数据源后，具备权限的账号即可向该数据库提问。
+              {{
+                canWrite
+                  ? '新增数据源后，具备权限的账号即可向该数据库提问。'
+                  : '暂无已登记的数据源；如需新增，请联系具备维护权限的管理员。'
+              }}
             </span>
           </div>
         </template>
@@ -274,6 +285,7 @@ onMounted(() => {
     </div>
 
     <el-dialog
+      v-if="canWrite"
       v-model="dialogVisible"
       class="ac-dialog"
       :title="dialogTitle"

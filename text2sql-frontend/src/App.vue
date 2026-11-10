@@ -7,6 +7,7 @@ import ConversationSidebar from '@/components/ConversationSidebar.vue'
 import { useAuthStore } from '@/stores/auth'
 import { useChatStore } from '@/stores/chat'
 import { useConversationStore } from '@/stores/conversation'
+import { visibleNavigationEntries } from '@/utils/navigation'
 
 const route = useRoute()
 const router = useRouter()
@@ -17,8 +18,21 @@ const conversation = useConversationStore()
 /** Public routes (login) render bare, without the app chrome. */
 const showChrome = computed(() => route.meta.public !== true)
 
-/** The history sidebar belongs to the chat screen. */
-const showSidebar = computed(() => showChrome.value && route.name === 'chat')
+/** Navigation and the history sidebar follow the same effective permission set as the guard. */
+const navigationEntries = computed(() =>
+  visibleNavigationEntries((permission) => auth.can(permission)),
+)
+const menuEntries = computed(() =>
+  navigationEntries.value.filter((entry) => entry.placement === 'menu'),
+)
+const showModelSettings = computed(() =>
+  navigationEntries.value.some((entry) => entry.name === 'model-settings'),
+)
+
+/** The history sidebar belongs to the chat screen and is useless without chat permission. */
+const showSidebar = computed(
+  () => showChrome.value && route.name === 'chat' && auth.can('chat.use'),
+)
 
 /** Desktop collapse state of the sidebar: 260px expanded, 0 collapsed. */
 const collapsed = ref(false)
@@ -214,15 +228,9 @@ watch(
         :ellipsis="false"
         class="layout__menu"
       >
-        <el-menu-item index="/">对话</el-menu-item>
-        <el-menu-item index="/datasources">数据源</el-menu-item>
-        <el-menu-item v-if="auth.user?.role === 'admin'" index="/admin/datasource-access">
-          数据源权限
+        <el-menu-item v-for="entry in menuEntries" :key="entry.name" :index="entry.path">
+          {{ entry.label }}
         </el-menu-item>
-        <el-menu-item v-if="auth.can('access.manage')" index="/admin/access-control">
-          权限管理
-        </el-menu-item>
-        <el-menu-item v-if="auth.user?.role === 'admin'" index="/knowledge">知识库</el-menu-item>
       </el-menu>
 
       <el-dropdown class="layout__user" trigger="click" @command="onUserCommand">
@@ -233,8 +241,8 @@ watch(
         </span>
         <template #dropdown>
           <el-dropdown-menu>
-            <el-dropdown-item command="models">模型配置</el-dropdown-item>
-            <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+            <el-dropdown-item v-if="showModelSettings" command="models">模型配置</el-dropdown-item>
+            <el-dropdown-item command="logout" :divided="showModelSettings">退出登录</el-dropdown-item>
           </el-dropdown-menu>
         </template>
       </el-dropdown>

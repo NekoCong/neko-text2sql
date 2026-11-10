@@ -118,10 +118,10 @@ const hitTagTypes: Record<KnowledgeType, TagType> = {
 const auth = useAuthStore()
 
 /**
- * The route already carries `meta.admin` (the router guard redirects non-admins);
- * this second check keeps the page itself from issuing any knowledge request.
+ * The route carries `meta.permission: access.manage`; this second check keeps the page from issuing
+ * knowledge requests if permissions change while it is open, without relying on the role claim.
  */
-const isAdmin = computed(() => auth.user?.role === 'admin')
+const canManageKnowledge = computed(() => auth.can('access.manage'))
 
 const datasources = ref<DatasourceDetail[]>([])
 /** Tab id is kept as a plain string because `el-tabs` emits string | number. */
@@ -748,7 +748,7 @@ watch(activeTab, () => {
 })
 
 onMounted(async () => {
-  if (!isAdmin.value) {
+  if (!canManageKnowledge.value) {
     return
   }
   await loadDatasources()
@@ -759,7 +759,7 @@ onBeforeUnmount(clearPollTimers)
 </script>
 
 <template>
-  <section v-if="isAdmin" class="ac-page knowledge">
+  <section v-if="canManageKnowledge" class="ac-page knowledge">
     <header class="ac-page-header">
       <div>
         <h1 class="ac-page-title">知识库</h1>
@@ -1437,7 +1437,7 @@ onBeforeUnmount(clearPollTimers)
     <header class="ac-page-header">
       <div>
         <h1 class="ac-page-title">知识库</h1>
-        <p class="ac-page-description">该页面仅管理员可见。</p>
+        <p class="ac-page-description">该页面需要知识库管理权限。</p>
       </div>
     </header>
     <el-alert
