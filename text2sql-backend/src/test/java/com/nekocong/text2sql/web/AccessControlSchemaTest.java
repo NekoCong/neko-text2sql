@@ -88,7 +88,8 @@ class AccessControlSchemaTest {
         List<String> tableNames = tables.stream().map(t -> String.valueOf(t.get("name"))).toList();
         assertThat(tableNames)
                 .as("the demo schema tables are listed by name")
-                .contains("class", "course", "student", "score", "attendance");
+                .contains("class", "course", "student", "score", "attendance")
+                .isSorted();
 
         Map<String, Object> student =
                 tables.stream()
@@ -98,8 +99,8 @@ class AccessControlSchemaTest {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> columns = (List<Map<String, Object>>) student.get("columns");
         assertThat(columns).isNotEmpty();
-        assertThat(columns.stream().map(c -> String.valueOf(c.get("name"))))
-                .contains("id", "name", "student_no");
+        List<String> columnNames = columns.stream().map(c -> String.valueOf(c.get("name"))).toList();
+        assertThat(columnNames).contains("id", "name", "student_no").isSorted();
         // Every column reports a non-blank introspected type name and never any connection detail.
         assertThat(columns)
                 .allSatisfy(

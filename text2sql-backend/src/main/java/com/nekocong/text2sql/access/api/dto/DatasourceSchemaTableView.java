@@ -6,7 +6,7 @@ import java.util.List;
  * One table of a datasource's live metadata, as returned to the data-scope editor.
  *
  * @param name the table name
- * @param columns the table's columns, in declaration order
+ * @param columns the table's columns, sorted by name
  */
 public record DatasourceSchemaTableView(String name, List<DatasourceSchemaColumnView> columns) {
 

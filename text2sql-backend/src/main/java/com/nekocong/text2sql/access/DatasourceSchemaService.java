@@ -7,6 +7,7 @@ import com.nekocong.text2sql.config.BlockingSchedulerConfig;
 import com.nekocong.text2sql.datasource.DataSourceRegistry;
 import com.nekocong.text2sql.schema.SchemaIntrospector;
 import com.nekocong.text2sql.schema.model.TableSchema;
+import java.util.Comparator;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.regex.Pattern;
@@ -87,7 +88,11 @@ public class DatasourceSchemaService {
                                                                         new DatasourceSchemaColumnView(
                                                                                 column.name(),
                                                                                 column.typeName()))
+                                                        .sorted(
+                                                                Comparator.comparing(
+                                                                        DatasourceSchemaColumnView::name))
                                                         .toList()))
+                        .sorted(Comparator.comparing(DatasourceSchemaTableView::name))
                         .toList();
         return new DatasourceSchemaView(datasourceId, viewTables);
     }
