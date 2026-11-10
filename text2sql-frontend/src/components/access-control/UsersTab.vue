@@ -1,20 +1,16 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Key, Plus, Refresh, Search } from '@element-plus/icons-vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import type { FormInstance, FormRules } from 'element-plus'
 import {
-  createUser,
   listRoles,
   listUsers,
   normalizeAccessControlError,
-  replaceUserRoles,
-  resetUserPassword,
-  updateUserDisplayName,
   updateUserStatus,
 } from '@/api/accessControl'
 import type { AccessRole, AccessUser, AccessUserPage } from '@/types'
 import { useAuthStore } from '@/stores/auth'
+import UserDialogs from '@/components/access-control/UserDialogs.vue'
 
 const auth = useAuthStore()
 const canRead = computed(() => auth.can('user.read'))
@@ -23,20 +19,24 @@ const canWrite = computed(() => auth.can('user.manage'))
 /** Tooltip shown on write controls when the caller can read users but not manage them. */
 const writeTip = computed(() => (canWrite.value ? '' : '缺少 user.manage 权限，无法修改用户'))
 
-/** Mirrors the backend's username and password rules. */
-const USERNAME_PATTERN = /^[A-Za-z0-9._-]{3,64}$/
-
 const loading = ref(false)
 const roles = ref<AccessRole[]>([])
 const page = ref<AccessUserPage>({ items: [], total: 0, page: 0, size: 20 })
 
 const query = ref('')
-const enabledFilter = ref<string>('')
+const enabledFilter = ref('')
 const roleFilter = ref('')
 const currentPage = ref(1)
 const pageSize = ref(20)
 
 let debounceTimer: number | undefined
+
+// Row-dialog state handed to the shared dialog component.
+const editingUser = ref<AccessUser | null>(null)
+const createOpen = ref(false)
+const editNameOpen = ref(false)
+const resetOpen = ref(false)
+const assignOpen = ref(false)
 
 async function loadRoles(): Promise<void> {
   try {
@@ -91,148 +91,28 @@ function onSizeChange(value: number): void {
   void loadUsers()
 }
 
-// ---------- Create ----------------------------------------------------------
-
-interface CreateFormState {
-  username: string
-  displayName: string
-  password: string
-  confirmPassword: string
-  roleIds: string[]
-}
-
-const createVisible = ref(false)
-const createSaving = ref(false)
-const createFormRef = ref<FormInstance>()
-const createForm = reactive<CreateFormState>({
-  username: '',
-  displayName: '',
-  password: '',
-  confirmPassword: '',
-  roleIds: [],
-})
-
-const createRules: FormRules<CreateFormState> = {
-  username: [
-    { required: true, message: '请输入用户名', trigger: 'blur' },
-    {
-      validator: (_rule, value: string, callback) => {
-        if (!value || USERNAME_PATTERN.test(value.trim())) {
-          callback()
-        } else {
-          callback(new Error('用户名需为 3-64 位字母、数字、点、短横线或下划线'))
-        }
-      },
-      trigger: 'blur',
-    },
-  ],
-  password: [
-    { required: true, message: '请输入初始密码', trigger: 'blur' },
-    {
-      validator: (_rule, value: string, callback) => {
-        if (value.length >= 8 && value.length <= 72) {
-          callback()
-        } else {
-          callback(new Error('密码长度必须为 8-72 个字符'))
-        }
-      },
-      trigger: 'blur',
-    },
-  ],
-  confirmPassword: [
-    { required: true, message: '请再次输入密码', trigger: 'blur' },
-    {
-      validator: (_rule, value: string, callback) => {
-        if (value === createForm.password) {
-          callback()
-        } else {
-          callback(new Error('两次输入的密码不一致'))
-        }
-      },
-      trigger: 'blur',
-    },
-  ],
-  roleIds: [
-    {
-      validator: (_rule, value: string[], callback) => {
-        if (value && value.length > 0) {
-          callback()
-        } else {
-          callback(new Error('请至少选择一个角色'))
-        }
-      },
-      trigger: 'change',
-    },
-  ],
-}
-
 function openCreate(): void {
-  Object.assign(createForm, {
-    username: '',
-    displayName: '',
-    password: '',
-    confirmPassword: '',
-    roleIds: [],
-  })
-  createVisible.value = true
+  createOpen.value = true
 }
-
-async function submitCreate(): Promise<void> {
-  const valid = await createFormRef.value?.validate().catch(() => false)
-  if (!valid) {
-    return
-  }
-  createSaving.value = true
-  try {
-    await createUser({
-      username: createForm.username.trim(),
-      password: createForm.password,
-      displayName: createForm.displayName.trim() || undefined,
-      roleIds: createForm.roleIds,
-    })
-    ElMessage.success('用户已创建')
-    createVisible.value = false
-    await loadUsers()
-  } catch (error) {
-    ElMessage.error(normalizeAccessControlError(error, '创建用户失败').message)
-  } finally {
-    createSaving.value = false
-  }
-}
-
-// ---------- Edit display name -------------------------------------------------
-
-const editNameVisible = ref(false)
-const editNameSaving = ref(false)
-const editNameForm = reactive({ displayName: '' })
-const editingUser = ref<AccessUser | null>(null)
 
 function openEditName(row: AccessUser): void {
   editingUser.value = row
-  editNameForm.displayName = row.displayName ?? ''
-  editNameVisible.value = true
+  editNameOpen.value = true
 }
 
-async function submitEditName(): Promise<void> {
-  if (!editingUser.value) {
-    return
-  }
-  editNameSaving.value = true
-  try {
-    await updateUserDisplayName(editingUser.value.id, {
-      displayName: editNameForm.displayName.trim() || null,
-    })
-    ElMessage.success('显示名称已更新')
-    editNameVisible.value = false
-    await loadUsers()
-  } catch (error) {
-    ElMessage.error(normalizeAccessControlError(error, '更新显示名称失败').message)
-  } finally {
-    editNameSaving.value = false
-  }
+function openReset(row: AccessUser): void {
+  editingUser.value = row
+  resetOpen.value = true
 }
 
-// ---------- Enable / disable -------------------------------------------------
+function openAssign(row: AccessUser): void {
+  editingUser.value = row
+  assignOpen.value = true
+}
+
+function onDialogsSaved(): void {
+  void loadUsers()
+}
 
 async function toggleStatus(row: AccessUser): Promise<void> {
   try {
@@ -244,109 +124,18 @@ async function toggleStatus(row: AccessUser): Promise<void> {
   }
 }
 
-// ---------- Reset password ---------------------------------------------------
-
-const resetVisible = ref(false)
-const resetSaving = ref(false)
-const resetForm = reactive({ password: '', confirmPassword: '' })
-const resetFormRef = ref<FormInstance>()
-
-const resetRules: FormRules<{ password: string; confirmPassword: string }> = {
-  password: [
-    { required: true, message: '请输入新密码', trigger: 'blur' },
-    {
-      validator: (_rule, value: string, callback) => {
-        if (value.length >= 8 && value.length <= 72) {
-          callback()
-        } else {
-          callback(new Error('密码长度必须为 8-72 个字符'))
-        }
-      },
-      trigger: 'blur',
-    },
-  ],
-  confirmPassword: [
-    { required: true, message: '请再次输入密码', trigger: 'blur' },
-    {
-      validator: (_rule, value: string, callback) => {
-        if (value === resetForm.password) {
-          callback()
-        } else {
-          callback(new Error('两次输入的密码不一致'))
-        }
-      },
-      trigger: 'blur',
-    },
-  ],
-}
-
-function openReset(row: AccessUser): void {
-  editingUser.value = row
-  resetForm.password = ''
-  resetForm.confirmPassword = ''
-  resetVisible.value = true
-}
-
-async function submitReset(): Promise<void> {
-  if (!editingUser.value) {
-    return
-  }
-  const valid = await resetFormRef.value?.validate().catch(() => false)
-  if (!valid) {
-    return
-  }
-  resetSaving.value = true
-  try {
-    await resetUserPassword(editingUser.value.id, { password: resetForm.password })
-    ElMessage.success('密码已重置')
-    resetVisible.value = false
-  } catch (error) {
-    ElMessage.error(normalizeAccessControlError(error, '重置密码失败').message)
-  } finally {
-    resetSaving.value = false
-  }
-}
-
-// ---------- Assign roles -----------------------------------------------------
-
-const assignVisible = ref(false)
-const assignSaving = ref(false)
-const assignForm = reactive({ roleIds: [] as string[] })
-
-function openAssign(row: AccessUser): void {
-  editingUser.value = row
-  assignForm.roleIds = row.roles.map((role) => role.id)
-  assignVisible.value = true
-}
-
-async function submitAssign(): Promise<void> {
-  if (!editingUser.value) {
-    return
-  }
-  assignSaving.value = true
-  try {
-    await replaceUserRoles(editingUser.value.id, { roleIds: assignForm.roleIds })
-    ElMessage.success('角色分配已保存')
-    assignVisible.value = false
-    await loadUsers()
-  } catch (error) {
-    ElMessage.error(normalizeAccessControlError(error, '保存角色分配失败').message)
-  } finally {
-    assignSaving.value = false
-  }
-}
-
-// ---------- Presentation -----------------------------------------------------
-
 function formatTime(value: number): string {
   return new Date(value).toLocaleString('zh-CN', { hour12: false })
 }
 
-watch(() => canRead.value, (readable) => {
-  if (readable) {
-    void loadUsers()
-  }
-})
+watch(
+  () => canRead.value,
+  (readable) => {
+    if (readable) {
+      void loadUsers()
+    }
+  },
+)
 
 onMounted(() => {
   void loadRoles()
@@ -449,13 +238,7 @@ onBeforeUnmount(() => {
                   <el-button size="small" text :disabled="!canWrite" @click="openAssign(row)">
                     分配角色
                   </el-button>
-                  <el-button
-                    size="small"
-                    text
-                    :icon="Key"
-                    :disabled="!canWrite"
-                    @click="openReset(row)"
-                  >
+                  <el-button size="small" text :disabled="!canWrite" @click="openReset(row)">
                     重置密码
                   </el-button>
                   <el-popconfirm
@@ -502,138 +285,15 @@ onBeforeUnmount(() => {
         @size-change="onSizeChange"
       />
 
-      <!-- Create -->
-      <el-dialog
-        v-model="createVisible"
-        class="ac-dialog"
-        title="新增用户"
-        width="min(560px, calc(100vw - 32px))"
-        :close-on-click-modal="false"
-      >
-        <el-form ref="createFormRef" :model="createForm" :rules="createRules" label-width="96px">
-          <el-form-item label="用户名" prop="username">
-            <el-input v-model="createForm.username" maxlength="64" placeholder="3-64 位字母、数字、点、短横线或下划线" />
-          </el-form-item>
-          <el-form-item label="显示名称">
-            <el-input v-model="createForm.displayName" maxlength="100" placeholder="可选" />
-          </el-form-item>
-          <el-form-item label="初始密码" prop="password">
-            <el-input
-              v-model="createForm.password"
-              type="password"
-              show-password
-              autocomplete="new-password"
-              placeholder="8-72 个字符"
-            />
-          </el-form-item>
-          <el-form-item label="确认密码" prop="confirmPassword">
-            <el-input
-              v-model="createForm.confirmPassword"
-              type="password"
-              show-password
-              autocomplete="new-password"
-              placeholder="再次输入密码"
-            />
-          </el-form-item>
-          <el-form-item label="角色" prop="roleIds">
-            <el-select v-model="createForm.roleIds" class="users__control" multiple filterable>
-              <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
-            </el-select>
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <div class="users__footer">
-            <span class="users__spacer" />
-            <el-button @click="createVisible = false">取消</el-button>
-            <el-button type="primary" :loading="createSaving" @click="submitCreate">创建</el-button>
-          </div>
-        </template>
-      </el-dialog>
-
-      <!-- Edit display name -->
-      <el-dialog
-        v-model="editNameVisible"
-        class="ac-dialog"
-        title="编辑显示名称"
-        width="min(440px, calc(100vw - 32px))"
-        :close-on-click-modal="false"
-      >
-        <el-form label-width="96px">
-          <el-form-item label="显示名称">
-            <el-input v-model="editNameForm.displayName" maxlength="100" placeholder="留空清除显示名称" />
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <div class="users__footer">
-            <span class="users__spacer" />
-            <el-button @click="editNameVisible = false">取消</el-button>
-            <el-button type="primary" :loading="editNameSaving" @click="submitEditName">保存</el-button>
-          </div>
-        </template>
-      </el-dialog>
-
-      <!-- Reset password -->
-      <el-dialog
-        v-model="resetVisible"
-        class="ac-dialog"
-        title="重置密码"
-        width="min(440px, calc(100vw - 32px))"
-        :close-on-click-modal="false"
-      >
-        <p class="ac-text-meta">为用户「{{ editingUser?.username }}」设置新密码，密码不会回显。</p>
-        <el-form ref="resetFormRef" :model="resetForm" :rules="resetRules" label-width="96px">
-          <el-form-item label="新密码" prop="password">
-            <el-input
-              v-model="resetForm.password"
-              type="password"
-              show-password
-              autocomplete="new-password"
-              placeholder="8-72 个字符"
-            />
-          </el-form-item>
-          <el-form-item label="确认密码" prop="confirmPassword">
-            <el-input
-              v-model="resetForm.confirmPassword"
-              type="password"
-              show-password
-              autocomplete="new-password"
-              placeholder="再次输入密码"
-            />
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <div class="users__footer">
-            <span class="users__spacer" />
-            <el-button @click="resetVisible = false">取消</el-button>
-            <el-button type="primary" :loading="resetSaving" @click="submitReset">重置</el-button>
-          </div>
-        </template>
-      </el-dialog>
-
-      <!-- Assign roles -->
-      <el-dialog
-        v-model="assignVisible"
-        class="ac-dialog"
-        title="分配角色"
-        width="min(480px, calc(100vw - 32px))"
-        :close-on-click-modal="false"
-      >
-        <p class="ac-text-meta">为用户「{{ editingUser?.username }}」选择角色，保存后整体替换现有角色。</p>
-        <el-form label-width="96px">
-          <el-form-item label="角色">
-            <el-select v-model="assignForm.roleIds" class="users__control" multiple filterable>
-              <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
-            </el-select>
-          </el-form-item>
-        </el-form>
-        <template #footer>
-          <div class="users__footer">
-            <span class="users__spacer" />
-            <el-button @click="assignVisible = false">取消</el-button>
-            <el-button type="primary" :loading="assignSaving" @click="submitAssign">保存</el-button>
-          </div>
-        </template>
-      </el-dialog>
+      <UserDialogs
+        :roles="roles"
+        :editing-user="editingUser"
+        v-model:create-open="createOpen"
+        v-model:edit-name-open="editNameOpen"
+        v-model:reset-open="resetOpen"
+        v-model:assign-open="assignOpen"
+        @saved="onDialogsSaved"
+      />
     </template>
   </div>
 </template>
@@ -690,19 +350,5 @@ onBeforeUnmount(() => {
 .users__pagination {
   justify-content: flex-end;
   margin-top: var(--ac-space-12);
-}
-
-.users__control {
-  width: 100%;
-}
-
-.users__footer {
-  display: flex;
-  align-items: center;
-  gap: var(--ac-space-8);
-}
-
-.users__spacer {
-  flex: 1;
 }
 </style>

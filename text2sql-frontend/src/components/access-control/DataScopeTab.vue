@@ -1,54 +1,22 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import { listDatasources } from '@/api/datasources'
 import {
   deleteDataScope,
-  getDatasourceSchema,
   listDataScopes,
   listRoles,
   normalizeAccessControlError,
-  upsertDataScope,
 } from '@/api/accessControl'
-import type {
-  AccessRole,
-  DataScope,
-  DataScopeRequest,
-  DatasourceDetail,
-  DatasourceSchema,
-} from '@/types'
+import type { AccessRole, DataScope, DatasourceDetail } from '@/types'
 import { useAuthStore } from '@/stores/auth'
+import DataScopeRuleDialog from '@/components/access-control/DataScopeRuleDialog.vue'
 
 const auth = useAuthStore()
 const canWrite = computed(() => auth.can('access.manage'))
 
 type Policy = 'ALL' | 'FILTER' | 'DENY'
-
-/** The closed principal-attribute catalog, with the pairing kind used to validate a column. */
-interface PrincipalAttributeOption {
-  code: string
-  label: string
-  kind: 'numeric' | 'text' | 'multi'
-}
-
-const PRINCIPAL_ATTRIBUTES: PrincipalAttributeOption[] = [
-  { code: 'userId', label: '用户 ID（userId）', kind: 'text' },
-  { code: 'username', label: '用户名（username）', kind: 'text' },
-  { code: 'studentId', label: '学号 ID（studentId，数值）', kind: 'numeric' },
-  { code: 'studentNo', label: '学号（studentNo）', kind: 'text' },
-  { code: 'classIds', label: '班级 ID 集合（classIds）', kind: 'multi' },
-]
-
-/** SQL type names that hold text (mirrors the backend's normalization). */
-const TEXT_TYPES = new Set([
-  'CHAR', 'VARCHAR', 'VARCHAR2', 'NCHAR', 'NVARCHAR', 'NVARCHAR2', 'TEXT', 'CLOB',
-  'MEDIUMTEXT', 'LONGTEXT', 'TINYTEXT', 'STRING',
-])
-const NUMERIC_TYPES = new Set([
-  'TINYINT', 'SMALLINT', 'INT', 'INTEGER', 'BIGINT', 'DECIMAL', 'NUMERIC', 'FLOAT',
-  'DOUBLE', 'REAL', 'DOUBLE PRECISION', 'SMALLSERIAL', 'SERIAL', 'BIGSERIAL', 'MONEY',
-])
 
 const policyLabels: Record<Policy, string> = { ALL: '全部', FILTER: '过滤', DENY: '拒绝' }
 const policyTagTypes: Record<Policy, 'success' | 'primary' | 'danger'> = {
@@ -64,6 +32,9 @@ const rules = ref<DataScope[]>([])
 
 const filterRoleId = ref('')
 const filterDatasourceId = ref('')
+
+const dialogVisible = ref(false)
+const dialogRule = ref<DataScope | null>(null)
 
 async function loadRoles(): Promise<void> {
   try {
@@ -107,164 +78,18 @@ onMounted(async () => {
   await loadRules()
 })
 
-// ---------- Upsert dialog ---------------------------------------------------
-
-interface DataScopeFormState {
-  roleId: string
-  datasourceId: string
-  tableName: string
-  policy: Policy
-  columnName: string
-  principalAttribute: string
-}
-
-const dialogVisible = ref(false)
-const saving = ref(false)
-const formError = ref('')
-const schema = ref<DatasourceSchema | null>(null)
-const schemaLoading = ref(false)
-const form = reactive<DataScopeFormState>({
-  roleId: '',
-  datasourceId: '',
-  tableName: '',
-  policy: 'ALL',
-  columnName: '',
-  principalAttribute: '',
-})
-
-const tables = computed(() => schema.value?.tables ?? [])
-const selectedTable = computed(() =>
-  tables.value.find((table) => table.name === form.tableName),
-)
-const columns = computed(() => selectedTable.value?.columns ?? [])
-
 function openCreate(): void {
-  Object.assign(form, {
-    roleId: filterRoleId.value || roles.value[0]?.id || '',
-    datasourceId: filterDatasourceId.value || datasources.value[0]?.id || '',
-    tableName: '',
-    policy: 'ALL' as Policy,
-    columnName: '',
-    principalAttribute: '',
-  })
-  formError.value = ''
-  schema.value = null
+  dialogRule.value = null
   dialogVisible.value = true
-  if (form.datasourceId) {
-    void loadSchema(form.datasourceId)
-  }
 }
 
 function openEdit(row: DataScope): void {
-  Object.assign(form, {
-    roleId: row.roleId,
-    datasourceId: row.datasourceId,
-    tableName: row.tableName,
-    policy: row.policy as Policy,
-    columnName: row.columnName ?? '',
-    principalAttribute: row.principalAttribute ?? '',
-  })
-  formError.value = ''
-  schema.value = null
+  dialogRule.value = row
   dialogVisible.value = true
-  void loadSchema(row.datasourceId)
 }
 
-async function loadSchema(datasourceId: string): Promise<void> {
-  schemaLoading.value = true
-  schema.value = null
-  try {
-    schema.value = await getDatasourceSchema(datasourceId)
-  } catch (error) {
-    ElMessage.error(normalizeAccessControlError(error, '加载数据源结构失败').message)
-  } finally {
-    schemaLoading.value = false
-  }
-}
-
-function onDatasourceChange(datasourceId: string): void {
-  form.tableName = ''
-  form.columnName = ''
-  schema.value = null
-  if (datasourceId) {
-    void loadSchema(datasourceId)
-  }
-}
-
-function onTableChange(): void {
-  form.columnName = ''
-}
-
-/** Rejects a FILTER pairing that the backend (or the type rule) would refuse. */
-function incompatibleReason(): string | null {
-  if (form.policy !== 'FILTER' || !form.columnName || !form.principalAttribute) {
-    return null
-  }
-  const attribute = PRINCIPAL_ATTRIBUTES.find((entry) => entry.code === form.principalAttribute)
-  const column = columns.value.find((entry) => entry.name === form.columnName)
-  if (!attribute || !column) {
-    return null
-  }
-  const kind = columnKind(column.typeName)
-  if (attribute.kind === 'numeric' && kind === 'text') {
-    return 'studentId 按数值比较，请选择数值类型字段'
-  }
-  if (attribute.kind === 'text' && kind === 'numeric') {
-    return '该主体属性按文本比较，请选择文本类型字段'
-  }
-  return null
-}
-
-/** Save is blocked while the FILTER combination is incomplete or type-incompatible. */
-const blockedReason = computed(() => {
-  if (form.policy !== 'FILTER') {
-    return null
-  }
-  if (!form.columnName || !form.principalAttribute) {
-    return 'FILTER 策略必须同时选择过滤字段与主体属性'
-  }
-  return incompatibleReason()
-})
-
-const canSubmit = computed(() => {
-  if (!form.roleId || !form.datasourceId || !form.tableName || !form.policy) {
-    return false
-  }
-  return blockedReason.value == null
-})
-
-async function submit(): Promise<void> {
-  const block = blockedReason.value
-  if (block) {
-    formError.value = block
-    return
-  }
-  if (!form.roleId || !form.datasourceId || !form.tableName) {
-    formError.value = '请选择角色、数据源与表'
-    return
-  }
-  saving.value = true
-  formError.value = ''
-  const request: DataScopeRequest = {
-    roleId: form.roleId,
-    datasourceId: form.datasourceId,
-    tableName: form.tableName,
-    policy: form.policy,
-  }
-  if (form.policy === 'FILTER') {
-    request.columnName = form.columnName
-    request.principalAttribute = form.principalAttribute
-  }
-  try {
-    await upsertDataScope(request)
-    ElMessage.success('数据范围规则已保存')
-    dialogVisible.value = false
-    await loadRules()
-  } catch (error) {
-    formError.value = normalizeAccessControlError(error, '保存数据范围失败').message
-  } finally {
-    saving.value = false
-  }
+function onDialogSaved(): void {
+  void loadRules()
 }
 
 async function remove(row: DataScope): Promise<void> {
@@ -279,37 +104,6 @@ async function remove(row: DataScope): Promise<void> {
 
 function datasourceName(id: string): string {
   return datasources.value.find((item) => item.id === id)?.name ?? id
-}
-
-/** Normalizes a type name and classifies it as text, numeric, or other. */
-function columnKind(typeName: string): 'text' | 'numeric' | 'other' {
-  const normalized = normalizeType(typeName)
-  if (TEXT_TYPES.has(normalized)) {
-    return 'text'
-  }
-  if (NUMERIC_TYPES.has(normalized)) {
-    return 'numeric'
-  }
-  return 'other'
-}
-
-function normalizeType(typeName: string): string {
-  const upper = typeName.trim().toUpperCase()
-  const paren = upper.indexOf('(')
-  const base = paren > 0 ? upper.substring(0, paren).trim() : upper
-  if (base === 'CHARACTER VARYING' || base === 'CHAR VARYING') {
-    return 'VARCHAR'
-  }
-  if (base === 'CHARACTER') {
-    return 'CHAR'
-  }
-  if (base === 'NATIONAL CHARACTER VARYING') {
-    return 'NVARCHAR'
-  }
-  if (base === 'CHARACTER LARGE OBJECT') {
-    return 'CLOB'
-  }
-  return base
 }
 </script>
 
@@ -417,112 +211,15 @@ function normalizeType(typeName: string): string {
       </el-table>
     </div>
 
-    <el-dialog
+    <DataScopeRuleDialog
       v-model="dialogVisible"
-      class="ac-dialog"
-      title="数据范围规则"
-      width="min(640px, calc(100vw - 32px))"
-      :close-on-click-modal="false"
-    >
-      <el-alert
-        v-if="formError"
-        class="scope__error"
-        type="error"
-        :closable="false"
-        show-icon
-        :title="formError"
-      />
-
-      <el-form label-width="96px">
-        <el-form-item label="角色" required>
-          <el-select v-model="form.roleId" class="scope__control" placeholder="选择角色" filterable>
-            <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="数据源" required>
-          <el-select
-            v-model="form.datasourceId"
-            class="scope__control"
-            placeholder="选择数据源"
-            filterable
-            @change="onDatasourceChange"
-          >
-            <el-option
-              v-for="datasource in datasources"
-              :key="datasource.id"
-              :label="datasource.name"
-              :value="datasource.id"
-            />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="表" required>
-          <el-select
-            v-model="form.tableName"
-            class="scope__control"
-            placeholder="选择表"
-            filterable
-            :loading="schemaLoading"
-            :disabled="!form.datasourceId"
-            @change="onTableChange"
-          >
-            <el-option v-for="table in tables" :key="table.name" :label="table.name" :value="table.name" />
-          </el-select>
-        </el-form-item>
-        <el-form-item label="策略" required>
-          <el-radio-group v-model="form.policy">
-            <el-radio-button value="ALL">全部</el-radio-button>
-            <el-radio-button value="FILTER">过滤</el-radio-button>
-            <el-radio-button value="DENY">拒绝</el-radio-button>
-          </el-radio-group>
-        </el-form-item>
-
-        <template v-if="form.policy === 'FILTER'">
-          <el-form-item label="过滤字段" required>
-            <el-select
-              v-model="form.columnName"
-              class="scope__control"
-              placeholder="选择该表的字段"
-              filterable
-              :disabled="!form.tableName"
-            >
-              <el-option
-                v-for="column in columns"
-                :key="column.name"
-                :label="`${column.name}（${column.typeName}）`"
-                :value="column.name"
-              />
-            </el-select>
-          </el-form-item>
-          <el-form-item label="主体属性" required>
-            <el-select
-              v-model="form.principalAttribute"
-              class="scope__control"
-              placeholder="选择主体属性"
-            >
-              <el-option
-                v-for="attribute in PRINCIPAL_ATTRIBUTES"
-                :key="attribute.code"
-                :label="attribute.label"
-                :value="attribute.code"
-              />
-            </el-select>
-          </el-form-item>
-          <p v-if="blockedReason" class="scope__blocked">
-            {{ blockedReason }}
-          </p>
-        </template>
-      </el-form>
-
-      <template #footer>
-        <div class="scope__footer">
-          <span class="scope__spacer" />
-          <el-button @click="dialogVisible = false">取消</el-button>
-          <el-button type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">
-            保存
-          </el-button>
-        </div>
-      </template>
-    </el-dialog>
+      :roles="roles"
+      :datasources="datasources"
+      :rule="dialogRule"
+      :default-role-id="filterRoleId"
+      :default-datasource-id="filterDatasourceId || (datasources[0]?.id ?? '')"
+      @saved="onDialogSaved"
+    />
   </div>
 </template>
 
@@ -562,29 +259,5 @@ function normalizeType(typeName: string): string {
 .scope__code {
   color: var(--ac-text);
   font-size: 13px;
-}
-
-.scope__error {
-  margin-bottom: var(--ac-space-16);
-}
-
-.scope__control {
-  width: 100%;
-}
-
-.scope__blocked {
-  margin: 0 0 0 var(--ac-space-8);
-  color: var(--el-color-danger);
-  font-size: var(--ac-text-meta);
-}
-
-.scope__footer {
-  display: flex;
-  align-items: center;
-  gap: var(--ac-space-8);
-}
-
-.scope__spacer {
-  flex: 1;
 }
 </style>
