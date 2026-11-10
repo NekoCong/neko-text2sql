@@ -153,7 +153,9 @@ done
 log "Waiting for the backend to answer"
 healthy=0
 for _ in $(seq 1 60); do
-    if curl -fsS -o /dev/null --max-time 5 "http://127.0.0.1/api/text2sql/health"; then
+    # `-S` is deliberately omitted: while nginx is up but the backend is still booting it answers
+    # 502, and printing that on every retry reads like a failure even though the loop is working.
+    if curl -fs -o /dev/null --max-time 5 "http://127.0.0.1/api/text2sql/health" 2>/dev/null; then
         healthy=1
         break
     fi
