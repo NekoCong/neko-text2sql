@@ -57,13 +57,13 @@
 
 ## 8. Integration verification
 
-- [ ] 8.1 Run the backend test suite with JDK 25 (`.\mvnw.cmd test` or the project's documented command) and verify all tests pass, including the new access-control/CTE tests.
-- [ ] 8.2 Run `npm test` and `npm run build` in `text2sql-frontend`; both must exit 0.
-- [ ] 8.3 Apply the migration to a copy of the seed database and compare effective access for `admin`, `student01`, and `counselor01` with the pre-change behavior. Verify `student01` still sees only own rows, `counselor01` sees only managed classes, and `admin` is unrestricted.
-- [ ] 8.4 End-to-end check: create a custom role, grant `chat.use` plus a filtered `score` policy, create a user with that role, and verify both the pipeline and AgentScope path return the filtered result; revoke the role and verify the next request is denied.
+- [x] 8.1 Run the backend test suite with JDK 25 (`.\mvnw.cmd test` or the project's documented command) and verify all tests pass, including the new access-control/CTE tests.
+- [x] 8.2 Run `npm test` and `npm run build` in `text2sql-frontend`; both must exit 0.
+- [x] 8.3 Apply the migration to a copy of the seed database and compare effective access for `admin`, `student01`, and `counselor01` with the pre-change behavior. Verify `student01` still sees only own rows, `counselor01` sees only managed classes, and `admin` is unrestricted.
+- [x] 8.4 End-to-end check: create a custom role, grant `chat.use` plus a filtered `score` policy, create a user with that role, and verify both the pipeline and AgentScope path return the filtered result; revoke the role and verify the next request is denied.
 - [x] 8.5 Run the CTE regression and confirm a restricted user cannot read a protected table via a same-name CTE, including a schema-qualified body.
 - [x] 8.6 Confirm the final diff contains no sandbox/container-isolation work, no approval workflow, and no dependency changes; update the change ledger with the results.
-- [ ] 8.7 E2E account lifecycle: create a user with the `student` role, log in, disable the account and verify the next request with the same token returns 401/403, re-enable and verify the old token is still rejected, reset the password and verify login with the old password fails and the new one succeeds; confirm the audit rows contain no password material.
+- [x] 8.7 E2E account lifecycle: create a user with the `student` role, log in, disable the account and verify the next request with the same token returns 401/403, re-enable and verify the old token is still rejected, reset the password and verify login with the old password fails and the new one succeeds; confirm the audit rows contain no password material.
 
 ## Workflow follow-up
 
