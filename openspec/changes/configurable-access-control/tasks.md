@@ -41,12 +41,12 @@
 ## 6. Frontend access-control area
 
 - [x] 6.1 Add TypeScript types and API client functions for roles, permissions, data scopes, users, datasource grants, and audit. Verify the client compiles and each function maps to the backend route.
-- [ ] 6.2 Add `/admin/access-control` route, navigation entry, and a permission-aware route guard based on `access.manage`; keep the API as the security boundary. Verify a non-admin cannot see the entry or render the page, and a direct API call returns 403.
-- [ ] 6.3 Build the Roles tab: list, create, edit, disable, parent-role selector, built-in badge. Verify create/edit/disable and cycle errors surface inline.
-- [ ] 6.4 Build the Permissions tab: grouped permission catalog and role-permission matrix with save feedback. Verify toggling a permission persists and reloads correctly.
-- [ ] 6.5 Build the Data scope tab: role/datasource/table selector, `ALL`/`FILTER`/`DENY`, column and principal-attribute selectors, and an effective-policy preview. Verify invalid combinations are blocked before save.
-- [ ] 6.6 Build the Users and Datasource access tabs: user search/pagination, create-user dialog (username, display name, initial password, roles), edit display name, disable/enable, reset-password dialog, role assignment, and the migrated role-datasource matrix. Password inputs are write-only; the UI never displays a stored password. Verify changes persist, match backend state, and disabled users show the correct status.
-- [ ] 6.7 Build the Audit tab: read-only table with actor, time, entity, result, and before/after expand. Verify `audit.read` gating and empty/error states.
+- [x] 6.2 Add `/admin/access-control` route, navigation entry, and a permission-aware route guard based on `access.manage`; keep the API as the security boundary. Verify a non-admin cannot see the entry or render the page, and a direct API call returns 403.
+- [x] 6.3 Build the Roles tab: list, create, edit, disable, parent-role selector, built-in badge. Verify create/edit/disable and cycle errors surface inline.
+- [x] 6.4 Build the Permissions tab: grouped permission catalog and role-permission matrix with save feedback. Verify toggling a permission persists and reloads correctly.
+- [x] 6.5 Build the Data scope tab: role/datasource/table selector, `ALL`/`FILTER`/`DENY`, column and principal-attribute selectors, and an effective-policy preview. Verify invalid combinations are blocked before save.
+- [x] 6.6 Build the Users and Datasource access tabs: user search/pagination, create-user dialog (username, display name, initial password, roles), edit display name, disable/enable, reset-password dialog, role assignment, and the migrated role-datasource matrix. Password inputs are write-only; the UI never displays a stored password. Verify changes persist, match backend state, and disabled users show the correct status.
+- [x] 6.7 Build the Audit tab: read-only table with actor, time, entity, result, and before/after expand. Verify `audit.read` gating and empty/error states.
 - [ ] 6.8 Make navigation and page guards permission-aware across the app (chat, datasources, model settings, access control). Verify a user without a module permission does not see its entry and direct API calls still return 403.
 
 ## 7. Documentation and migration
