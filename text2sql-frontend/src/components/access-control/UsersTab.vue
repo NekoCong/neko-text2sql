@@ -24,8 +24,9 @@ const roles = ref<AccessRole[]>([])
 const page = ref<AccessUserPage>({ items: [], total: 0, page: 0, size: 20 })
 
 const query = ref('')
-const enabledFilter = ref('')
-const roleFilter = ref('')
+// Element Plus sets a cleared select to undefined rather than the initial empty string.
+const enabledFilter = ref<string | undefined>('')
+const roleFilter = ref<string | undefined>('')
 const currentPage = ref(1)
 const pageSize = ref(20)
 
@@ -41,9 +42,10 @@ const assignOpen = ref(false)
 async function loadRoles(): Promise<void> {
   try {
     roles.value = await listRoles()
-  } catch {
+  } catch (error) {
     // The role filter and role pickers degrade to empty; the user list still works.
     roles.value = []
+    ElMessage.error(normalizeAccessControlError(error, '加载角色失败').message)
   }
 }
 
@@ -55,7 +57,10 @@ async function loadUsers(): Promise<void> {
   try {
     page.value = await listUsers({
       query: query.value.trim() || undefined,
-      enabled: enabledFilter.value === '' ? undefined : enabledFilter.value === 'true',
+      enabled:
+        enabledFilter.value == null || enabledFilter.value === ''
+          ? undefined
+          : enabledFilter.value === 'true',
       roleId: roleFilter.value || undefined,
       page: currentPage.value - 1,
       size: pageSize.value,

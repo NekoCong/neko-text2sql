@@ -15,7 +15,7 @@ const page = ref<AccessAuditPage>({ items: [], total: 0, page: 0, size: 50 })
 const actorFilter = ref('')
 const actionFilter = ref('')
 const entityTypeFilter = ref('')
-const resultFilter = ref<string>('')
+const resultFilter = ref<'SUCCESS' | 'DENIED' | '' | undefined>('')
 const timeRange = ref<[Date, Date] | null>(null)
 const currentPage = ref(1)
 const pageSize = ref(50)
@@ -30,7 +30,8 @@ async function load(): Promise<void> {
       actorId: actorFilter.value.trim() || undefined,
       action: actionFilter.value.trim() || undefined,
       entityType: entityTypeFilter.value.trim() || undefined,
-      result: resultFilter.value === '' ? undefined : (resultFilter.value as 'SUCCESS' | 'DENIED'),
+      result:
+        resultFilter.value == null || resultFilter.value === '' ? undefined : resultFilter.value,
       from: timeRange.value ? timeRange.value[0].getTime() : undefined,
       to: timeRange.value ? timeRange.value[1].getTime() + 1 : undefined,
       page: currentPage.value - 1,
@@ -214,7 +215,6 @@ onMounted(() => {
 
       <el-drawer
         v-model="drawerVisible"
-        class="ac-drawer"
         title="审计详情"
         size="min(860px, 94vw)"
         append-to-body

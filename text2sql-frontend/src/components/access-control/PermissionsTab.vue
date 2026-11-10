@@ -88,7 +88,8 @@ function isModuleIndeterminate(module: string): boolean {
 }
 
 function toggleModule(module: string, checked: string | number | boolean): void {
-  const keys = moduleKeys(module)
+  // Group toggles must preserve the built-in administrator's locked keys in both directions.
+  const keys = moduleKeys(module).filter((key) => !isKeyDisabled(key))
   const set = new Set(selectedKeys.value)
   if (checked === true) {
     keys.forEach((key) => set.add(key))
@@ -256,7 +257,10 @@ onMounted(async () => {
             :disabled="!canWrite || isKeyDisabled(permission.key)"
           >
             <span class="permissions__item-main">
-              <code class="permissions__key">{{ permission.key }}</code>
+              <span class="permissions__item-heading">
+                <code class="permissions__key">{{ permission.key }}</code>
+                <span class="permissions__action">操作：{{ permission.action }}</span>
+              </span>
               <span v-if="permission.description" class="permissions__desc">
                 {{ permission.description }}
               </span>
@@ -337,9 +341,21 @@ onMounted(async () => {
   white-space: normal;
 }
 
+.permissions__item-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--ac-space-4) var(--ac-space-8);
+}
+
 .permissions__key {
   color: var(--ac-text);
   font-size: 13px;
+}
+
+.permissions__action {
+  color: var(--ac-muted);
+  font-size: var(--ac-text-meta);
 }
 
 .permissions__desc {

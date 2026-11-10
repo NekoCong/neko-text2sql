@@ -153,10 +153,13 @@ function incompatibleReason(): string | null {
     return null
   }
   const kind = columnKind(column.typeName)
-  if (attribute.kind === 'numeric' && kind === 'text') {
+  if (attribute.kind === 'multi' && kind !== 'numeric') {
+    return 'classIds 是数值 ID 集合，请选择数值类型字段'
+  }
+  if (attribute.kind === 'numeric' && kind !== 'numeric') {
     return 'studentId 按数值比较，请选择数值类型字段'
   }
-  if (attribute.kind === 'text' && kind === 'numeric') {
+  if (attribute.kind === 'text' && kind !== 'text') {
     return '该主体属性按文本比较，请选择文本类型字段'
   }
   return null

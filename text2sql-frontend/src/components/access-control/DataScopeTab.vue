@@ -31,7 +31,7 @@ const datasources = ref<DatasourceDetail[]>([])
 const rules = ref<DataScope[]>([])
 
 const filterRoleId = ref('')
-const filterDatasourceId = ref('')
+const filterDatasourceId = ref<string | undefined>('')
 
 const dialogVisible = ref(false)
 const dialogRule = ref<DataScope | null>(null)

@@ -36,6 +36,10 @@ async function load(): Promise<void> {
 
 onMounted(load)
 
+/**
+ * Display-only bypass badge for the built-in bootstrap admin. Actual authorization remains
+ * permission-based on the backend; this matrix response has no role-permission signal to inspect.
+ */
 function isBypass(roleId: string): boolean {
   const role = matrix.value.roles.find((entry) => entry.id === roleId)
   return role?.builtIn === true && role.code === 'admin'
