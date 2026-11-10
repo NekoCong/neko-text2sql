@@ -94,6 +94,7 @@ mvn spring-boot:run
 | GET | `/api/admin/access-control/datasource-access` | 角色记录 × 数据源矩阵 |
 | GET/PUT | `/api/admin/access-control/roles/{id}/datasources` | 角色数据源授权 |
 | GET/PUT/DELETE | `/api/admin/access-control/data-scopes[/{id}]` | 数据范围策略（`ALL`/`FILTER`/`DENY`） |
+| GET | `/api/admin/access-control/datasources/{id}/schema` | 只读表/列元数据（数据范围编辑器用） |
 | GET/POST | `/api/admin/access-control/users` | 用户列表（分页，`user.read`）/ 创建（`user.manage`） |
 | GET/PUT | `/api/admin/access-control/users/{id}` | 用户详情 / 修改显示名 |
 | PUT | `/api/admin/access-control/users/{id}/status` | 停用/启用（旧令牌立即失效） |

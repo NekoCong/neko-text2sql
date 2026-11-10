@@ -163,7 +163,13 @@ PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org || echo '<server-ip>')
 log "Done"
 cat <<TXT
   Frontend : http://${PUBLIC_IP}/
-  Accounts : admin / admin123  (admin)     alice / alice123     bob / bob123   (regular users)
+  Accounts : admin / admin123              (admin, all permissions)
+             student01 / student123        (student, own rows only)
+             student02 / student123        (student, own rows only)
+             student03 / student123        (student, own rows only)
+             counselor01 / counselor123    (counselor, managed classes)
+  Access   : admin -> 权限管理 (/admin/access-control): roles, permissions, data scopes,
+             users, datasource grants, audit
   Status   : docker compose -f deploy/docker-compose.prod.yml ps
   Logs     : docker compose -f deploy/docker-compose.prod.yml logs -f backend
   Grafana  : ssh -L 3000:127.0.0.1:3000 root@${PUBLIC_IP}  then http://localhost:3000

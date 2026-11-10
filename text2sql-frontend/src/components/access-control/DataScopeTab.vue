@@ -2,14 +2,14 @@
 import { computed, onMounted, ref } from 'vue'
 import { Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
-import { listDatasources } from '@/api/datasources'
 import {
   deleteDataScope,
+  getDatasourceMatrix,
   listDataScopes,
   listRoles,
   normalizeAccessControlError,
 } from '@/api/accessControl'
-import type { AccessRole, DataScope, DatasourceDetail } from '@/types'
+import type { AccessRole, DataScope, DatasourceMatrixDatasource } from '@/types'
 import { useAuthStore } from '@/stores/auth'
 import DataScopeRuleDialog from '@/components/access-control/DataScopeRuleDialog.vue'
 
@@ -27,7 +27,7 @@ const policyTagTypes: Record<Policy, 'success' | 'primary' | 'danger'> = {
 
 const loading = ref(false)
 const roles = ref<AccessRole[]>([])
-const datasources = ref<DatasourceDetail[]>([])
+const datasources = ref<DatasourceMatrixDatasource[]>([])
 const rules = ref<DataScope[]>([])
 
 const filterRoleId = ref('')
@@ -49,7 +49,9 @@ async function loadRoles(): Promise<void> {
 
 async function loadDatasources(): Promise<void> {
   try {
-    datasources.value = await listDatasources()
+    // The matrix endpoint is gated by `access.manage` like the rest of this console, so an operator
+    // without `datasource.read` can still configure data scopes.
+    datasources.value = (await getDatasourceMatrix()).datasources
   } catch (error) {
     ElMessage.error(normalizeAccessControlError(error, '加载数据源失败').message)
   }

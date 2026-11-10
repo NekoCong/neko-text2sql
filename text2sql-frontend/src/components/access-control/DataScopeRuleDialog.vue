@@ -6,7 +6,7 @@ import type {
   AccessRole,
   DataScope,
   DataScopeRequest,
-  DatasourceDetail,
+  DatasourceMatrixDatasource,
   DatasourceSchema,
 } from '@/types'
 
@@ -40,7 +40,7 @@ const NUMERIC_TYPES = new Set([
 const props = defineProps<{
   modelValue: boolean
   roles: AccessRole[]
-  datasources: DatasourceDetail[]
+  datasources: DatasourceMatrixDatasource[]
   /** The rule to edit, or `null` to create a new one. */
   rule: DataScope | null
   defaultRoleId: string
@@ -142,7 +142,7 @@ function onTableChange(): void {
   form.columnName = ''
 }
 
-/** Rejects a FILTER pairing that the backend (or the type rule) would refuse. */
+/** Rejects a FILTER pairing that the backend would refuse. */
 function incompatibleReason(): string | null {
   if (form.policy !== 'FILTER' || !form.columnName || !form.principalAttribute) {
     return null
@@ -152,15 +152,11 @@ function incompatibleReason(): string | null {
   if (!attribute || !column) {
     return null
   }
-  const kind = columnKind(column.typeName)
-  if (attribute.kind === 'multi' && kind !== 'numeric') {
-    return 'classIds 是数值 ID 集合，请选择数值类型字段'
-  }
-  if (attribute.kind === 'numeric' && kind !== 'numeric') {
+  // Mirrors the backend rule: only `studentId` is rendered as a bare number and therefore needs a
+  // numeric column. `classIds` is an IN list and the other attributes are compared as text, so any
+  // column type is accepted for them (the backend does the same).
+  if (attribute.code === 'studentId' && columnKind(column.typeName) === 'text') {
     return 'studentId 按数值比较，请选择数值类型字段'
-  }
-  if (attribute.kind === 'text' && kind !== 'text') {
-    return '该主体属性按文本比较，请选择文本类型字段'
   }
   return null
 }
