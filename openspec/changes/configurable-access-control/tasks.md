@@ -3,9 +3,9 @@
 ## 1. Access-control schema and seed
 
 - [x] 1.1 Add `access_role`, `access_permission`, `access_role_permission`, `access_user_role`, `access_role_datasource`, `access_data_scope`, and `access_audit` to `text2sql-backend/src/main/resources/db/app-schema.sql` with the indexes needed by the resolver (user, role, datasource/table). Verify a fresh schema applies cleanly and `SHOW TABLES` lists all seven.
-- [ ] 1.2 Seed the built-in `admin`, `student`, and `counselor` roles, the permission catalog (including `user.read` and `user.manage`), role-permission mappings, datasource grants, and data-scope policies equivalent to today's `TablePolicy` in `db/app-data.sql` using idempotent inserts. Verify a fresh DB has exactly one built-in admin role and the expected permission/scope counts.
-- [ ] 1.3 Add an idempotent migration script under `text2sql-backend/src/main/resources/db/migration/` that creates the new tables if absent and backfills `access_user_role` from `app_user.role`, `access_role_datasource` from `datasource_access`, and `access_data_scope` from the current role behavior. Verify running it twice produces no duplicate rows and leaves the legacy tables untouched.
-- [ ] 1.4 Add `enabled BOOLEAN NOT NULL DEFAULT TRUE` and `token_version INTEGER NOT NULL DEFAULT 0` to `app_user` (schema + idempotent migration for existing volumes). Verify a fresh schema has both columns, existing rows backfill with `TRUE`/`0`, and the migration adds them to an existing table.
+- [x] 1.2 Seed the built-in `admin`, `student`, and `counselor` roles, the permission catalog (including `user.read` and `user.manage`), role-permission mappings, datasource grants, and data-scope policies equivalent to today's `TablePolicy` in `db/app-data.sql` using idempotent inserts. Verify a fresh DB has exactly one built-in admin role and the expected permission/scope counts.
+- [x] 1.3 Add an idempotent migration script under `text2sql-backend/src/main/resources/db/migration/` that creates the new tables if absent and backfills `access_user_role` from `app_user.role`, `access_role_datasource` from `datasource_access`, and `access_data_scope` from the current role behavior. Verify running it twice produces no duplicate rows and leaves the legacy tables untouched.
+- [x] 1.4 Add `enabled BOOLEAN NOT NULL DEFAULT TRUE` and `token_version INTEGER NOT NULL DEFAULT 0` to `app_user` (schema + idempotent migration for existing volumes). Verify a fresh schema has both columns, existing rows backfill with `TRUE`/`0`, and the migration adds them to an existing table.
 
 ## 2. Access-control domain and resolution
 
@@ -47,13 +47,13 @@
 - [x] 6.5 Build the Data scope tab: role/datasource/table selector, `ALL`/`FILTER`/`DENY`, column and principal-attribute selectors, and an effective-policy preview. Verify invalid combinations are blocked before save.
 - [x] 6.6 Build the Users and Datasource access tabs: user search/pagination, create-user dialog (username, display name, initial password, roles), edit display name, disable/enable, reset-password dialog, role assignment, and the migrated role-datasource matrix. Password inputs are write-only; the UI never displays a stored password. Verify changes persist, match backend state, and disabled users show the correct status.
 - [x] 6.7 Build the Audit tab: read-only table with actor, time, entity, result, and before/after expand. Verify `audit.read` gating and empty/error states.
-- [ ] 6.8 Make navigation and page guards permission-aware across the app (chat, datasources, model settings, access control). Verify a user without a module permission does not see its entry and direct API calls still return 403.
+- [x] 6.8 Make navigation and page guards permission-aware across the app (chat, datasources, model settings, access control). Verify a user without a module permission does not see its entry and direct API calls still return 403.
 
 ## 7. Documentation and migration
 
-- [ ] 7.1 Update `docs/nl2sql.md` with the configurable RBAC/data-scope model, the `DENY` > `ALL` > `FILTER` merge rule, and the CTE-safe enforcement note. Verify the documented examples match the implemented behavior.
-- [ ] 7.2 Update `docs/deploy.md` with the migration script, backup/rollback steps, and the existing-volume warning (init scripts do not rerun). Verify the commands are runnable as written.
-- [ ] 7.3 Update `README.md` with the admin access-control page (including user creation/disable/reset/role assignment), built-in roles, and the fact that role changes and account-status changes apply on the next request. Verify the described routes and seeds exist.
+- [x] 7.1 Update `docs/nl2sql.md` with the configurable RBAC/data-scope model, the `DENY` > `ALL` > `FILTER` merge rule, and the CTE-safe enforcement note. Verify the documented examples match the implemented behavior.
+- [x] 7.2 Update `docs/deploy.md` with the migration script, backup/rollback steps, and the existing-volume warning (init scripts do not rerun). Verify the commands are runnable as written.
+- [x] 7.3 Update `README.md` with the admin access-control page (including user creation/disable/reset/role assignment), built-in roles, and the fact that role changes and account-status changes apply on the next request. Verify the described routes and seeds exist.
 
 ## 8. Integration verification
 
@@ -61,8 +61,8 @@
 - [ ] 8.2 Run `npm test` and `npm run build` in `text2sql-frontend`; both must exit 0.
 - [ ] 8.3 Apply the migration to a copy of the seed database and compare effective access for `admin`, `student01`, and `counselor01` with the pre-change behavior. Verify `student01` still sees only own rows, `counselor01` sees only managed classes, and `admin` is unrestricted.
 - [ ] 8.4 End-to-end check: create a custom role, grant `chat.use` plus a filtered `score` policy, create a user with that role, and verify both the pipeline and AgentScope path return the filtered result; revoke the role and verify the next request is denied.
-- [ ] 8.5 Run the CTE regression and confirm a restricted user cannot read a protected table via a same-name CTE, including a schema-qualified body.
-- [ ] 8.6 Confirm the final diff contains no sandbox/container-isolation work, no approval workflow, and no dependency changes; update the change ledger with the results.
+- [x] 8.5 Run the CTE regression and confirm a restricted user cannot read a protected table via a same-name CTE, including a schema-qualified body.
+- [x] 8.6 Confirm the final diff contains no sandbox/container-isolation work, no approval workflow, and no dependency changes; update the change ledger with the results.
 - [ ] 8.7 E2E account lifecycle: create a user with the `student` role, log in, disable the account and verify the next request with the same token returns 401/403, re-enable and verify the old token is still rejected, reset the password and verify login with the old password fails and the new one succeeds; confirm the audit rows contain no password material.
 
 ## Workflow follow-up
