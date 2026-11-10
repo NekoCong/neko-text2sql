@@ -12,6 +12,11 @@
 --
 -- 不删除、不修改任何既有列与表：app_user.role、user_scope、datasource_access 原样保留，
 -- 供旧的展示逻辑与后续回滚使用。
+--
+-- 字符集：本文件含中文种子文本，必须显式固定连接字符集。否则 mysql 客户端按 latin1
+-- （cp1252）解释 UTF-8 字节，中文会以二次编码的形式写入（显示成乱码）。
+-- app-data.sql 出于同样的原因在开头设置了它。
+SET NAMES utf8mb4;
 
 -- --- 1. app_user 新增列 --------------------------------------------------------------------------
 SET @sql = (
@@ -295,3 +300,26 @@ INSERT IGNORE INTO access_role_datasource (role_id, datasource_id)
 SELECT r.id, d.datasource_id
   FROM datasource_access d
   JOIN access_role r ON r.code = d.role;
+
+-- --- 6. 修复早期版本写入的二次编码种子文本 -------------------------------------------------------
+-- 早期版本的本文件缺少 `SET NAMES utf8mb4`，通过 mysql 客户端执行时中文种子文本被二次编码
+-- （“学生”落库为对应的 cp1252 乱码）。INSERT IGNORE 不会更新既有行，所以这里做一次幂等修复。
+--
+-- 判定依据：二次编码的中文一定以 UTF-8 的 0xC3 开头（原 UTF-8 首字节 0xE4–0xE9 被拆成
+-- 0xC3 0xA4–0xC3 0xA9），而正确存储的中文首字节是 0xE4–0xE9、ASCII 名称是 0x20–0x7E，
+-- 两者都不会匹配。修复表达式把列按 latin1（cp1252）读回原始字节，再按 utf8mb4 重新解释；
+-- 修复后 HEX 不再以 C3 开头，因此重复执行是空操作。逐列判定，避免连带改写本来正确的列。
+UPDATE access_role
+   SET name = IF(HEX(name) LIKE 'C3%',
+                 CONVERT(CAST(CONVERT(name USING latin1) AS BINARY) USING utf8mb4),
+                 name),
+       description = IF(HEX(description) LIKE 'C3%',
+                        CONVERT(CAST(CONVERT(description USING latin1) AS BINARY) USING utf8mb4),
+                        description)
+ WHERE id LIKE 'seed-role-%';
+
+UPDATE access_permission
+   SET description = IF(HEX(description) LIKE 'C3%',
+                        CONVERT(CAST(CONVERT(description USING latin1) AS BINARY) USING utf8mb4),
+                        description)
+ WHERE id LIKE 'seed-perm-%';

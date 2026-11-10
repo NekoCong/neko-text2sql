@@ -269,9 +269,13 @@ sudo bash deploy/bootstrap.sh
 
 ```bash
 docker compose -f deploy/docker-compose.prod.yml --env-file deploy/.env exec -T mysql \
-  sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" \
+  sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$MYSQL_DATABASE" \
          < /docker-entrypoint-initdb.d/04-access-control.sql'
 ```
+
+> 迁移脚本自带 `SET NAMES utf8mb4`，命令行上的 `--default-character-set=utf8mb4` 只是双保险：
+> 缺了字符集设置时，中文种子文本会被二次编码成乱码。脚本末尾包含一次幂等修复，会纠正
+> 早期版本写入的乱码种子行。
 
 升级前先备份（本演示默认不持久化，但升级动作仍建议留一份）：
 

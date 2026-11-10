@@ -140,7 +140,7 @@ done
 
 for script in 03-app-migrate.sql 04-access-control.sql; do
     docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
-        sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" \"\$MYSQL_DATABASE\" < /docker-entrypoint-initdb.d/$script"
+        sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --default-character-set=utf8mb4 \"\$MYSQL_DATABASE\" < /docker-entrypoint-initdb.d/$script"
 done
 
 # --- 7. Wait for it to serve --------------------------------------------------------------------
