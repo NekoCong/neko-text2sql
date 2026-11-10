@@ -198,6 +198,14 @@ class AccessControlUserTest {
                 .isEqualTo(true);
         assertThat(tokenVersion(id)).isEqualTo(before + 2);
 
+        // Re-enabling does not resurrect the old token: its version is still stale.
+        client.get()
+                .uri("/api/auth/me")
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                .exchange()
+                .expectStatus()
+                .isUnauthorized();
+
         // A fresh login works again.
         assertThat(TestAuth.login(client, username, PASSWORD)).isNotBlank();
     }
