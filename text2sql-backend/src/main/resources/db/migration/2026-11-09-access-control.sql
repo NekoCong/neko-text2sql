@@ -8,7 +8,8 @@
 --      ADD COLUMN IF NOT EXISTS），与 deploy/app-migrate.sql 的写法一致。
 --   2. 建表使用 CREATE TABLE IF NOT EXISTS。
 --   3. 索引存在性用 information_schema.statistics 判断（MySQL 8 没有 CREATE INDEX IF NOT EXISTS）。
---   4. 回填使用 INSERT IGNORE + 主键/唯一键，重复执行不会产生重复行。
+--   4. 回填使用 INSERT IGNORE + 主键/唯一键，并且只在目标表为空时执行一次，重复执行不会产生重复行，
+--      也不会把管理端已移除的角色/授权重新写回。
 --
 -- 不删除、不修改任何既有列与表：app_user.role、user_scope、datasource_access 原样保留，
 -- 供旧的展示逻辑与后续回滚使用。
@@ -288,18 +289,25 @@ INSERT IGNORE INTO access_data_scope (id, role_id, datasource_id, table_name, po
     ('seed-scope-counselor-attendance', 'seed-role-counselor', 'campus', 'attendance', 'FILTER', 'class_id',   'classIds',   1792454400000, 1792454400000),
     ('seed-scope-counselor-course',     'seed-role-counselor', 'campus', 'course',     'ALL',    NULL,         NULL,         1792454400000, 1792454400000);
 
--- --- 5. 回填既有数据（幂等，不改动原表） ---------------------------------------------------------
+-- --- 5. 回填既有数据（只在首次迁移时执行，不改动原表） ------------------------------------------
+-- 只回填一次：目标表非空时整体跳过。否则每次部署都会把旧 `app_user.role` / `datasource_access`
+-- 重新授予一遍，把管理端已经移除的角色或撤销的数据源授权悄悄恢复。
+SET @backfill_user_roles = (SELECT COUNT(*) = 0 FROM access_user_role);
+SET @backfill_datasources = (SELECT COUNT(*) = 0 FROM access_role_datasource);
+
 -- 账号 -> 角色：沿用 app_user.role 的取值，按角色 code 关联；未知角色值自动跳过。
 INSERT IGNORE INTO access_user_role (user_id, role_id, created_at)
 SELECT u.id, r.id, 1792454400000
   FROM app_user u
-  JOIN access_role r ON r.code = u.role;
+  JOIN access_role r ON r.code = u.role
+ WHERE @backfill_user_roles;
 
 -- 角色 -> 数据源：沿用 datasource_access 的授权矩阵；管理员本来就没有行，无需特殊处理。
 INSERT IGNORE INTO access_role_datasource (role_id, datasource_id)
 SELECT r.id, d.datasource_id
   FROM datasource_access d
-  JOIN access_role r ON r.code = d.role;
+  JOIN access_role r ON r.code = d.role
+ WHERE @backfill_datasources;
 
 -- --- 6. 修复早期版本写入的二次编码种子文本 -------------------------------------------------------
 -- 早期版本的本文件缺少 `SET NAMES utf8mb4`，通过 mysql 客户端执行时中文种子文本被二次编码

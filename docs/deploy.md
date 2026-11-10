@@ -259,7 +259,8 @@ sudo bash deploy/bootstrap.sh
 - `app_user` 新增 `enabled BOOLEAN NOT NULL DEFAULT TRUE`、`token_version INTEGER NOT NULL DEFAULT 0`；
 - 新增 `access_role`、`access_permission`、`access_role_permission`、`access_user_role`、
   `access_role_datasource`、`access_data_scope`、`access_audit` 七张表与二级索引；
-- 回填内置角色/权限/数据范围，并按 `app_user.role` / `datasource_access` 回填用户角色与数据源授权；
+- 回填内置角色/权限/数据范围，并按 `app_user.role` / `datasource_access` 在**首次迁移时**回填一次
+  用户角色与数据源授权（目标表非空时跳过，避免部署把管理端已移除的角色/授权重新写回）；
 - 旧的 `app_user.role`、`user_scope`、`datasource_access` 原样保留，供回滚与旧展示逻辑使用。
 
 **全新数据卷**：compose 会把 `04-access-control.sql` 挂到 MySQL init 目录，首次初始化自动执行。

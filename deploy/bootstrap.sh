@@ -138,9 +138,15 @@ for _ in $(seq 1 60); do
 done
 [[ "$mysql_ready" -eq 1 ]] || fail "MySQL did not become ready in time; inspect: docker compose -f $COMPOSE_FILE logs mysql"
 
-for script in 03-app-migrate.sql 04-access-control.sql; do
+# Read the scripts from the host, not from /docker-entrypoint-initdb.d: a file bind mount keeps the
+# inode it was created with, so after `git pull` replaces a file the container would still execute the
+# old copy.
+for script in "$REPO_DIR/deploy/app-migrate.sql" \
+              "$REPO_DIR/text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql"; do
+    [[ -f "$script" ]] || fail "Cannot find migration $script"
     docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
-        sh -c "mysql -uroot -p\"\$MYSQL_ROOT_PASSWORD\" --default-character-set=utf8mb4 \"\$MYSQL_DATABASE\" < /docker-entrypoint-initdb.d/$script"
+        sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$MYSQL_DATABASE"' \
+        < "$script"
 done
 
 # --- 7. Wait for it to serve --------------------------------------------------------------------
