@@ -2,13 +2,20 @@ package com.nekocong.text2sql.web;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nekocong.text2sql.access.AccessControlRepository;
+import com.nekocong.text2sql.repository.UserRepository;
+import com.nekocong.text2sql.security.Roles;
+import com.nekocong.text2sql.user.AppUser;
 import java.util.Map;
+import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.web.reactive.server.WebTestClient;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -21,8 +28,19 @@ class ModelConfigControllerTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    private static final String PASSWORD = "secret123";
+
     @LocalServerPort
     private int port;
+
+    @Autowired
+    private UserRepository users;
+
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+
+    @Autowired
+    private AccessControlRepository access;
 
     private WebTestClient client;
     private String token;
@@ -30,7 +48,11 @@ class ModelConfigControllerTest {
     @BeforeEach
     void setUp() {
         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
-        token = TestAuth.registerAndLogin(client);
+        String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+        AppUser admin =
+                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
+        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
+        token = TestAuth.login(client, username, PASSWORD);
     }
 
     @Test

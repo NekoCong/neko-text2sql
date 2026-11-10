@@ -137,6 +137,17 @@ public class SecurityConfig {
                                         .access(datasourceWrite())
                                         .pathMatchers(HttpMethod.DELETE, "/api/text2sql/datasources/**")
                                         .access(datasourceWrite())
+                                        .pathMatchers(
+                                                HttpMethod.GET,
+                                                "/api/text2sql/datasources",
+                                                "/api/text2sql/datasources/**")
+                                        .access(datasourceRead())
+                                        .pathMatchers("/api/model-configs/**")
+                                        .access(modelManage())
+                                        .pathMatchers("/api/text2sql/**")
+                                        .access(chatUse())
+                                        .pathMatchers("/api/conversations/**")
+                                        .access(chatUse())
                                         .anyExchange()
                                         .authenticated())
                 .oauth2ResourceServer(
@@ -160,12 +171,39 @@ public class SecurityConfig {
     }
 
     /**
+     * Requires the {@code datasource.read} permission.
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> datasourceRead() {
+        return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_READ);
+    }
+
+    /**
      * Requires the {@code datasource.write} permission.
      *
      * @return the authorization manager
      */
     static ReactiveAuthorizationManager<AuthorizationContext> datasourceWrite() {
         return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_WRITE);
+    }
+
+    /**
+     * Requires the {@code chat.use} permission.
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> chatUse() {
+        return PermissionAuthorizationManager.permission(Permissions.CHAT_USE);
+    }
+
+    /**
+     * Requires the {@code model.manage} permission.
+     *
+     * @return the authorization manager
+     */
+    static ReactiveAuthorizationManager<AuthorizationContext> modelManage() {
+        return PermissionAuthorizationManager.permission(Permissions.MODEL_MANAGE);
     }
 
     /**
