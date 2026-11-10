@@ -128,8 +128,8 @@ mvn spring-boot:run
 | `rows` | `{columns, rows, rowCount, truncated, elapsedMs}` | 结果集（行以列名为键的对象数组） |
 | `chart`| `{type, xField, yField, title}` | GBI 图表推断（`BAR`/`LINE`/`PIE`/`NONE`） |
 | `citations` | `Citation[]` | 本次回答使用的文档原文引用（页码/坐标/字符区间/预签名预览地址）；无文档引用时不发 |
-| `delta`| 文本 | 仅 Agent 模式 |
-| `done` | `[DONE]` | 流结束 |
+| `delta`| 文本 | 仅 Agent 模式；受限账号的否定断言会在 `done` 前追加一条范围澄清 |
+| `done` | `[DONE]` | 流结束（始终是最后一个事件） |
 | `error`| 文本或 `{message}` | 错误信息（含权限拒绝原因） |
 
 ## 演示账号与数据权限
@@ -161,6 +161,9 @@ mvn spring-boot:run
   不能被停用、移除管理角色或通过角色权限/停用/改父级间接移除；内置 `admin` 角色不可停用、不可改父级。
   所有变更写入 `access_audit`（操作者、before/after、结果），被拒绝的提权也会记录 `DENIED`。
 - 未配置数据范围的账号（例如刚注册的学生）一律拒绝，而不是返回空结果。
+- **Agent 模式同样感知范围**：系统提示词按请求注入调用者范围（与流水线同一份文案），
+  `query_database` 返回 `{result, dataScope}` 信封，回答不得把权限过滤说成数据不存在、不得探测
+  范围外存在性；模型若仍给出否定断言，服务端在 `done` 前追加一次范围澄清（管理员不追加）。
 
 管理员界面：`/admin/access-control`（顶部导航「权限管理」，`access.manage` 可见），包含角色、权限、
 数据范围、用户、数据源授权、审计六个 Tab。旧页面 `/admin/datasource-access` 保留兼容。

@@ -62,7 +62,9 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 | `SqlGenerationService` | `nl2sql` | 调用 AgentScope `Model` 生成 SQL |
 | `SqlResultParser` | `nl2sql` | 从模型输出中宽松提取 `{sql, explanation}` |
 | `Text2SqlPipelineService` | `service` | 编排上述步骤，产出 `Flux<Text2SqlEvent>` |
-| `SqlTools` | `tool` | `@Tool`：`query_database` / `list_tables` / `describe_table` |
+| `DataScopeDescriber` | `security` | 范围文案的唯一来源：`summary`（兜底澄清用短文案）、`promptBlock`（注入生成/Agent 提示词）、`restricted`（fail-closed） |
+| `ScopeAnswerGuard` | `security` | 受限账号的否定断言兜底：在 SSE 流末尾追加一次范围澄清 |
+| `SqlTools` | `tool` | `@Tool`：`query_database` / `list_tables` / `describe_table`；`query_database` 返回 `{result, dataScope}` |
 | `Text2SqlController` | `web` | REST + SSE，映射事件为 `step/sql/rows/done/error` |
 
 ## 4. 安全模型
@@ -120,10 +122,13 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 | `sql` | 流水线 `{datasourceId, dialect, sql, explanation}`；Agent `{datasourceId, sql, rowCount, scopeApplied}` |
 | `rows` | `{columns:[{name,typeName}], rows:[{col:val}], rowCount, truncated, elapsedMs}` |
 | `chart` | `{type, xField, yField, title}` |
-| `delta` | 文本（Agent 模式） |
+| `delta` | 文本（Agent 模式）；受限账号的否定断言会在 `done` 前追加**一条**范围澄清 `delta` |
 | `done` / `error` | `[DONE]` / 文本或 `{message}` |
 
 两种路径展示的 `sql` 都是**已应用权限后实际执行**的语句。
+
+Agent 流的追加澄清不改变事件契约：仍然是 `delta`，仍然只追加、不重写已下发的文本，
+`done` 始终是最后一个事件，前端无需改动。
 
 新增事件名对既有 `EventSource` 监听器无影响，因此契约可向后兼容地扩展。
 
@@ -136,6 +141,32 @@ SSE: step(introspect/generate/execute) → sql → rows → done
   避免"list → describe → run"式的多跳 ReAct 造成的高延迟与不稳定。
 - 记忆/会话由 AgentScope 的 `AgentStateStore` 承担（默认 `JsonFileAgentStateStore`，
   多副本可换 Redis/JDBC）。
+
+### 6.1 范围感知回答
+
+权限过滤是执行层的硬约束，但模型如果不知道调用者的范围，就会把"被过滤掉"说成"数据不存在"。
+因此 Agent 路径在三个位置显式带上范围：
+
+1. **提示词**：`HarnessAgentFactory.create(Model, DataScope)` 按请求用
+   `PromptCatalog.render` 渲染 `prompts/agent-system.md` 的 `{{data_scope}}`
+   （文案来自 `DataScopeDescriber.promptBlock`，与流水线生成阶段**逐字相同**）。
+   没有"无范围"的重载，调用方无法漏传。`agent-system.md` 同时给出三条回答规则：
+   - 禁止把权限过滤表述为"数据库中没有记录/不存在"；
+   - 禁止为判断范围外数据是否存在而发起探测查询，也禁止对范围外对象下存在性结论；
+   - 管理员（`restricted=false`）按实际结果作答，不追加范围免责声明。
+2. **工具返回**：`query_database` 返回
+   `{"result": {sql, result, chart, ...}, "dataScope": {restricted, role, summary}}`。
+   `result` 与既有 `Text2SqlResult` 结构一致（未改字段），`dataScope` 是本次结果的范围依据；
+   `sql_runner` 子代理同样从 `result` 读取 SQL 与行。
+3. **确定性兜底**：`ScopeAnswerGuard` 累积 `delta` 文本，若受限账号的回答出现否定断言
+   （`不存在` / `没有数据` / `数据库中只有` / `未找到` / `没有找到` / `无数据`）且**尚未**说明范围
+   （`数据范围` / `权限范围` / `仅本人` / `所管班级` / `不可见` / `无权查看` / `仅限` / `可查看范围`），
+   则在 `done` 之前追加一条澄清：
+   `（说明：当前账号的数据范围仅限{summary}；未返回的数据可能在该范围之外，不能据此判断数据库中不存在。）`
+   管理员永远不会触发；已说明范围的回答也不会重复追加。守卫只累积文本、不缓冲整个流，
+   因此增量下发与首字延迟不受影响。
+
+范围文案只包含调用者**自己**的标识（本人学号、可管理班级 id），从不渲染范围外的班级、学号或表名。
 
 ## 7. 与 DB-GPT 能力对照
 
@@ -220,6 +251,11 @@ SSE: step(introspect/generate/execute) → sql → rows → done
 - `DataScopeRewriterTest` / `DataScopePolicyEngineTest` — `DENY` > `ALL` > `FILTER` 合并、CTE
   同名遮蔽/递归 CTE/schema 限定引用、越界条件与解析失败 fail-closed。
 - `AccessStatusIntegrationTest` — 停用账号与过期 `token_version` 在下一次请求被拒绝。
+- `DataScopeDescriberTest` — 学生/辅导员/管理员三种范围文案，且受限文案不含范围外班级、学号或表名。
+- `ScopeAnswerGuardTest` — 触发、不触发、已含范围说明、管理员四种情况。
+- `HarnessAgentFactoryTest` / `HarnessAgentFactorySubagentsTest` — 按请求渲染 `{{data_scope}}`（学生/管理员）、
+  无残留占位符、`sql_runner` 提示说明 `{result, dataScope}` 信封。
+- `Text2SqlControllerAgentStreamTest` — 澄清 `delta` 只追加一次且 `done` 仍是最后一个事件。
 
 > 所有测试运行在 `test` profile（H2 应用库），无需 MySQL。测试通过真实 `/api/auth/register`+`/login` 取 JWT 后再访问受保护接口。
 
