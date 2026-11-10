@@ -178,11 +178,14 @@ function onConversationSelect(): void {
   }
 }
 
-// Session lifecycle: load the history once signed in, drop it again on logout.
+// Session lifecycle: load the history once signed in *and* allowed to chat, drop it again on
+// logout or when `chat.use` is lost. Keying on the permission (not just the token) means a
+// non-chat account never triggers a 403 from the conversations API on boot, and a profile
+// refresh that grants `chat.use` still loads the history.
 watch(
-  () => auth.isAuthenticated,
-  (authenticated) => {
-    if (authenticated) {
+  () => auth.isAuthenticated && auth.can('chat.use'),
+  (chatEnabled) => {
+    if (chatEnabled) {
       void conversation.load().catch(() => {
         // The sidebar stays empty; an expired token is handled by the http interceptor.
       })

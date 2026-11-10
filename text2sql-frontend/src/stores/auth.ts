@@ -95,7 +95,9 @@ export const useAuthStore = defineStore('auth', () => {
   /**
    * Re-fetches the profile from `me()` and applies it, so `can()`/`isAdmin` reflect the server's
    * current permission set rather than a stale localStorage snapshot. An explicit 401 clears the
-   * session; any other failure keeps the stored profile (fail closed on the caller's side).
+   * session; any other failure keeps the stored profile, so a backend that is down or erroring can
+   * leave stale UI entries visible. That is not a security hole: the API rejects every call without
+   * the permission, and the UI is only a convenience layer.
    *
    * <p>Concurrent callers share one in-flight request. Used on app boot (fire-and-forget, so the
    * app is not blocked) and by the router guard before a permission-gated route is rendered.
