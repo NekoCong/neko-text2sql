@@ -113,16 +113,16 @@ ssh -L 3000:127.0.0.1:3000 -L 9090:127.0.0.1:9090 -L 3306:127.0.0.1:3306 <user>@
 
 ### 2.3 代码怎么上服务器
 
-仓库远端：`https://github.com/NekoCong/text2sql-demo.git` —— **public**，匿名克隆即可：
+仓库远端：`https://github.com/NekoCong/neko-text2sql.git` —— **public**，匿名克隆即可：
 
 ```bash
-git clone https://github.com/NekoCong/text2sql-demo.git /root/text2sql-demo
+git clone https://github.com/NekoCong/neko-text2sql.git /root/neko-text2sql
 ```
 
 服务器上现在是真正的 git checkout，日常更新就是：
 
 ```bash
-cd /root/text2sql-demo && git pull
+cd /root/neko-text2sql && git pull
 ```
 
 > **历史说明（否则会误判）**：首次部署时这个仓库是私有的，服务器没有凭据，`git clone` 会报
@@ -140,8 +140,8 @@ cd /root/text2sql-demo && git pull
 ```bash
 # 1) 拉代码（仓库是 public）
 sudo apt-get update && sudo apt-get install -y git    # RHEL 系用 dnf
-git clone https://github.com/NekoCong/text2sql-demo.git /root/text2sql-demo
-cd /root/text2sql-demo
+git clone https://github.com/NekoCong/neko-text2sql.git /root/neko-text2sql
+cd /root/neko-text2sql
 
 # 2) 准备密钥
 cp deploy/.env.example deploy/.env
@@ -228,8 +228,8 @@ curl -s -X POST http://127.0.0.1/api/auth/login \
 
 ```bash
 # 新机器上（IP 可能已经变了）
-git clone https://github.com/NekoCong/text2sql-demo.git /root/text2sql-demo
-cd /root/text2sql-demo
+git clone https://github.com/NekoCong/neko-text2sql.git /root/neko-text2sql
+cd /root/neko-text2sql
 cp deploy/.env.example deploy/.env   # 重新填密钥
 sudo bash deploy/bootstrap.sh
 ```
@@ -353,12 +353,12 @@ Docker 构建不受影响（镜像里自带 JDK 25）。
 | `deploy/bootstrap.sh` | 幂等的服务器初始化脚本 |
 | `deploy/docker-compose.prod.yml` | 全栈编排（MySQL + pgvector + MinIO + otel + backend + frontend） |
 | `deploy/.env.example` | 密钥 + 镜像地址模板；`deploy/.env` 已 git-ignore |
-| `text2sql-backend/Dockerfile` | 多阶段：`maven:3.9-eclipse-temurin-25` 构建 → `eclipse-temurin:25-jre-alpine` 运行（非 root） |
-| `text2sql-frontend/Dockerfile` | `node:22-alpine` 构建 → `nginx:alpine` 托管 |
-| `text2sql-frontend/nginx.conf` | SPA 回退 + `/api` 反代 + SSE 关缓冲 |
+| `neko-text2sql-backend/Dockerfile` | 多阶段：`maven:3.9-eclipse-temurin-25` 构建 → `eclipse-temurin:25-jre-alpine` 运行（非 root） |
+| `neko-text2sql-frontend/Dockerfile` | `node:22-alpine` 构建 → `nginx:alpine` 托管 |
+| `neko-text2sql-frontend/nginx.conf` | SPA 回退 + `/api` 反代 + SSE 关缓冲 |
 | `docker-compose.yml` | **本地**只用基础设施（MySQL + otel-lgtm），不含应用容器 |
-| `text2sql-backend/src/main/resources/db/app-data.sql` | 种子数据：admin / student01-03 / counselor01 + 数据范围 + 会话 + 内置角色/权限 |
-| `text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql` | 已有数据卷的幂等迁移：`app_user` 两列、七张 `access_*` 表、索引、种子与回填 |
+| `neko-text2sql-backend/src/main/resources/db/app-data.sql` | 种子数据：admin / student01-03 / counselor01 + 数据范围 + 会话 + 内置角色/权限 |
+| `neko-text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql` | 已有数据卷的幂等迁移：`app_user` 两列、七张 `access_*` 表、索引、种子与回填 |
 
 ---
 

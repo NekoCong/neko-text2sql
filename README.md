@@ -1,4 +1,4 @@
-# Text2SQL Monorepo
+# neko-text2sql
 
 将自然语言问题转换为 SQL 并**真正执行**的全栈工程（DB-GPT 的 Java/Vue 精简实现）。
 仓库根目录仅作为**容器**（不做 Maven 聚合），前端与后端是两个相互独立的子工程。
@@ -17,13 +17,13 @@
 ## 目录结构
 
 ```
-text2sql-demo/                  # 仓库根（保持不变）
-├── text2sql-frontend/          # 前端：Vue 3 + Vite + TypeScript + Element Plus
+neko-text2sql/                  # 仓库根
+├── neko-neko-text2sql-frontend/     # 前端：Vue 3 + Vite + TypeScript + Element Plus
 │   ├── src/api/                #   axios 封装 + SSE 流式客户端（step/sql/rows）
 │   ├── src/stores/             #   Pinia 会话状态 + 数据源
 │   ├── src/views/              #   ChatView / AboutView
 │   └── vite.config.ts          #   /api 代理到后端 :8080
-└── text2sql-backend/           # 后端：Java 25 + Spring Boot 4 (WebFlux) + AgentScope 2.0
+└── neko-neko-text2sql-backend/      # 后端：Java 25 + Spring Boot 4 (WebFlux) + AgentScope 2.0
     ├── pom.xml
     ├── agentscope/workspace/   #   AgentScope 工作区：AGENTS.md
     └── src/main/
@@ -47,8 +47,8 @@ text2sql-demo/                  # 仓库根（保持不变）
 
 | 子工程 | 技术 |
 |--------|------|
-| text2sql-frontend | Vue 3、Vite、TypeScript、Pinia、Vue Router、Element Plus、Axios |
-| text2sql-backend  | Java 25、Spring Boot 4.1、Spring WebFlux、**Spring Data R2DBC（应用库，非阻塞）**、Spring JDBC（目标数据源，只读执行）、AgentScope 2.0（HarnessAgent）、DashScope 模型 |
+| neko-neko-text2sql-frontend | Vue 3、Vite、TypeScript、Pinia、Vue Router、Element Plus、Axios |
+| neko-neko-text2sql-backend  | Java 25、Spring Boot 4.1、Spring WebFlux、**Spring Data R2DBC（应用库，非阻塞）**、Spring JDBC（目标数据源，只读执行）、AgentScope 2.0（HarnessAgent）、DashScope 模型 |
 
 ## 前置条件
 
@@ -63,7 +63,7 @@ text2sql-demo/                  # 仓库根（保持不变）
 ## 启动后端
 
 ```bash
-cd text2sql-backend
+cd neko-text2sql-backend
 mvn spring-boot:run
 ```
 
@@ -173,7 +173,7 @@ mvn spring-boot:run
 ## 启动前端
 
 ```bash
-cd text2sql-frontend
+cd neko-text2sql-frontend
 npm install
 npm run dev        # http://localhost:5173
 ```
@@ -182,7 +182,7 @@ Vite 已将 `/api` 代理到 `http://localhost:8080`，前端无需配置后端�
 
 ## 配置
 
-后端配置位于 `text2sql-backend/src/main/resources/application.yml`。
+后端配置位于 `neko-text2sql-backend/src/main/resources/application.yml`。
 
 ### 数据源 `text2sql.datasources.*`
 
@@ -329,7 +329,7 @@ set MINERU_TOKEN=...
 | `sys-prompt-file` | Agent 系统提示词文件（`resources/prompts/`） | `prompts/agent-system.md` |
 | `sys-prompt` | 内联系统提示词（非空时覆盖文件） | 空 |
 
-> **提示词集中管理**：所有 LLM 提示词位于 `text2sql-backend/src/main/resources/prompts/`
+> **提示词集中管理**：所有 LLM 提示词位于 `neko-text2sql-backend/src/main/resources/prompts/`
 > （`agent-system.md` / `nl2sql-system.md` / `nl2sql-user.md`），使用 `{{占位符}}` 模板，由
 > `prompt.PromptCatalog` 加载渲染；配置文件只保留文件路径。提示词要求**模型最终以简体中文输出**
 > （SQL 解释与 Agent 回答）。

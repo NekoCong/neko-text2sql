@@ -38,11 +38,11 @@ These are the failure modes the spec implies but a happy-path test may miss. Eac
 ## Task 1: Schema, seed, and migration
 
 **Files:**
-- Modify: `text2sql-backend/src/main/resources/db/app-schema.sql`
-- Modify: `text2sql-backend/src/main/resources/db/app-data.sql`
-- Create: `text2sql-backend/src/main/resources/db/migration/2026-10-30-access-control.sql`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/persistence/AccessControlSeedTest.java`
-- Modify: `text2sql-backend/src/test/java/com/nekocong/text2sql/persistence/SeedDataScriptTest.java`
+- Modify: `neko-text2sql-backend/src/main/resources/db/app-schema.sql`
+- Modify: `neko-text2sql-backend/src/main/resources/db/app-data.sql`
+- Create: `neko-text2sql-backend/src/main/resources/db/migration/2026-10-30-access-control.sql`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/persistence/AccessControlSeedTest.java`
+- Modify: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/persistence/SeedDataScriptTest.java`
 
 **Interfaces:**
 - Produces tables: `access_role`, `access_permission`, `access_role_permission`, `access_user_role`, `access_role_datasource`, `access_data_scope`, `access_audit`.
@@ -65,7 +65,7 @@ assertThat(count("SELECT COUNT(*) FROM access_data_scope WHERE policy = 'FILTER'
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `cd text2sql-backend; $env:JAVA_HOME = "C:\Users\14364\.jdks\corretto-25.0.4.1"; .\mvnw.cmd -Dtest=AccessControlSeedTest test`
+Run: `cd neko-text2sql-backend; $env:JAVA_HOME = "C:\Users\14364\.jdks\corretto-25.0.4.1"; .\mvnw.cmd -Dtest=AccessControlSeedTest test`
 Expected: FAIL because `access_role` does not exist.
 
 - [ ] **Step 3: Add the schema tables**
@@ -116,7 +116,7 @@ Expected: PASS.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add text2sql-backend/src/main/resources/db text2sql-backend/src/test/java/com/nekocong/text2sql/persistence
+git add neko-text2sql-backend/src/main/resources/db neko-text2sql-backend/src/test/java/com/nekocong/text2sql/persistence
 git commit -m "feat(access): add access-control schema, seed, and migration"
 ```
 
@@ -125,18 +125,18 @@ git commit -m "feat(access): add access-control schema, seed, and migration"
 ## Task 2: Access model and effective-access resolver
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/AccessPermissions.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/PrincipalAttribute.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/PrincipalAttributes.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/PolicyType.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/TableKey.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicyRule.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/RoleSummary.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java`
-- Test helper: `text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeFixtures.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/AccessPermissions.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/PrincipalAttribute.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/PrincipalAttributes.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/PolicyType.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/TableKey.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicyRule.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/RoleSummary.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java`
+- Test helper: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeFixtures.java`
 
 **Interfaces:**
 - `DataScope` is redefined as:
@@ -210,7 +210,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/security text2sql-backend/src/main/java/com/nekocong/text2sql/repository text2sql-backend/src/test/java/com/nekocong/text2sql/security
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security neko-text2sql-backend/src/main/java/com/nekocong/text2sql/repository neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security
 git commit -m "feat(access): resolve effective roles, permissions, and data scope"
 ```
 
@@ -219,9 +219,9 @@ git commit -m "feat(access): resolve effective roles, permissions, and data scop
 ## Task 3: Data-scope policy engine
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopePolicyEngine.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/sql/SqlIdentifiers.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopePolicyEngineTest.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopePolicyEngine.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/sql/SqlIdentifiers.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopePolicyEngineTest.java`
 
 **Interfaces:**
 - `DataScopePolicyEngine`:
@@ -273,7 +273,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopePolicyEngine.java text2sql-backend/src/main/java/com/nekocong/text2sql/sql/SqlIdentifiers.java text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopePolicyEngineTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopePolicyEngine.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/sql/SqlIdentifiers.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopePolicyEngineTest.java
 git commit -m "feat(access): add data-scope policy engine"
 ```
 
@@ -282,18 +282,18 @@ git commit -m "feat(access): add data-scope policy engine"
 ## Task 4: SQL rewriter, CTE fix, and enforcement integration
 
 **Files:**
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/schema/FullSchemaProvider.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/schema/RagSchemaProvider.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/schema/SchemaProvider.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlAgentService.java` (type-only changes if needed)
-- Delete: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/schema/FullSchemaProvider.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/schema/RagSchemaProvider.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/schema/SchemaProvider.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlAgentService.java` (type-only changes if needed)
+- Delete: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java`
 
 **Interfaces:**
 - `DataScopeRewriter` constructor takes `DataScopePolicyEngine`; `rewrite(String sql, DataScope scope)`.
@@ -352,7 +352,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/sql text2sql-backend/src/main/java/com/nekocong/text2sql/schema text2sql-backend/src/main/java/com/nekocong/text2sql/tool text2sql-backend/src/main/java/com/nekocong/text2sql/service text2sql-backend/src/test/java/com/nekocong/text2sql/sql text2sql-backend/src/test/java/com/nekocong/text2sql/service text2sql-backend/src/test/java/com/nekocong/text2sql/tool
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/sql neko-text2sql-backend/src/main/java/com/nekocong/text2sql/schema neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service neko-text2sql-backend/src/test/java/com/nekocong/text2sql/sql neko-text2sql-backend/src/test/java/com/nekocong/text2sql/service neko-text2sql-backend/src/test/java/com/nekocong/text2sql/tool
 git commit -m "feat(access): enforce policy engine and fix CTE shadowing"
 ```
 
@@ -361,16 +361,16 @@ git commit -m "feat(access): enforce policy engine and fix CTE shadowing"
 ## Task 5: Permission-aware auth and controllers
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/AccessGuard.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ConversationController.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DataSourceController.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ModelConfigController.java` if it uses role checks
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/web/Text2SqlControllerScopeTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/AccessGuard.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ConversationController.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DataSourceController.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ModelConfigController.java` if it uses role checks
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/Text2SqlControllerScopeTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java`
 
 **Interfaces:**
 - `AccessGuard.require(String userId, String username, String permission) -> Mono<DataScope>`; throws 403 when absent.
@@ -420,7 +420,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/security/AccessGuard.java text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java text2sql-backend/src/main/java/com/nekocong/text2sql/controller text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java text2sql-backend/src/test/java/com/nekocong/text2sql/web
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/AccessGuard.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web
 git commit -m "feat(access): enforce permissions on controllers and registration"
 ```
 
@@ -429,12 +429,12 @@ git commit -m "feat(access): enforce permissions on controllers and registration
 ## Task 6: Admin API for roles and permissions
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlService.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java`
-- Create DTOs under `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/access/`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessControlServiceTest.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlService.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java`
+- Create DTOs under `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/access/`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessControlServiceTest.java`
 
 **Interfaces:**
 - `AccessControlController` endpoints:
@@ -491,7 +491,7 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/access text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/access text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java text2sql-backend/src/test/java/com/nekocong/text2sql/access
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/access neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/access neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/access
 git commit -m "feat(access): add role and permission admin API"
 ```
 
@@ -500,12 +500,12 @@ git commit -m "feat(access): add role and permission admin API"
 ## Task 7: Admin API for data scopes, users, datasources, audit, and anti-escalation
 
 **Files:**
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlService.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlService.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java`
 - Modify DTOs under `controller/dto/access/`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessControlServiceTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessControlServiceTest.java`
 
 **Interfaces:**
 - Endpoints:
@@ -568,7 +568,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/access text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/access text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java text2sql-backend/src/test/java/com/nekocong/text2sql/access
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/access neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AccessControlController.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/access neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlControllerTest.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/access
 git commit -m "feat(access): add data scope, user role, datasource, and audit APIs"
 ```
 
@@ -577,11 +577,11 @@ git commit -m "feat(access): add data scope, user role, datasource, and audit AP
 ## Task 8: Frontend access-control foundation
 
 **Files:**
-- Create: `text2sql-frontend/src/api/accessControl.ts`
-- Create: `text2sql-frontend/src/stores/access.ts`
-- Modify: `text2sql-frontend/src/types.ts`
-- Modify: `text2sql-frontend/src/router/index.ts`
-- Modify: `text2sql-frontend/src/App.vue`
+- Create: `neko-text2sql-frontend/src/api/accessControl.ts`
+- Create: `neko-text2sql-frontend/src/stores/access.ts`
+- Modify: `neko-text2sql-frontend/src/types.ts`
+- Modify: `neko-text2sql-frontend/src/router/index.ts`
+- Modify: `neko-text2sql-frontend/src/App.vue`
 - Test: `npm run build`; manual route/permission checks.
 
 **Interfaces:**
@@ -615,13 +615,13 @@ Add the nav item only when `access.has('access.manage')`. Keep `/admin/datasourc
 
 - [ ] **Step 4: Build and verify**
 
-Run: `cd text2sql-frontend; npm run build`
+Run: `cd neko-text2sql-frontend; npm run build`
 Expected: exit 0.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-frontend/src/api/accessControl.ts text2sql-frontend/src/stores/access.ts text2sql-frontend/src/types.ts text2sql-frontend/src/router/index.ts text2sql-frontend/src/App.vue
+git add neko-text2sql-frontend/src/api/accessControl.ts neko-text2sql-frontend/src/stores/access.ts neko-text2sql-frontend/src/types.ts neko-text2sql-frontend/src/router/index.ts neko-text2sql-frontend/src/App.vue
 git commit -m "feat(ui): add access-control client, store, and route"
 ```
 
@@ -630,9 +630,9 @@ git commit -m "feat(ui): add access-control client, store, and route"
 ## Task 9: Frontend Roles and Permissions tabs
 
 **Files:**
-- Create: `text2sql-frontend/src/views/AccessControlView.vue`
-- Create: `text2sql-frontend/src/components/access/RolesPanel.vue`
-- Create: `text2sql-frontend/src/components/access/PermissionsPanel.vue`
+- Create: `neko-text2sql-frontend/src/views/AccessControlView.vue`
+- Create: `neko-text2sql-frontend/src/components/access/RolesPanel.vue`
+- Create: `neko-text2sql-frontend/src/components/access/PermissionsPanel.vue`
 - Test: `npm run build`; manual create/edit/disable/cycle-error and permission matrix.
 
 **Interfaces:**
@@ -656,7 +656,7 @@ Manual: create a role, assign `chat.use`, verify the role appears; toggle a perm
 - [ ] **Step 4: Commit**
 
 ```bash
-git add text2sql-frontend/src/views/AccessControlView.vue text2sql-frontend/src/components/access
+git add neko-text2sql-frontend/src/views/AccessControlView.vue neko-text2sql-frontend/src/components/access
 git commit -m "feat(ui): add access-control roles and permissions tabs"
 ```
 
@@ -665,11 +665,11 @@ git commit -m "feat(ui): add access-control roles and permissions tabs"
 ## Task 10: Frontend Data scope, Users, Datasource, and Audit tabs
 
 **Files:**
-- Create: `text2sql-frontend/src/components/access/DataScopePanel.vue`
-- Create: `text2sql-frontend/src/components/access/UsersPanel.vue`
-- Create: `text2sql-frontend/src/components/access/DatasourcePanel.vue`
-- Create: `text2sql-frontend/src/components/access/AuditPanel.vue`
-- Modify: `text2sql-frontend/src/views/AccessControlView.vue`
+- Create: `neko-text2sql-frontend/src/components/access/DataScopePanel.vue`
+- Create: `neko-text2sql-frontend/src/components/access/UsersPanel.vue`
+- Create: `neko-text2sql-frontend/src/components/access/DatasourcePanel.vue`
+- Create: `neko-text2sql-frontend/src/components/access/AuditPanel.vue`
+- Modify: `neko-text2sql-frontend/src/views/AccessControlView.vue`
 - Test: `npm run build`; manual CRUD/permission checks.
 
 **Interfaces:**
@@ -694,7 +694,7 @@ Manual: create a filtered `score` policy for a custom role; assign a user; verif
 - [ ] **Step 4: Commit**
 
 ```bash
-git add text2sql-frontend/src/components/access text2sql-frontend/src/views/AccessControlView.vue
+git add neko-text2sql-frontend/src/components/access neko-text2sql-frontend/src/views/AccessControlView.vue
 git commit -m "feat(ui): add data scope, users, datasource, and audit tabs"
 ```
 
@@ -720,7 +720,7 @@ Document:
 - [ ] **Step 2: Run the backend suite**
 
 ```powershell
-cd text2sql-backend
+cd neko-text2sql-backend
 $env:JAVA_HOME = "C:\Users\14364\.jdks\corretto-25.0.4.1"
 .\mvnw.cmd test
 ```
@@ -730,7 +730,7 @@ Expected: all tests pass.
 - [ ] **Step 3: Run the frontend build and tests**
 
 ```powershell
-cd text2sql-frontend
+cd neko-text2sql-frontend
 npm test
 npm run build
 ```

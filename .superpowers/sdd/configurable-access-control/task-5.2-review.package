@@ -1,0 +1,1373 @@
+﻿## Commits
+4c9ba62 feat(access-control): permission catalog and role-permission matrix (task 5.2)
+ccb973f chore(openspec): mark role admin API task complete
+
+## Stat
+ .../changes/configurable-access-control/tasks.md   |   2 +-
+ .../text2sql/access/AccessAdminRepository.java     |  32 +-
+ .../text2sql/access/AccessAdminService.java        | 297 +++++++++++++++
+ .../nekocong/text2sql/access/AccessPermission.java |  25 ++
+ .../text2sql/access/PermissionEscalationGuard.java |  41 ++
+ .../access/R2dbcAccessAdminRepository.java         |  52 +++
+ .../access/api/AccessControlController.java        |  55 ++-
+ .../access/api/dto/AccessPermissionView.java       |  38 ++
+ .../api/dto/AccessRolePermissionsRequest.java      |  15 +
+ .../access/api/dto/AccessRolePermissionsView.java  |  20 +
+ .../access/AccessAdminServiceTransactionTest.java  |  15 +
+ .../text2sql/web/AccessControlPermissionTest.java  | 418 +++++++++++++++++++++
+ 12 files changed, 1003 insertions(+), 7 deletions(-)
+
+## Diff
+diff --git a/openspec/changes/configurable-access-control/tasks.md b/openspec/changes/configurable-access-control/tasks.md
+index 0f22df0..7246060 100644
+--- a/openspec/changes/configurable-access-control/tasks.md
++++ b/openspec/changes/configurable-access-control/tasks.md
+@@ -23,21 +23,21 @@
+ - [x] 3.5 Add account-status and session invalidation: login rejects disabled accounts; the JWT carries the user's `token_version` (`ver`); the access resolver rejects a disabled account or version mismatch on every request; disable, re-enable and password reset bump the version; self-registration assigns the seeded `student` role. Verify disabled login returns 401, an old token is rejected after disable and after reset, a re-enabled account still needs a new login, and a newly registered user has the student role.
+ 
+ ## 4. SQL rewriting and CTE fix
+ 
+ - [x] 4.1 Fix CTE scoping in `DataScopeRewriter`: a non-recursive CTE's own name is not visible inside its body, only previously defined CTEs are; reject CTE names that collide with protected tables; reject recursive CTEs in this phase. Verify tests for same-name masking, schema-qualified body, nested CTE, legal CTE, and recursive rejection.
+ - [x] 4.2 Harden the row-predicate builder: quote identifiers, escape string values consistently with MySQL, and reject unknown/unsafe identifiers. Verify tests for quote/backslash handling and identifier rejection.
+ - [x] 4.3 Add a regression test that a restricted user's `WITH ... AS (SELECT * FROM protected_table)` query is rejected or filtered and returns no out-of-scope rows.
+ 
+ ## 5. Admin API
+ 
+-- [ ] 5.1 Add role CRUD and hierarchy endpoints under `/api/admin/access-control/roles`, including built-in protection, code immutability, and cycle rejection. Verify 200/403/409 cases and audit rows.
++- [x] 5.1 Add role CRUD and hierarchy endpoints under `/api/admin/access-control/roles`, including built-in protection, code immutability, and cycle rejection. Verify 200/403/409 cases and audit rows.
+ - [ ] 5.2 Add permission catalog and role-permission matrix endpoints. Verify assigning/revoking a permission changes the next request's effective permission.
+ - [ ] 5.3 Add data-scope endpoints with server-side validation against datasource metadata and the principal-attribute catalog. Verify invalid table/column/attribute and raw-SQL input are rejected with 422.
+ - [ ] 5.4 Add user management endpoints under `/api/admin/access-control/users`: search/paginate (`user.read`), create with an initial password, edit the display name, disable/enable, reset password, and assign/remove roles (`user.manage`). Password fields are write-only and never echoed back. Verify create/duplicate-username/disable/enable/reset/role-assignment cases, that responses contain no password material, and that every mutation is audited.
+ - [ ] 5.5 Migrate the datasource-access matrix to role records and expose it through the access-control API. Verify the existing grant/revoke behavior and the next-request effect.
+ - [ ] 5.6 Add audit read endpoints and write audit rows for every access-control mutation, including denied escalation attempts and user lifecycle events without password material. Verify audit rows contain actor, before/after, result, and that `audit.read` is required.
+ - [ ] 5.7 Implement anti-escalation and lockout protection: only `access.manage` manages roles/permissions/data scopes, `user.manage` manages users, no self-grant of permissions the actor lacks (including roles assigned during user creation), the last `access.manage` holder cannot be removed, disabled, or have the admin role revoked, and the built-in admin cannot be deleted/disabled. Verify each rejection with a test.
+ 
+ ## 6. Frontend access-control area
+ 
+ - [ ] 6.1 Add TypeScript types and API client functions for roles, permissions, data scopes, users, datasource grants, and audit. Verify the client compiles and each function maps to the backend route.
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+index d2b6ae8..272c189 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+@@ -53,25 +53,55 @@ public interface AccessAdminRepository {
+      * @param id the role id
+      * @param name the display name
+      * @param description the description, or {@code null}
+      * @param parentId the parent role, or {@code null}
+      * @param enabled whether the role participates in effective access
+      * @return completion
+      */
+     Mono<Void> updateRole(
+             String id, String name, String description, String parentId, boolean enabled);
+ 
++    /**
++     * Lists the whole permission catalog, ordered by module then key.
++     *
++     * @return the catalog
++     */
++    Mono<List<AccessPermission>> permissions();
++
++    /**
++     * Loads the permission keys granted to one role directly, ordered by key.
++     *
++     * <p>Inherited permissions are not included: this is the role's own, editable set.
++     *
++     * @param roleId the role id
++     * @return the granted keys (empty when the role holds none)
++     */
++    Mono<List<String>> permissionKeysOf(String roleId);
++
++    /**
++     * Replaces one role's permission set.
++     *
++     * <p>Deletes every grant of the role, then inserts the given ones. Both statements must run in
++     * the caller's transaction so the set is replaced atomically.
++     *
++     * @param roleId the role id
++     * @param permissionIds the catalog ids to grant (already validated against the catalog)
++     * @return completion
++     */
++    Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds);
++
+     /**
+      * Appends one audit row.
+      *
+      * @param actorId the acting user id
+-     * @param action the action key ({@code role.create}, {@code role.update}, {@code role.disable})
++     * @param action the action key ({@code role.create}, {@code role.update}, {@code role.disable},
++     *     {@code role.permissions})
+      * @param entityType the entity type ({@code ROLE})
+      * @param entityId the affected role id, or {@code null}
+      * @param beforeJson the serialized before state, or {@code null}
+      * @param afterJson the serialized after state, or {@code null}
+      * @param result {@code SUCCESS} or {@code DENIED}
+      * @param reason the human-readable reason, or {@code null}
+      * @return completion
+      */
+     Mono<Void> record(
+             String actorId,
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+index 89f4e92..b57612d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+@@ -1,23 +1,31 @@
+ package com.nekocong.text2sql.access;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
++import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import com.nekocong.text2sql.security.Roles;
+ import java.util.HashSet;
+ import java.util.List;
++import java.util.Map;
++import java.util.Objects;
+ import java.util.Set;
++import java.util.TreeSet;
+ import java.util.regex.Pattern;
++import java.util.stream.Collectors;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.ReactiveTransactionManager;
+ import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.reactive.TransactionalOperator;
+ import org.springframework.transaction.support.DefaultTransactionDefinition;
+ import org.springframework.web.server.ResponseStatusException;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+@@ -78,67 +86,356 @@ public class AccessAdminService {
+     private static final int MAX_DESCRIPTION_LENGTH = 512;
+ 
+     /** Matches {@code access_audit.reason VARCHAR(512)}. */
+     private static final int MAX_REASON_LENGTH = 512;
+ 
+     private static final String ENTITY_TYPE = "ROLE";
+ 
+     private static final String ACTION_CREATE = "role.create";
+     private static final String ACTION_UPDATE = "role.update";
+     private static final String ACTION_DISABLE = "role.disable";
++    private static final String ACTION_PERMISSIONS = "role.permissions";
++
++    /** Matches {@code access_permission.permission_key VARCHAR(128)}. */
++    private static final int MAX_PERMISSION_KEY_LENGTH = 128;
++
++    /** Upper bound on keys per replace request, so a huge body cannot drive unbounded work. */
++    private static final int MAX_PERMISSION_KEYS = 256;
+ 
+     private static final String RESULT_SUCCESS = "SUCCESS";
+     private static final String RESULT_DENIED = "DENIED";
+ 
+     private static final String REASON_DUPLICATE_CODE = "角色编码已存在";
+     private static final String REASON_IMMUTABLE_CODE = "角色编码不可修改";
+     private static final String REASON_BUILT_IN_ADMIN = "内置管理员角色不能停用";
+     private static final String REASON_BUILT_IN_ADMIN_PARENT = "内置管理员角色不能作为父角色";
+     private static final String REASON_CYCLE = "会形成循环继承";
+     private static final String REASON_PARENT_MISSING = "父角色不存在";
+     private static final String REASON_ROLE_MISSING = "角色不存在";
++    private static final String REASON_TOO_MANY_PERMISSIONS =
++            "权限数量不能超过 " + MAX_PERMISSION_KEYS + " 个";
++    private static final String REASON_MALFORMED_PERMISSIONS = "权限列表格式不正确";
+ 
+     private final AccessAdminRepository repository;
+     private final TransactionalOperator transactions;
+     private final TransactionalOperator newTransactions;
+     private final ObjectMapper objectMapper;
++    private final PermissionEscalationGuard escalationGuard;
+ 
+     /**
+      * Creates the service.
+      *
++     * <p>Spring constructs the service through this constructor; the guard defaults to the
++     * permissive one because the anti-escalation rule is not implemented yet. The four-argument
++     * overload exists so a future implementation (or a test) can supply the real guard.
++     *
+      * @param repository the admin repository
+      * @param transactionManager the R2DBC reactive transaction manager
+      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
+      */
++    @Autowired
+     public AccessAdminService(
+             AccessAdminRepository repository,
+             ReactiveTransactionManager transactionManager,
+             ObjectMapper objectMapper) {
++        this(repository, transactionManager, objectMapper, PermissionEscalationGuard.permitAll());
++    }
++
++    /**
++     * Creates the service with an explicit anti-escalation guard.
++     *
++     * @param repository the admin repository
++     * @param transactionManager the R2DBC reactive transaction manager
++     * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
++     * @param escalationGuard the guard consulted before a permission set is applied, or {@code null}
++     *     for the permissive one
++     */
++    public AccessAdminService(
++            AccessAdminRepository repository,
++            ReactiveTransactionManager transactionManager,
++            ObjectMapper objectMapper,
++            PermissionEscalationGuard escalationGuard) {
++
+         this.repository = repository;
+         this.transactions = TransactionalOperator.create(transactionManager);
+         this.newTransactions =
+                 TransactionalOperator.create(
+                         transactionManager,
+                         new DefaultTransactionDefinition(
+                                 TransactionDefinition.PROPAGATION_REQUIRES_NEW));
+         this.objectMapper = objectMapper;
++        this.escalationGuard =
++                escalationGuard == null ? PermissionEscalationGuard.permitAll() : escalationGuard;
+     }
+ 
+     /**
+      * Lists every role, ordered by code.
+      *
+      * @return the role views
+      */
+     public Mono<List<AccessRoleView>> list() {
+         return repository.roles().map(roles -> roles.stream().map(AccessRoleView::of).toList());
+     }
+ 
++    /**
++     * Lists the permission catalog, ordered by module then key.
++     *
++     * @return the catalog
++     */
++    public Mono<List<AccessPermissionView>> permissions() {
++        return repository
++                .permissions()
++                .map(catalog -> catalog.stream().map(AccessPermissionView::of).toList());
++    }
++
++    /**
++     * Reads one role's own permission set (the keys it holds directly, not inherited ones).
++     *
++     * @param roleId the role id
++     * @return the role's keys, ordered
++     */
++    public Mono<AccessRolePermissionsView> permissionsOf(String roleId) {
++        return Mono.defer(
++                () -> {
++                    requireIdentifier(roleId);
++                    return repository
++                            .role(roleId)
++                            .switchIfEmpty(
++                                    Mono.error(
++                                            new ResponseStatusException(
++                                                    HttpStatus.NOT_FOUND, REASON_ROLE_MISSING)))
++                            .then(repository.permissionKeysOf(roleId))
++                            .map(keys -> new AccessRolePermissionsView(roleId, sortedKeys(keys)));
++                });
++    }
++
++    /**
++     * Replaces one role's permission set.
++     *
++     * <p>The <em>whole</em> set is replaced: a previously held key that is absent from the request is
++     * revoked. An empty or {@code null} list clears the role. Duplicates are de-duplicated; every key
++     * must exist in the catalog.
++     *
++     * <p>The set replacement and its {@code role.permissions} audit row commit in one transaction, so
++     * a failed audit insert also rolls the change back. Every rejection decided against the loaded
++     * role writes a {@code DENIED} row in its own transaction; a malformed request (bad path id, too
++     * many keys) fails with {@code 400} before the role is loaded and is not audited, matching the
++     * rule in this class's documentation.
++     *
++     * <p>Built-in roles are editable; the last-{@code access.manage} lockout rule is not enforced
++     * here.
++     *
++     * @param actorId the acting user id
++     * @param roleId the role id
++     * @param request the complete new set ({@code null} means empty)
++     * @return the stored set
++     */
++    public Mono<AccessRolePermissionsView> replacePermissions(
++            String actorId, String roleId, List<String> request) {
++        return Mono.defer(
++                        () -> {
++                            // Shape-only checks first: they need no entity, so they are not audited.
++                            requireIdentifier(roleId);
++                            List<String> requestedKeys = normalizeKeys(request);
++                            Mono<AccessRole> loaded =
++                                    repository
++                                            .role(roleId)
++                                            .switchIfEmpty(
++                                                    Mono.defer(
++                                                            () ->
++                                                                    denyPermissions(
++                                                                                    actorId,
++                                                                                    roleId,
++                                                                                    List.of(),
++                                                                                    requestedKeys,
++                                                                                    new Denial(
++                                                                                            REASON_ROLE_MISSING,
++                                                                                            HttpStatus
++                                                                                                    .NOT_FOUND))
++                                                                            .cast(AccessRole.class)));
++                            return loaded.flatMap(
++                                    role -> replacePermissions(actorId, role, requestedKeys));
++                        })
++                .as(transactions::transactional)
++                .map(keys -> new AccessRolePermissionsView(roleId, keys));
++    }
++
++    /** Applies a validated replace request to a loaded role. */
++    private Mono<List<String>> replacePermissions(
++            String actorId, AccessRole role, List<String> requestedKeys) {
++        return repository
++                .permissions()
++                .flatMap(catalog -> {
++                    Map<String, String> idByKey =
++                            catalog.stream()
++                                    .collect(
++                                            Collectors.toMap(
++                                                    AccessPermission::key,
++                                                    AccessPermission::id,
++                                                    (first, second) -> first));
++                    for (String key : requestedKeys) {
++                        if (!idByKey.containsKey(key)) {
++                            return denyPermissions(
++                                    actorId,
++                                    role.id(),
++                                    List.of(),
++                                    requestedKeys,
++                                    new Denial("未知权限：" + key, HttpStatus.BAD_REQUEST));
++                        }
++                    }
++                    return repository
++                            .permissionKeysOf(role.id())
++                            .flatMap(before -> {
++                                List<String> beforeKeys = sortedKeys(before);
++                                Mono<Void> replaced =
++                                        Mono.defer(
++                                                () ->
++                                                        repository.replaceRolePermissions(
++                                                                role.id(),
++                                                                requestedKeys.stream()
++                                                                        .map(idByKey::get)
++                                                                        .toList()));
++                                // Anti-escalation seam: reject a grant the actor does not hold. This
++                                // guard permits everything until that rule is implemented.
++                                Mono<Boolean> allowed =
++                                        escalationGuard
++                                                .check(actorId, role, beforeKeys, requestedKeys)
++                                                .onErrorResume(
++                                                        Denial.class,
++                                                        denial ->
++                                                                denyPermissions(
++                                                                                actorId,
++                                                                                role.id(),
++                                                                                beforeKeys,
++                                                                                requestedKeys,
++                                                                                denial)
++                                                                        .then(Mono.empty()))
++                                                .thenReturn(Boolean.TRUE);
++                                return allowed.flatMap(
++                                        granted ->
++                                                replaced.then(
++                                                        recordPermissionChange(
++                                                                actorId,
++                                                                role.id(),
++                                                                beforeKeys,
++                                                                requestedKeys)));
++                            });
++                });
++    }
++
++    /**
++     * Validates the shape of a requested key set: trims each key, rejects an over-long or
++     * over-populated list, and removes duplicates while keeping the canonical key order.
++     *
++     * <p>Key existence is checked against the catalog afterwards (in {@link #replacePermissions}),
++     * because that denial is decided against the loaded role and is audited.
++     */
++    private static List<String> normalizeKeys(List<String> request) {
++        if (request == null || request.isEmpty()) {
++            return List.of();
++        }
++        if (request.size() > MAX_PERMISSION_KEYS) {
++            throw badRequest(REASON_TOO_MANY_PERMISSIONS);
++        }
++        TreeSet<String> keys = new TreeSet<>();
++        for (String raw : request) {
++            if (raw == null) {
++                throw badRequest(REASON_MALFORMED_PERMISSIONS);
++            }
++            String key = raw.trim();
++            if (key.isEmpty()) {
++                throw badRequest(REASON_MALFORMED_PERMISSIONS);
++            }
++            if (key.length() > MAX_PERMISSION_KEY_LENGTH) {
++                throw badRequest("未知权限：" + key);
++            }
++            keys.add(key);
++        }
++        return List.copyOf(keys);
++    }
++
++    private static List<String> sortedKeys(List<String> keys) {
++        if (keys == null || keys.isEmpty()) {
++            return List.of();
++        }
++        return keys.stream().filter(Objects::nonNull).distinct().sorted().toList();
++    }
++
++    /** Appends the SUCCESS row for a replaced permission set, then returns its key list. */
++    private Mono<List<String>> recordPermissionChange(
++            String actorId, String roleId, List<String> before, List<String> after) {
++        return repository
++                .record(
++                        actorId,
++                        ACTION_PERMISSIONS,
++                        ENTITY_TYPE,
++                        roleId,
++                        jsonKeys(before),
++                        jsonKeys(after),
++                        RESULT_SUCCESS,
++                        null)
++                .thenReturn(after);
++    }
++
++    /**
++     * Appends a DENIED row for a rejected permission-set change, in its own transaction, then fails
++     * with the rejection. Mirrors {@link #deny} for role edits.
++     */
++    private Mono<List<String>> denyPermissions(
++            String actorId,
++            String roleId,
++            List<String> before,
++            List<String> requestedKeys,
++            Denial denial) {
++        Mono<Void> record =
++                repository
++                        .record(
++                                actorId,
++                                ACTION_PERMISSIONS,
++                                ENTITY_TYPE,
++                                roleId,
++                                jsonKeysForDenial(before),
++                                jsonKeysForDenial(requestedKeys),
++                                RESULT_DENIED,
++                                truncate(denial.getMessage()))
++                        .onErrorResume(
++                                error -> {
++                                    log.error(
++                                            "Failed to append the DENIED audit row {}",
++                                            ACTION_PERMISSIONS,
++                                            error);
++                                    return Mono.empty();
++                                });
++        return record.as(newTransactions::transactional).then(Mono.error(denial));
++    }
++
++    /** Serializes a key array for the DENIED payload; never fails the rejection. */
++    private String jsonKeysForDenial(List<String> keys) {
++        try {
++            return jsonKeys(keys);
++        } catch (IllegalStateException ex) {
++            log.warn("Failed to serialize the DENIED audit payload; storing null instead", ex);
++            return null;
++        }
++    }
++
++    private String jsonKeys(List<String> keys) {
++        if (keys == null) {
++            return null;
++        }
++        try {
++            return objectMapper.writeValueAsString(keys);
++        } catch (JsonProcessingException ex) {
++            throw new IllegalStateException("Failed to serialize the access-audit payload", ex);
++        }
++    }
++
+     /**
+      * Creates a role.
+      *
+      * @param actorId the acting user id
+      * @param request the request (required)
+      * @return the created role
+      */
+     public Mono<AccessRoleView> create(String actorId, AccessRoleRequest request) {
+         return Mono.defer(
+                         () -> {
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessPermission.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessPermission.java
+new file mode 100644
+index 0000000..37a4f53
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessPermission.java
+@@ -0,0 +1,25 @@
++package com.nekocong.text2sql.access;
++
++/**
++ * One entry of the seeded permission catalog.
++ *
++ * <p>The catalog is the authoritative list of grantable permission keys: a role's permission set may
++ * only reference keys that appear here, so an unknown key is rejected instead of being silently
++ * stored and never enforced. Keys are dotted {@code module.action} strings such as {@code chat.use};
++ * enforcement code refers to them through {@link Permissions}.
++ *
++ * @param id the permission id
++ * @param key the permission key ({@code access_permission.permission_key})
++ * @param module the module the key belongs to ({@code chat}, {@code datasource}, ...)
++ * @param action the action within the module ({@code use}, {@code read}, ...)
++ * @param description the human-readable description, or {@code null}
++ * @param builtIn whether the catalog row is seeded
++ */
++public record AccessPermission(
++        String id,
++        String key,
++        String module,
++        String action,
++        String description,
++        boolean builtIn) {
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/PermissionEscalationGuard.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/PermissionEscalationGuard.java
+new file mode 100644
+index 0000000..1f64d04
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/PermissionEscalationGuard.java
+@@ -0,0 +1,41 @@
++package com.nekocong.text2sql.access;
++
++import java.util.List;
++import reactor.core.publisher.Mono;
++
++/**
++ * Seam for the anti-escalation rule of the permission-set endpoint.
++ *
++ * <p>Consulted by {@link AccessAdminService#replacePermissions} after the request has been validated
++ * against the catalog and the role's current set has been loaded, and before the set is written.
++ * Returning an error (a {@link AccessAdminService.Denial}) rejects the change and writes its {@code
++ * DENIED} audit row. The default is the permissive instance: the rule itself ("an administrator may
++ * not grant a permission they do not hold") is not implemented yet.
++ *
++ * <p>The intended implementation resolves the actor's {@link EffectiveAccess} and rejects any
++ * requested key absent from it. It receives the actor id rather than the context so it can resolve
++ * lazily and stay usable outside a request (for example in tests).
++ */
++@FunctionalInterface
++public interface PermissionEscalationGuard {
++
++    /**
++     * This instance, which permits every change (no anti-escalation rule yet).
++     *
++     * @return the permissive guard
++     */
++    static PermissionEscalationGuard permitAll() {
++        return (actorId, role, before, after) -> Mono.empty();
++    }
++
++    /**
++     * Decides whether a permission-set change may be applied.
++     *
++     * @param actorId the acting user id
++     * @param role the role whose set is being replaced
++     * @param before the role's current keys, sorted
++     * @param after the requested keys, sorted and de-duplicated
++     * @return completion when the change is allowed, or an error rejecting it
++     */
++    Mono<Void> check(String actorId, AccessRole role, List<String> before, List<String> after);
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+index 3f050bd..15075ab 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+@@ -86,20 +86,72 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+                                 + " WHERE id = :id")
+                         .bind("id", id)
+                         .bind("name", name)
+                         .bind("enabled", enabled)
+                         .bind("updatedAt", System.currentTimeMillis());
+         spec = bindNullable(spec, "description", description);
+         spec = bindNullable(spec, "parentId", parentId);
+         return spec.then();
+     }
+ 
++    @Override
++    public Mono<List<AccessPermission>> permissions() {
++        return client.sql("SELECT id, permission_key, module, action, description, built_in"
++                        + " FROM access_permission ORDER BY module, permission_key")
++                .map((row, meta) -> new AccessPermission(
++                        row.get("id", String.class),
++                        row.get("permission_key", String.class),
++                        row.get("module", String.class),
++                        row.get("action", String.class),
++                        row.get("description", String.class),
++                        Boolean.TRUE.equals(row.get("built_in", Boolean.class))))
++                .all()
++                .collectList();
++    }
++
++    @Override
++    public Mono<List<String>> permissionKeysOf(String roleId) {
++        return client.sql("SELECT p.permission_key"
++                        + " FROM access_permission p"
++                        + " JOIN access_role_permission rp ON rp.permission_id = p.id"
++                        + " WHERE rp.role_id = :roleId"
++                        + " ORDER BY p.permission_key")
++                .bind("roleId", roleId)
++                .map((row, meta) -> row.get("permission_key", String.class))
++                .all()
++                .collectList();
++    }
++
++    @Override
++    public Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds) {
++        Mono<Void> delete =
++                client.sql("DELETE FROM access_role_permission WHERE role_id = :roleId")
++                        .bind("roleId", roleId)
++                        .then();
++        if (permissionIds == null || permissionIds.isEmpty()) {
++            return delete;
++        }
++        // One INSERT ... SELECT per key keeps every value bound (no IN-list is built from client
++        // input). Duplicates are already removed by the service, so the primary key cannot collide.
++        Mono<Void> insert = Mono.empty();
++        for (String permissionId : List.copyOf(permissionIds)) {
++            insert =
++                    insert.then(
++                            client.sql("INSERT INTO access_role_permission (role_id, permission_id)"
++                                            + " VALUES (:roleId, :permissionId)")
++                                    .bind("roleId", roleId)
++                                    .bind("permissionId", permissionId)
++                                    .then());
++        }
++        return delete.then(insert);
++    }
++
+     @Override
+     public Mono<Void> record(
+             String actorId,
+             String action,
+             String entityType,
+             String entityId,
+             String beforeJson,
+             String afterJson,
+             String result,
+             String reason) {
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index a248e2d..55cddbf 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -1,107 +1,152 @@
+ package com.nekocong.text2sql.access.api;
+ 
+ import com.nekocong.text2sql.access.AccessAdminService;
++import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
++import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
++import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.security.core.Authentication;
+ import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.PostMapping;
+ import org.springframework.web.bind.annotation.PutMapping;
+ import org.springframework.web.bind.annotation.RequestBody;
+-import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.ResponseStatus;
+ import org.springframework.web.bind.annotation.RestController;
+ import org.springframework.web.server.ResponseStatusException;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Admin API for the role catalog: list, create and update roles.
+  *
+  * <p>There is no delete: a role is disabled with {@code PUT {enabled:false}}. Access is enforced by
+  * {@code SecurityConfig} ({@code /api/admin/**} requires the {@code access.manage} permission
+  * resolved from the access-control tables), so an unauthorized caller never reaches these handlers.
+  *
+  * <p>Validation and conflict failures are answered here with {@code {"status": ..., "message": ...}}.
+  * The handler is deliberately local to this controller: the application-wide advice is untouched, so
+  * the error shape of the auth, conversation, model, datasource and knowledge endpoints does not
+  * change.
+  *
+  * <p>The acting user id (the token subject) is passed to the service for the audit trail; without an
+  * authenticated principal the request fails closed with {@code 401}.
++ *
++ * <p>The permission catalog and the role-permission matrix live next to the role routes but are
++ * mapped on a separate base path ({@code /api/admin/access-control}), because {@code /permissions}
++ * is not a role resource. Both are gated by the same {@code access.manage} route rule.
+  */
+ @RestController
+-@RequestMapping("/api/admin/access-control/roles")
+ public class AccessControlController {
+ 
++    private static final String ROLES = "/api/admin/access-control/roles";
++
+     private final AccessAdminService service;
+ 
+     /**
+      * Creates the controller.
+      *
+      * @param service the role administration service
+      */
+     public AccessControlController(AccessAdminService service) {
+         this.service = service;
+     }
+ 
+     /**
+      * Lists every role, ordered by code.
+      *
+      * @return the roles
+      */
+-    @GetMapping
++    @GetMapping(path = ROLES)
+     public Mono<List<AccessRoleView>> list() {
+         return service.list();
+     }
+ 
+     /**
+      * Creates a role.
+      *
+      * @param request the role
+      * @return the created role
+      */
+-    @PostMapping
++    @PostMapping(path = ROLES)
+     @ResponseStatus(HttpStatus.CREATED)
+     public Mono<AccessRoleView> create(@RequestBody AccessRoleRequest request) {
+         return actorId()
+                 .flatMap(actor -> service.create(actor, request))
+                 .onErrorMap(AccessControlController::asStatusException);
+     }
+ 
+     /**
+      * Updates a role ({@code code} is immutable).
+      *
+      * <p>An omitted or {@code null} field keeps its current value; {@code "parentId": ""} clears the
+      * parent.
+      *
+      * @param id the role id
+      * @param request the new values
+      * @return the updated role
+      */
+-    @PutMapping("/{id}")
++    @PutMapping(path = ROLES + "/{id}")
+     public Mono<AccessRoleView> update(
+             @PathVariable String id, @RequestBody(required = false) AccessRoleRequest request) {
+         return actorId()
+                 .flatMap(actor -> service.update(actor, id, request))
+                 .onErrorMap(AccessControlController::asStatusException);
+     }
+ 
++    /**
++     * Lists the permission catalog, ordered by module then key.
++     *
++     * @return the catalog
++     */
++    @GetMapping(path = "/api/admin/access-control/permissions")
++    public Mono<List<AccessPermissionView>> permissions() {
++        return service.permissions();
++    }
++
++    /**
++     * Reads a role's own permission set.
++     *
++     * @param id the role id
++     * @return the role's permission keys
++     */
++    @GetMapping(path = ROLES + "/{id}/permissions")
++    public Mono<AccessRolePermissionsView> rolePermissions(@PathVariable String id) {
++        return service.permissionsOf(id).onErrorMap(AccessControlController::asStatusException);
++    }
++
++    /**
++     * Replaces a role's permission set with the complete requested set.
++     *
++     * @param id the role id
++     * @param request the new set (an empty list clears it); a missing body clears it too
++     * @return the stored set
++     */
++    @PutMapping(path = ROLES + "/{id}/permissions")
++    public Mono<AccessRolePermissionsView> replaceRolePermissions(
++            @PathVariable String id,
++            @RequestBody(required = false) AccessRolePermissionsRequest request) {
++        List<String> permissions = request == null ? null : request.permissions();
++        return actorId()
++                .flatMap(actor -> service.replacePermissions(actor, id, permissions))
++                .onErrorMap(AccessControlController::asStatusException);
++    }
++
+     /** Converts the service's audited rejection into the status exception the handler renders. */
+     private static Throwable asStatusException(Throwable error) {
+         ResponseStatusException mapped = AccessAdminService.toResponseStatusException(error);
+         return mapped == null ? error : mapped;
+     }
+ 
+     /**
+      * Renders a validation or conflict failure raised by the role API.
+      *
+      * @param exception the failure
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessPermissionView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessPermissionView.java
+new file mode 100644
+index 0000000..c6a6874
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessPermissionView.java
+@@ -0,0 +1,38 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import com.nekocong.text2sql.access.AccessPermission;
++
++/**
++ * A permission catalog entry as returned to clients.
++ *
++ * @param id the permission id
++ * @param key the permission key ({@code chat.use})
++ * @param module the module ({@code chat})
++ * @param action the action within the module ({@code use})
++ * @param description the human-readable description, or {@code null}
++ * @param builtIn whether the catalog row is seeded
++ */
++public record AccessPermissionView(
++        String id,
++        String key,
++        String module,
++        String action,
++        String description,
++        boolean builtIn) {
++
++    /**
++     * Maps a catalog entry to its view.
++     *
++     * @param permission the permission
++     * @return the view
++     */
++    public static AccessPermissionView of(AccessPermission permission) {
++        return new AccessPermissionView(
++                permission.id(),
++                permission.key(),
++                permission.module(),
++                permission.action(),
++                permission.description(),
++                permission.builtIn());
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsRequest.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsRequest.java
+new file mode 100644
+index 0000000..b776828
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsRequest.java
+@@ -0,0 +1,15 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * Request body for replacing a role's permission set.
++ *
++ * <p>The list is the <em>complete</em> new set, not a delta: a key absent from it is revoked. An
++ * empty (or {@code null}) list clears every permission of the role. Duplicates are de-duplicated and
++ * every key must exist in the permission catalog.
++ *
++ * @param permissions the permission keys the role should hold
++ */
++public record AccessRolePermissionsRequest(List<String> permissions) {
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsView.java
+new file mode 100644
+index 0000000..f33fd59
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsView.java
+@@ -0,0 +1,20 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * One role's permission set, as permission keys.
++ *
++ * <p>Returned by both the read and the replace endpoints, so a client can apply the result without
++ * a second round trip. The list is ordered (by key) and free of duplicates.
++ *
++ * @param roleId the role id
++ * @param permissions the permission keys the role holds
++ */
++public record AccessRolePermissionsView(String roleId, List<String> permissions) {
++
++    /** Normalizes the key list so the view is structurally immutable. */
++    public AccessRolePermissionsView {
++        permissions = permissions == null ? List.of() : List.copyOf(permissions);
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+index 4f6dea3..c28329a 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+@@ -166,20 +166,35 @@ class AccessAdminServiceTransactionTest {
+                     String code, String name, String description, String parentId, boolean enabled) {
+                 return delegate.insertRole(code, name, description, parentId, enabled);
+             }
+ 
+             @Override
+             public Mono<Void> updateRole(
+                     String id, String name, String description, String parentId, boolean enabled) {
+                 return delegate.updateRole(id, name, description, parentId, enabled);
+             }
+ 
++            @Override
++            public Mono<List<AccessPermission>> permissions() {
++                return delegate.permissions();
++            }
++
++            @Override
++            public Mono<List<String>> permissionKeysOf(String roleId) {
++                return delegate.permissionKeysOf(roleId);
++            }
++
++            @Override
++            public Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds) {
++                return delegate.replaceRolePermissions(roleId, permissionIds);
++            }
++
+             @Override
+             public Mono<Void> record(
+                     String actorId,
+                     String action,
+                     String entityType,
+                     String entityId,
+                     String beforeJson,
+                     String afterJson,
+                     String result,
+                     String reason) {
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlPermissionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlPermissionTest.java
+new file mode 100644
+index 0000000..78d348a
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlPermissionTest.java
+@@ -0,0 +1,418 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.nekocong.text2sql.access.AccessContextResolver;
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.access.EffectiveAccess;
++import com.nekocong.text2sql.access.Permissions;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/**
++ * The permission catalog and the role-permission matrix: read the catalog, read and replace one
++ * role's set, with audit and next-request effect.
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class AccessControlPermissionTest {
++
++    private static final String PASSWORD = "secret123";
++
++    private static final String BASE = "/api/admin/access-control";
++
++    private static final String ROLES = BASE + "/roles";
++
++    private static final String PERMISSIONS = BASE + "/permissions";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
++    @Autowired
++    private AccessContextResolver resolver;
++
++    @Autowired
++    private DatabaseClient db;
++
++    private WebTestClient client;
++    private String adminToken;
++    private String adminId;
++    private String customRoleId;
++
++    @BeforeEach
++    void setUp() {
++        client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++        String username = unique("admin");
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++        adminId = admin.id();
++        adminToken = TestAuth.login(client, username, PASSWORD);
++
++        // A fresh, non built-in role per test: the H2 database is shared across test contexts, so the
++        // seeded roles must not be edited in place.
++        customRoleId = createRole();
++    }
++
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    @Test
++    void listsTheNineSeededPermissionsWithModuleActionAndBuiltIn() {
++        List<Map<String, Object>> catalog =
++                (List) client.get()
++                        .uri(PERMISSIONS)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBodyList(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++
++        assertThat(catalog).isNotEmpty();
++        assertThat(catalog)
++                .filteredOn(row -> Boolean.TRUE.equals(row.get("builtIn")))
++                .extracting(row -> String.valueOf(row.get("key")))
++                .containsExactlyInAnyOrder(
++                        Permissions.CHAT_USE,
++                        Permissions.DATASOURCE_READ,
++                        Permissions.DATASOURCE_WRITE,
++                        Permissions.MODEL_MANAGE,
++                        Permissions.ACCESS_MANAGE,
++                        Permissions.USER_READ,
++                        Permissions.USER_MANAGE,
++                        Permissions.AUDIT_READ,
++                        Permissions.BYPASS_DATA_SCOPE);
++
++        // Ordered by module then key.
++        List<String> ordering =
++                catalog.stream().map(row -> row.get("module") + "." + row.get("key")).toList();
++        assertThat(ordering).isSorted();
++
++        // Every entry carries its module/action split and an id.
++        assertThat(catalog).allSatisfy(row -> {
++            assertThat(row.get("id")).isNotNull();
++            assertThat(row.get("module")).isNotNull();
++            assertThat(row.get("action")).isNotNull();
++            assertThat(row.get("builtIn")).isNotNull();
++        });
++
++        Map<String, Object> chatUse =
++                catalog.stream()
++                        .filter(row -> Permissions.CHAT_USE.equals(row.get("key")))
++                        .findFirst()
++                        .orElseThrow();
++        assertThat(chatUse.get("module")).isEqualTo("chat");
++        assertThat(chatUse.get("action")).isEqualTo("use");
++        assertThat(chatUse.get("builtIn")).isEqualTo(true);
++        assertThat(chatUse.get("id")).isNotNull();
++    }
++
++    @Test
++    void replacesASubsetAndTheNextReadReflectsIt() {
++        putPermissions(List.of(Permissions.CHAT_USE, Permissions.DATASOURCE_WRITE))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.roleId")
++                .isEqualTo(customRoleId)
++                .jsonPath("$.permissions.length()")
++                .isEqualTo(2)
++                .jsonPath("$.permissions[0]")
++                .isEqualTo(Permissions.CHAT_USE);
++
++        // Replace (not merge): only the requested keys remain, and the result is ordered by key.
++        putPermissions(List.of(Permissions.DATASOURCE_WRITE))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.permissions.length()")
++                .isEqualTo(1)
++                .jsonPath("$.permissions[0]")
++                .isEqualTo(Permissions.DATASOURCE_WRITE);
++
++        assertThat(getPermissions()).containsExactly(Permissions.DATASOURCE_WRITE);
++    }
++
++    @Test
++    void duplicateKeysAreDeduplicated() {
++        putPermissions(List.of(Permissions.CHAT_USE, Permissions.CHAT_USE))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.permissions.length()")
++                .isEqualTo(1);
++
++        assertThat(getPermissions()).containsExactly(Permissions.CHAT_USE);
++    }
++
++    @Test
++    void anEmptyArrayClearsTheSet() {
++        putPermissions(List.of(Permissions.CHAT_USE, Permissions.USER_READ))
++                .expectStatus()
++                .isOk();
++        assertThat(getPermissions()).hasSize(2);
++
++        putPermissions(List.of())
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.permissions.length()")
++                .isEqualTo(0);
++
++        assertThat(getPermissions()).isEmpty();
++    }
++
++    @Test
++    void anUnknownRoleIsNotFoundAndAudited() {
++        String unknown = UUID.randomUUID().toString();
++
++        client.put()
++                .uri(ROLES + "/" + unknown + "/permissions")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("permissions", List.of(Permissions.CHAT_USE)))
++                .exchange()
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("角色不存在");
++
++        client.get()
++                .uri(ROLES + "/" + unknown + "/permissions")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isNotFound();
++
++        assertThat(auditRows(unknown, "DENIED")).isEqualTo(1);
++    }
++
++    @Test
++    void anUnknownKeyIsRejectedAndAudited() {
++        putPermissions(List.of(Permissions.CHAT_USE)).expectStatus().isOk();
++        long successBefore = auditRows(customRoleId, "SUCCESS");
++
++        putPermissions(List.of(Permissions.CHAT_USE, "chat.nope"))
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("未知权限：chat.nope");
++
++        assertThat(getPermissions())
++                .as("a rejected request does not change the set")
++                .containsExactly(Permissions.CHAT_USE);
++        assertThat(auditRows(customRoleId, "DENIED")).isEqualTo(1);
++        assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(successBefore);
++    }
++
++    @Test
++    void aStudentCannotReadOrReplacePermissions() {
++        String username = unique("student");
++        AppUser student =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT)
++                        .block();
++        access.assignRoleByCode(student.id(), Roles.STUDENT).block();
++        String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
++
++        client.get()
++                .uri(PERMISSIONS)
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        client.get()
++                .uri(ROLES + "/" + customRoleId + "/permissions")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        client.put()
++                .uri(ROLES + "/" + customRoleId + "/permissions")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("permissions", List.of(Permissions.ACCESS_MANAGE)))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        assertThat(getPermissions()).isEmpty();
++        assertThat(auditRows(customRoleId, "SUCCESS")).isZero();
++    }
++
++    @Test
++    void eachReplaceWritesOneSuccessRowWithSortedBeforeAndAfter() {
++        putPermissions(List.of(Permissions.USER_READ, Permissions.CHAT_USE))
++                .expectStatus()
++                .isOk();
++        putPermissions(List.of(Permissions.USER_READ))
++                .expectStatus()
++                .isOk();
++
++        assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(2);
++
++        Map<String, Object> latest = latestAuditRow(customRoleId, "SUCCESS");
++        assertThat(String.valueOf(latest.get("action"))).isEqualTo("role.permissions");
++        assertThat(String.valueOf(latest.get("entity_type"))).isEqualTo("ROLE");
++        assertThat(String.valueOf(latest.get("before_json")))
++                .isEqualTo("[\"" + Permissions.CHAT_USE + "\",\"" + Permissions.USER_READ + "\"]");
++        assertThat(String.valueOf(latest.get("after_json")))
++                .isEqualTo("[\"" + Permissions.USER_READ + "\"]");
++    }
++
++    @Test
++    void aGrantedPermissionAppliesToTheNextRequest() {
++        AppUser user =
++                users.insert(unique("u"), passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT)
++                        .block();
++        assign(user.id(), customRoleId);
++        assertThat(resolve(user.id()).hasPermission(Permissions.DATASOURCE_WRITE)).isFalse();
++
++        putPermissions(List.of(Permissions.DATASOURCE_WRITE)).expectStatus().isOk();
++
++        EffectiveAccess after = resolve(user.id());
++        assertThat(after.hasPermission(Permissions.DATASOURCE_WRITE))
++                .as("the edited set applies on the next resolution, without a new token")
++                .isTrue();
++        assertThat(after.roles()).extracting(role -> role.id()).contains(customRoleId);
++    }
++
++    // --- helpers ----------------------------------------------------------------------------
++
++    private String bearer() {
++        return "Bearer " + adminToken;
++    }
++
++    private WebTestClient.ResponseSpec putPermissions(List<String> keys) {
++        return client.put()
++                .uri(ROLES + "/" + customRoleId + "/permissions")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("permissions", keys))
++                .exchange();
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<String> getPermissions() {
++        Map<String, Object> body =
++                client.get()
++                        .uri(ROLES + "/" + customRoleId + "/permissions")
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBody(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(body).isNotNull();
++        assertThat(body.get("roleId")).isEqualTo(customRoleId);
++        return (List<String>) body.getOrDefault("permissions", List.of());
++    }
++
++    private EffectiveAccess resolve(String userId) {
++        Integer tokenVersion =
++                db.sql("SELECT token_version FROM app_user WHERE id = :id")
++                        .bind("id", userId)
++                        .map((row, meta) -> {
++                            Integer version = row.get("token_version", Integer.class);
++                            return version == null ? 0 : version;
++                        })
++                        .one()
++                        .block();
++        return resolver.resolve(userId, tokenVersion).block();
++    }
++
++    /** Creates a fresh, non built-in role and returns its id. */
++    private String createRole() {
++        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String roleId = "test-role-perm-" + suffix;
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_role (id, code, name, description, parent_id, built_in,"
++                                + " enabled, created_at, updated_at)"
++                                + " VALUES (:id, :code, :name, NULL, NULL, FALSE, TRUE, :now, :now)")
++                .bind("id", roleId)
++                .bind("code", "perm-" + suffix)
++                .bind("name", "Perm " + suffix)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        return roleId;
++    }
++
++    private void assign(String userId, String roleId) {
++        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:user, :role, :now)")
++                .bind("user", userId)
++                .bind("role", roleId)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++    }
++
++    private long auditRows(String entityId, String result) {
++        Long count =
++                db.sql(
++                                "SELECT COUNT(*) AS n FROM access_audit"
++                                        + " WHERE actor_id = :actorId AND action = :action"
++                                        + " AND entity_id = :entityId AND result = :result")
++                        .bind("actorId", adminId)
++                        .bind("action", "role.permissions")
++                        .bind("entityId", entityId)
++                        .bind("result", result)
++                        .map((row, meta) -> row.get("n", Long.class))
++                        .one()
++                        .block();
++        return count == null ? 0L : count;
++    }
++
++    private Map<String, Object> latestAuditRow(String entityId, String result) {
++        return db.sql(
++                        "SELECT action, entity_type, before_json, after_json, result FROM access_audit"
++                                + " WHERE actor_id = :actorId AND action = :action"
++                                + " AND entity_id = :entityId AND result = :result"
++                                + " ORDER BY created_at DESC, id DESC LIMIT 1")
++                .bind("actorId", adminId)
++                .bind("action", "role.permissions")
++                .bind("entityId", entityId)
++                .bind("result", result)
++                .map((row, meta) -> Map.<String, Object>of(
++                        "action", String.valueOf(row.get("action", String.class)),
++                        "entity_type", String.valueOf(row.get("entity_type", String.class)),
++                        "before_json", String.valueOf(row.get("before_json", String.class)),
++                        "after_json", String.valueOf(row.get("after_json", String.class)),
++                        "result", String.valueOf(row.get("result", String.class))))
++                .one()
++                .block();
++    }
++
++    private static String unique(String prefix) {
++        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++    }
++}

@@ -1,0 +1,3902 @@
+﻿## Commits
+2a43be1 refactor(ui): split data-scope and user dialogs out of the tab components
+ba674cb feat(access-control): add permission-management UI with six tabs
+84b0ffb feat(access-control): add read-only datasource schema endpoint
+
+## Stat
+ .../text2sql/access/DatasourceSchemaService.java   | 109 +++++
+ .../access/api/AccessControlController.java        |  23 +-
+ .../access/api/dto/DatasourceSchemaColumnView.java |  13 +
+ .../access/api/dto/DatasourceSchemaTableView.java  |  17 +
+ .../access/api/dto/DatasourceSchemaView.java       |  21 +
+ .../text2sql/web/AccessControlSchemaTest.java      | 152 +++++++
+ text2sql-frontend/src/App.vue                      |   7 +
+ text2sql-frontend/src/api/accessControl.ts         | 104 ++++-
+ .../src/components/access-control/AuditTab.vue     | 367 +++++++++++++++++
+ .../access-control/DataScopeRuleDialog.vue         | 381 ++++++++++++++++++
+ .../src/components/access-control/DataScopeTab.vue | 263 ++++++++++++
+ .../access-control/DatasourceAccessTab.vue         | 195 +++++++++
+ .../components/access-control/PermissionsTab.vue   | 350 ++++++++++++++++
+ .../src/components/access-control/RolesTab.vue     | 383 ++++++++++++++++++
+ .../src/components/access-control/UserDialogs.vue  | 443 +++++++++++++++++++++
+ .../src/components/access-control/UsersTab.vue     | 354 ++++++++++++++++
+ text2sql-frontend/src/router/index.ts              |  18 +-
+ text2sql-frontend/src/stores/auth.ts               |  37 ++
+ text2sql-frontend/src/types.ts                     |  18 +
+ text2sql-frontend/src/views/AccessControlView.vue  |  66 +++
+ 20 files changed, 3303 insertions(+), 18 deletions(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DatasourceSchemaService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DatasourceSchemaService.java
+new file mode 100644
+index 0000000..f195ea1
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DatasourceSchemaService.java
+@@ -0,0 +1,109 @@
++package com.nekocong.text2sql.access;
++
++import com.nekocong.text2sql.access.api.dto.DatasourceSchemaColumnView;
++import com.nekocong.text2sql.access.api.dto.DatasourceSchemaTableView;
++import com.nekocong.text2sql.access.api.dto.DatasourceSchemaView;
++import com.nekocong.text2sql.config.BlockingSchedulerConfig;
++import com.nekocong.text2sql.datasource.DataSourceRegistry;
++import com.nekocong.text2sql.schema.SchemaIntrospector;
++import com.nekocong.text2sql.schema.model.TableSchema;
++import java.util.List;
++import java.util.NoSuchElementException;
++import java.util.regex.Pattern;
++import org.springframework.beans.factory.annotation.Qualifier;
++import org.springframework.http.HttpStatus;
++import org.springframework.stereotype.Service;
++import org.springframework.web.server.ResponseStatusException;
++import reactor.core.publisher.Mono;
++import reactor.core.scheduler.Scheduler;
++
++/**
++ * The read-only datasource-schema endpoint backing the data-scope editor's table/column selectors.
++ *
++ * <p>Resolution and introspection are blocking JDBC work, so they run on the blocking scheduler
++ * (virtual threads), never on the event loop. The endpoint returns only the table/column names and
++ * type names — never connection settings or credentials. An unknown datasource is a {@code 404}; the
++ * route itself is gated by {@code access.manage} through the {@code /api/admin/**} rule, like the rest
++ * of the access-control surface.
++ */
++@Service
++public class DatasourceSchemaService {
++
++    /** The datasource id space, identical to {@link DataScopeService}'s registry id space. */
++    private static final Pattern DATASOURCE_ID_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,64}$");
++
++    private static final String REASON_DATASOURCE_MISSING = "数据源不存在";
++
++    private final DataSourceRegistry datasources;
++    private final SchemaIntrospector introspector;
++    private final Scheduler blockingScheduler;
++
++    /**
++     * Creates the service.
++     *
++     * @param datasources the target-datasource registry, to resolve the datasource
++     * @param introspector the live metadata reader (blocking JDBC)
++     * @param blockingScheduler the scheduler blocking reads are offloaded to
++     */
++    public DatasourceSchemaService(
++            DataSourceRegistry datasources,
++            SchemaIntrospector introspector,
++            @Qualifier(BlockingSchedulerConfig.BLOCKING_SCHEDULER) Scheduler blockingScheduler) {
++        this.datasources = datasources;
++        this.introspector = introspector;
++        this.blockingScheduler = blockingScheduler;
++    }
++
++    /**
++     * Reads one datasource's live table/column metadata.
++     *
++     * @param datasourceId the datasource id
++     * @return the schema
++     */
++    public Mono<DatasourceSchemaView> schema(String datasourceId) {
++        return Mono.defer(
++                        () -> {
++                            requireDatasourceId(datasourceId);
++                            return Mono.fromCallable(() -> introspect(datasourceId))
++                                    .subscribeOn(blockingScheduler)
++                                    .onErrorResume(
++                                            NoSuchElementException.class,
++                                            error -> Mono.error(notFound()));
++                        });
++    }
++
++    /** Resolves the datasource and maps its live metadata to the view. */
++    private DatasourceSchemaView introspect(String datasourceId) {
++        List<TableSchema> tables = introspector.introspect(datasources.resolve(datasourceId));
++        List<DatasourceSchemaTableView> viewTables =
++                tables.stream()
++                        .map(
++                                table ->
++                                        new DatasourceSchemaTableView(
++                                                table.name(),
++                                                table.columns().stream()
++                                                        .map(
++                                                                column ->
++                                                                        new DatasourceSchemaColumnView(
++                                                                                column.name(),
++                                                                                column.typeName()))
++                                                        .toList()))
++                        .toList();
++        return new DatasourceSchemaView(datasourceId, viewTables);
++    }
++
++    /** Validates the id against the registry id space (it is only ever bound, never interpolated). */
++    private static void requireDatasourceId(String value) {
++        if (value == null || !DATASOURCE_ID_PATTERN.matcher(value).matches()) {
++            throw badRequest("数据源标识无效");
++        }
++    }
++
++    private static ResponseStatusException notFound() {
++        return new ResponseStatusException(HttpStatus.NOT_FOUND, REASON_DATASOURCE_MISSING);
++    }
++
++    private static ResponseStatusException badRequest(String message) {
++        return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index 1896bc6..0379be5 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -1,34 +1,36 @@
+ package com.nekocong.text2sql.access.api;
+ 
+ import com.nekocong.text2sql.access.AccessAdminService;
+ import com.nekocong.text2sql.access.AuditQueryService;
+ import com.nekocong.text2sql.access.DataScopeService;
++import com.nekocong.text2sql.access.DatasourceSchemaService;
+ import com.nekocong.text2sql.access.RoleDatasourceService;
+ import com.nekocong.text2sql.access.RolePermissionService;
+ import com.nekocong.text2sql.access.UserAdminService;
+ import com.nekocong.text2sql.access.api.dto.AccessAuditPageView;
+ import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPage;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserView;
+ import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
+ import com.nekocong.text2sql.access.api.dto.DataScopeView;
+ import com.nekocong.text2sql.access.api.dto.DatasourceMatrixView;
++import com.nekocong.text2sql.access.api.dto.DatasourceSchemaView;
+ import com.nekocong.text2sql.access.api.dto.RoleDatasourcesRequest;
+ import com.nekocong.text2sql.access.api.dto.RoleDatasourcesView;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.security.core.Authentication;
+ import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+ import org.springframework.security.oauth2.jwt.Jwt;
+@@ -75,44 +77,48 @@ public class AccessControlController {
+     private static final String USERS = "/api/admin/access-control/users";
+ 
+     private static final String DATASOURCE_ACCESS = "/api/admin/access-control/datasource-access";
+ 
+     private final AccessAdminService service;
+     private final RolePermissionService permissions;
+     private final DataScopeService dataScopes;
+     private final UserAdminService users;
+     private final RoleDatasourceService roleDatasources;
+     private final AuditQueryService auditService;
++    private final DatasourceSchemaService schemaService;
+ 
+     /**
+      * Creates the controller.
+      *
+      * @param service the role administration service
+      * @param permissions the permission catalog and role-permission matrix service
+      * @param dataScopes the data-scope policy service
+      * @param users the user lifecycle service
+      * @param roleDatasources the role → datasource matrix service
+      * @param auditService the read-only audit-trail service
++     * @param schemaService the read-only datasource schema service
+      */
+     public AccessControlController(
+             AccessAdminService service,
+             RolePermissionService permissions,
+             DataScopeService dataScopes,
+             UserAdminService users,
+             RoleDatasourceService roleDatasources,
+-            AuditQueryService auditService) {
++            AuditQueryService auditService,
++            DatasourceSchemaService schemaService) {
+         this.service = service;
+         this.permissions = permissions;
+         this.dataScopes = dataScopes;
+         this.users = users;
+         this.roleDatasources = roleDatasources;
+         this.auditService = auditService;
++        this.schemaService = schemaService;
+     }
+ 
+     /**
+      * Lists every role, ordered by code.
+      *
+      * @return the roles
+      */
+     @GetMapping(path = ROLES)
+     public Mono<List<AccessRoleView>> list() {
+         return service.list();
+@@ -312,20 +318,35 @@ public class AccessControlController {
+      *
+      * @param id the rule id
+      * @return no content
+      */
+     @DeleteMapping(path = DATA_SCOPES + "/{id}")
+     @ResponseStatus(HttpStatus.NO_CONTENT)
+     public Mono<Void> deleteDataScope(@PathVariable String id) {
+         return actorId().flatMap(actor -> dataScopes.delete(actor, id));
+     }
+ 
++    /**
++     * Reads one datasource's live table/column metadata for the data-scope editor's selectors.
++     *
++     * <p>Read-only and gated by the generic {@code /api/admin/**} {@code access.manage} rule. Returns
++     * only table and column names plus type names — never connection settings or credentials. An
++     * unknown datasource is a {@code 404} rendered in the controller's {@code {status,message}} shape.
++     *
++     * @param id the datasource id
++     * @return the schema
++     */
++    @GetMapping(path = "/api/admin/access-control/datasources/{id}/schema")
++    public Mono<DatasourceSchemaView> datasourceSchema(@PathVariable String id) {
++        return schemaService.schema(id);
++    }
++
+     /**
+      * Lists users, ordered by username, paginated.
+      *
+      * @param query the case-insensitive username/display-name filter, or omitted for all
+      * @param enabled keep only enabled/disabled users, or omitted for both
+      * @param roleId keep only users directly assigned that role, or omitted for all
+      * @param page the zero-based page number (default 0)
+      * @param size the page size (default 20; capped at the service maximum)
+      * @return the page of users with the total count
+      */
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaColumnView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaColumnView.java
+new file mode 100644
+index 0000000..513d4e3
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaColumnView.java
+@@ -0,0 +1,13 @@
++package com.nekocong.text2sql.access.api.dto;
++
++/**
++ * One column of a datasource's live metadata, as returned to the data-scope editor.
++ *
++ * <p>Deliberately minimal: only the name and the introspected type name. The type name is what the
++ * data-scope editor needs to pair a column with a principal attribute; connection secrets and other
++ * datasource details are never returned.
++ *
++ * @param name the column name
++ * @param typeName the database-specific type name (e.g. {@code BIGINT}, {@code VARCHAR})
++ */
++public record DatasourceSchemaColumnView(String name, String typeName) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaTableView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaTableView.java
+new file mode 100644
+index 0000000..38596d7
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaTableView.java
+@@ -0,0 +1,17 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * One table of a datasource's live metadata, as returned to the data-scope editor.
++ *
++ * @param name the table name
++ * @param columns the table's columns, in declaration order
++ */
++public record DatasourceSchemaTableView(String name, List<DatasourceSchemaColumnView> columns) {
++
++    /** Normalizes the column list so the view is structurally immutable. */
++    public DatasourceSchemaTableView {
++        columns = columns == null ? List.of() : List.copyOf(columns);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaView.java
+new file mode 100644
+index 0000000..b3f36ac
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaView.java
+@@ -0,0 +1,21 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * A datasource's live table/column metadata, returned to the data-scope editor.
++ *
++ * <p>Read-only: the table and column selectors of the data-scope dialog are populated from this, so a
++ * client can offer only names that actually exist in the datasource (the real boundary remains the
++ * {@code DataScopeService} validation on upsert).
++ *
++ * @param datasourceId the datasource id
++ * @param tables the user tables, sorted by name
++ */
++public record DatasourceSchemaView(String datasourceId, List<DatasourceSchemaTableView> tables) {
++
++    /** Normalizes the table list so the view is structurally immutable. */
++    public DatasourceSchemaView {
++        tables = tables == null ? List.of() : List.copyOf(tables);
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlSchemaTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlSchemaTest.java
+new file mode 100644
+index 0000000..acd1f18
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlSchemaTest.java
+@@ -0,0 +1,152 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.http.HttpHeaders;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/**
++ * The read-only datasource schema endpoint backing the data-scope editor: a known datasource returns
++ * its live tables/columns (never connection secrets), an unknown one is a 404, and a non-admin is
++ * forbidden.
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class AccessControlSchemaTest {
++
++    private static final String PASSWORD = "secret123";
++
++    private static final String SCHEMA = "/api/admin/access-control/datasources/{id}/schema";
++
++    private static final String DATASOURCE = "campus";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
++    private WebTestClient client;
++    private String adminToken;
++
++    @BeforeEach
++    void setUp() {
++        client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++        String username = unique("admin");
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++        adminToken = TestAuth.login(client, username, PASSWORD);
++    }
++
++    @Test
++    void aKnownDatasourceReturnsItsTablesAndColumnsWithoutSecrets() {
++        client.get()
++                .uri(SCHEMA, DATASOURCE)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.datasourceId")
++                .isEqualTo(DATASOURCE)
++                .jsonPath("$.tables")
++                .isNotEmpty();
++
++        Map<String, Object> schema =
++                client.get()
++                        .uri(SCHEMA, DATASOURCE)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBody(new org.springframework.core.ParameterizedTypeReference<Map<String, Object>>() {})
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(schema).isNotNull();
++
++        @SuppressWarnings("unchecked")
++        List<Map<String, Object>> tables = (List<Map<String, Object>>) schema.get("tables");
++        List<String> tableNames = tables.stream().map(t -> String.valueOf(t.get("name"))).toList();
++        assertThat(tableNames)
++                .as("the demo schema tables are listed by name")
++                .contains("class", "course", "student", "score", "attendance");
++
++        Map<String, Object> student =
++                tables.stream()
++                        .filter(t -> "student".equals(t.get("name")))
++                        .findFirst()
++                        .orElseThrow();
++        @SuppressWarnings("unchecked")
++        List<Map<String, Object>> columns = (List<Map<String, Object>>) student.get("columns");
++        assertThat(columns).isNotEmpty();
++        assertThat(columns.stream().map(c -> String.valueOf(c.get("name"))))
++                .contains("id", "name", "student_no");
++        // Every column reports a non-blank introspected type name and never any connection detail.
++        assertThat(columns)
++                .allSatisfy(
++                        column -> {
++                            assertThat(column.get("name")).isNotNull();
++                            assertThat(String.valueOf(column.get("typeName"))).isNotBlank();
++                            assertThat(column).doesNotContainKeys("url", "username", "password", "driver");
++                        });
++    }
++
++    @Test
++    void anUnknownDatasourceIsNotFoundWithTheStatusMessageShape() {
++        client.get()
++                .uri(SCHEMA, "no-such-ds")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.status")
++                .isEqualTo(404)
++                .jsonPath("$.message")
++                .isEqualTo("数据源不存在");
++    }
++
++    @Test
++    void aStudentCannotReadTheSchema() {
++        String username = unique("student");
++        AppUser student =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT)
++                        .block();
++        access.assignRoleByCode(student.id(), Roles.STUDENT).block();
++        String token = TestAuth.login(client, username, PASSWORD);
++
++        client.get()
++                .uri(SCHEMA, DATASOURCE)
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    private String bearer() {
++        return "Bearer " + adminToken;
++    }
++
++    private static String unique(String prefix) {
++        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++    }
++}
+diff --git a/text2sql-frontend/src/App.vue b/text2sql-frontend/src/App.vue
+index 5e023d5..398af4f 100644
+--- a/text2sql-frontend/src/App.vue
++++ b/text2sql-frontend/src/App.vue
+@@ -108,20 +108,24 @@ function onKeydown(event: KeyboardEvent): void {
+ function onMediaChange(event: MediaQueryListEvent): void {
+   isNarrow.value = event.matches
+   if (!event.matches) {
+     mobileOpen.value = false
+   }
+ }
+ 
+ onMounted(() => {
+   narrowQuery.addEventListener('change', onMediaChange)
+   document.addEventListener('keydown', onKeydown)
++  // Refresh the profile in the background so the permission-aware navigation reflects the
++  // server's current permission set, not a stale localStorage snapshot. Not awaited: the app
++  // must not block on it, and a failure simply keeps the stored profile.
++  void auth.refreshProfile()
+ })
+ 
+ onBeforeUnmount(() => {
+   narrowQuery.removeEventListener('change', onMediaChange)
+   document.removeEventListener('keydown', onKeydown)
+ })
+ 
+ /** Navigating away always dismisses the off-canvas panel. */
+ watch(
+   () => route.fullPath,
+@@ -208,20 +212,23 @@ watch(
+         mode="horizontal"
+         router
+         :ellipsis="false"
+         class="layout__menu"
+       >
+         <el-menu-item index="/">对话</el-menu-item>
+         <el-menu-item index="/datasources">数据源</el-menu-item>
+         <el-menu-item v-if="auth.user?.role === 'admin'" index="/admin/datasource-access">
+           数据源权限
+         </el-menu-item>
++        <el-menu-item v-if="auth.can('access.manage')" index="/admin/access-control">
++          权限管理
++        </el-menu-item>
+         <el-menu-item v-if="auth.user?.role === 'admin'" index="/knowledge">知识库</el-menu-item>
+       </el-menu>
+ 
+       <el-dropdown class="layout__user" trigger="click" @command="onUserCommand">
+         <span class="layout__user-trigger">
+           <el-icon class="layout__user-icon"><User /></el-icon>
+           <span class="layout__user-name">{{ userName }}</span>
+           <el-icon class="layout__user-caret"><ArrowDown /></el-icon>
+         </span>
+         <template #dropdown>
+diff --git a/text2sql-frontend/src/api/accessControl.ts b/text2sql-frontend/src/api/accessControl.ts
+index 7f7fbb9..b0f4c6e 100644
+--- a/text2sql-frontend/src/api/accessControl.ts
++++ b/text2sql-frontend/src/api/accessControl.ts
+@@ -1,80 +1,134 @@
++import { isAxiosError } from 'axios'
+ import { http } from './http'
+ import type {
+   AccessAuditPage,
+   AccessPermission,
+   AccessRole,
+   AccessRolePermissions,
+   AccessRoleRequest,
+   AccessUser,
+   AccessUserCreateRequest,
+   AccessUserDisplayNameRequest,
+   AccessUserPage,
+   AccessUserPasswordRequest,
+   AccessUserRolesRequest,
+   AccessUserStatusRequest,
+   AuditFilters,
+   DataScope,
+   DataScopeRequest,
+   DatasourceMatrix,
++  DatasourceSchema,
+   RoleDatasources,
+ } from '@/types'
+ 
+ /**
+  * Typed client for the access-control admin API (`/api/admin/access-control`). Every route is
+- * gated server-side by the `access.manage` permission; a caller without it gets a 401/403 from the
++ * gated server-side by the appropriate permission; a caller without it gets a 401/403 from the
+  * shared `http` instance.
+  */
+ const BASE = '/admin/access-control'
+ 
++/**
++ * A normalized API failure: the HTTP status plus a readable message. The access-control endpoints
++ * report failures as `{"status": ..., "message": ...}` bodies, so surface that message whenever the
++ * body carries one.
++ */
++export interface AccessControlError {
++  status: number | null
++  message: string
++}
++
++/**
++ * Extracts a user-facing message and status from an access-control API failure. Backend validation
++ * and conflict failures are `{status, message}` bodies; plain-text bodies and common statuses are
++ * mapped to readable fallbacks.
++ *
++ * @param error error thrown by the API call
++ * @param fallback message used when the backend sent no readable body
++ * @returns the normalized failure
++ */
++export function normalizeAccessControlError(
++  error: unknown,
++  fallback: string,
++): AccessControlError {
++  if (isAxiosError(error)) {
++    const body: unknown = error.response?.data
++    if (body != null && typeof body === 'object' && 'message' in body) {
++      const message = (body as { message?: unknown }).message
++      if (typeof message === 'string' && message.trim().length > 0) {
++        return { status: error.response?.status ?? null, message }
++      }
++    }
++    if (typeof body === 'string' && body.trim().length > 0) {
++      return { status: error.response?.status ?? null, message: body }
++    }
++    const status = error.response?.status ?? null
++    if (status === 403) {
++      return { status, message: '没有权限执行该操作' }
++    }
++    if (status === 404) {
++      return { status, message: '目标不存在，可能已被删除' }
++    }
++    if (status === 400) {
++      return { status, message: '请求参数无效，请检查表单内容' }
++    }
++    return { status, message: fallback }
++  }
++  return { status: null, message: fallback }
++}
++
+ // --- Roles --------------------------------------------------------------------------------------
+ 
+ /** Lists every role, ordered by code. */
+ export async function listRoles(): Promise<AccessRole[]> {
+   const { data } = await http.get<AccessRole[]>(`${BASE}/roles`)
+   return data
+ }
+ 
+ /** Creates a role. */
+ export async function createRole(request: AccessRoleRequest): Promise<AccessRole> {
+   const { data } = await http.post<AccessRole>(`${BASE}/roles`, request)
+   return data
+ }
+ 
+ /** Updates a role (`code` is immutable; omitted fields keep their current value). */
+ export async function updateRole(id: string, request: AccessRoleRequest): Promise<AccessRole> {
+-  const { data } = await http.put<AccessRole>(`${BASE}/roles/${id}`, request)
++  const { data } = await http.put<AccessRole>(`${BASE}/roles/${encodeURIComponent(id)}`, request)
+   return data
+ }
+ 
+ // --- Permissions --------------------------------------------------------------------------------
+ 
+ /** Lists the permission catalog, ordered by module then key. */
+ export async function listPermissions(): Promise<AccessPermission[]> {
+   const { data } = await http.get<AccessPermission[]>(`${BASE}/permissions`)
+   return data
+ }
+ 
+ /** Reads a role's own permission set. */
+ export async function getRolePermissions(roleId: string): Promise<AccessRolePermissions> {
+-  const { data } = await http.get<AccessRolePermissions>(`${BASE}/roles/${roleId}/permissions`)
++  const { data } = await http.get<AccessRolePermissions>(
++    `${BASE}/roles/${encodeURIComponent(roleId)}/permissions`,
++  )
+   return data
+ }
+ 
+ /** Replaces a role's permission set with the complete requested set. */
+ export async function replaceRolePermissions(
+   roleId: string,
+   permissions: string[],
+ ): Promise<AccessRolePermissions> {
+-  const { data } = await http.put<AccessRolePermissions>(`${BASE}/roles/${roleId}/permissions`, {
+-    permissions,
+-  })
++  const { data } = await http.put<AccessRolePermissions>(
++    `${BASE}/roles/${encodeURIComponent(roleId)}/permissions`,
++    { permissions },
++  )
+   return data
+ }
+ 
+ // --- Data scopes --------------------------------------------------------------------------------
+ 
+ /** Parameters for listing a role's data-scope rules. */
+ export interface ListDataScopesParams {
+   roleId: string
+   datasourceId?: string
+ }
+@@ -86,45 +140,56 @@ export async function listDataScopes(params: ListDataScopesParams): Promise<Data
+ }
+ 
+ /** Inserts or updates the rule for a role, datasource and table. */
+ export async function upsertDataScope(request: DataScopeRequest): Promise<DataScope> {
+   const { data } = await http.put<DataScope>(`${BASE}/data-scopes`, request)
+   return data
+ }
+ 
+ /** Deletes one data-scope rule. */
+ export async function deleteDataScope(id: string): Promise<void> {
+-  await http.delete(`${BASE}/data-scopes/${id}`)
++  await http.delete(`${BASE}/data-scopes/${encodeURIComponent(id)}`)
++}
++
++/** Reads one datasource's live table/column metadata for the data-scope editor. */
++export async function getDatasourceSchema(datasourceId: string): Promise<DatasourceSchema> {
++  const { data } = await http.get<DatasourceSchema>(
++    `${BASE}/datasources/${encodeURIComponent(datasourceId)}/schema`,
++  )
++  return data
+ }
+ 
+ // --- Datasource matrix --------------------------------------------------------------------------
+ 
+ /** Reads the full role → datasource matrix. */
+ export async function getDatasourceMatrix(): Promise<DatasourceMatrix> {
+   const { data } = await http.get<DatasourceMatrix>(`${BASE}/datasource-access`)
+   return data
+ }
+ 
+ /** Reads a role's own datasource grant set. */
+ export async function getRoleDatasources(roleId: string): Promise<RoleDatasources> {
+-  const { data } = await http.get<RoleDatasources>(`${BASE}/roles/${roleId}/datasources`)
++  const { data } = await http.get<RoleDatasources>(
++    `${BASE}/roles/${encodeURIComponent(roleId)}/datasources`,
++  )
+   return data
+ }
+ 
+ /** Replaces a role's datasource grant set with the complete requested set. */
+ export async function replaceRoleDatasources(
+   roleId: string,
+   datasourceIds: string[],
+ ): Promise<RoleDatasources> {
+-  const { data } = await http.put<RoleDatasources>(`${BASE}/roles/${roleId}/datasources`, {
+-    datasourceIds,
+-  })
++  const { data } = await http.put<RoleDatasources>(
++    `${BASE}/roles/${encodeURIComponent(roleId)}/datasources`,
++    { datasourceIds },
++  )
+   return data
+ }
+ 
+ // --- Users --------------------------------------------------------------------------------------
+ 
+ /** Parameters for listing users. */
+ export interface ListUsersParams {
+   query?: string
+   enabled?: boolean
+   roleId?: string
+@@ -133,62 +198,69 @@ export interface ListUsersParams {
+ }
+ 
+ /** Lists users, ordered by username, paginated. */
+ export async function listUsers(params: ListUsersParams = {}): Promise<AccessUserPage> {
+   const { data } = await http.get<AccessUserPage>(`${BASE}/users`, { params })
+   return data
+ }
+ 
+ /** Reads one user. */
+ export async function getUser(id: string): Promise<AccessUser> {
+-  const { data } = await http.get<AccessUser>(`${BASE}/users/${id}`)
++  const { data } = await http.get<AccessUser>(`${BASE}/users/${encodeURIComponent(id)}`)
+   return data
+ }
+ 
+ /** Creates a user. */
+ export async function createUser(request: AccessUserCreateRequest): Promise<AccessUser> {
+   const { data } = await http.post<AccessUser>(`${BASE}/users`, request)
+   return data
+ }
+ 
+ /** Edits a user's display name. */
+ export async function updateUserDisplayName(
+   id: string,
+   request: AccessUserDisplayNameRequest,
+ ): Promise<AccessUser> {
+-  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}`, request)
++  const { data } = await http.put<AccessUser>(`${BASE}/users/${encodeURIComponent(id)}`, request)
+   return data
+ }
+ 
+ /** Enables or disables a user. */
+ export async function updateUserStatus(
+   id: string,
+   request: AccessUserStatusRequest,
+ ): Promise<AccessUser> {
+-  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}/status`, request)
++  const { data } = await http.put<AccessUser>(
++    `${BASE}/users/${encodeURIComponent(id)}/status`,
++    request,
++  )
+   return data
+ }
+ 
+ /** Resets a user's password. */
+ export async function resetUserPassword(
+   id: string,
+   request: AccessUserPasswordRequest,
+ ): Promise<void> {
+-  await http.post(`${BASE}/users/${id}/reset-password`, request)
++  await http.post(`${BASE}/users/${encodeURIComponent(id)}/reset-password`, request)
+ }
+ 
+ /** Replaces a user's role assignments. */
+ export async function replaceUserRoles(
+   id: string,
+   request: AccessUserRolesRequest,
+ ): Promise<AccessUser> {
+-  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}/roles`, request)
++  const { data } = await http.put<AccessUser>(
++    `${BASE}/users/${encodeURIComponent(id)}/roles`,
++    request,
++  )
+   return data
+ }
+ 
+ // --- Audit --------------------------------------------------------------------------------------
+ 
+ /** Lists the access-control audit trail, newest first, paginated and filtered. */
+ export async function listAudit(filters: AuditFilters = {}): Promise<AccessAuditPage> {
+   const { data } = await http.get<AccessAuditPage>(`${BASE}/audit`, { params: filters })
+   return data
+ }
++
+diff --git a/text2sql-frontend/src/components/access-control/AuditTab.vue b/text2sql-frontend/src/components/access-control/AuditTab.vue
+new file mode 100644
+index 0000000..0f1ec7a
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/AuditTab.vue
+@@ -0,0 +1,367 @@
++<script setup lang="ts">
++import { computed, onMounted, ref } from 'vue'
++import { Refresh, Search, View } from '@element-plus/icons-vue'
++import { ElMessage } from 'element-plus'
++import { listAudit, normalizeAccessControlError } from '@/api/accessControl'
++import type { AccessAudit, AccessAuditPage } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++
++const auth = useAuthStore()
++const canRead = computed(() => auth.can('audit.read'))
++
++const loading = ref(false)
++const page = ref<AccessAuditPage>({ items: [], total: 0, page: 0, size: 50 })
++
++const actorFilter = ref('')
++const actionFilter = ref('')
++const entityTypeFilter = ref('')
++const resultFilter = ref<string>('')
++const timeRange = ref<[Date, Date] | null>(null)
++const currentPage = ref(1)
++const pageSize = ref(50)
++
++async function load(): Promise<void> {
++  if (!canRead.value) {
++    return
++  }
++  loading.value = true
++  try {
++    page.value = await listAudit({
++      actorId: actorFilter.value.trim() || undefined,
++      action: actionFilter.value.trim() || undefined,
++      entityType: entityTypeFilter.value.trim() || undefined,
++      result: resultFilter.value === '' ? undefined : (resultFilter.value as 'SUCCESS' | 'DENIED'),
++      from: timeRange.value ? timeRange.value[0].getTime() : undefined,
++      to: timeRange.value ? timeRange.value[1].getTime() + 1 : undefined,
++      page: currentPage.value - 1,
++      size: pageSize.value,
++    })
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载审计记录失败').message)
++  } finally {
++    loading.value = false
++  }
++}
++
++function search(): void {
++  currentPage.value = 1
++  void load()
++}
++
++function resetFilters(): void {
++  actorFilter.value = ''
++  actionFilter.value = ''
++  entityTypeFilter.value = ''
++  resultFilter.value = ''
++  timeRange.value = null
++  search()
++}
++
++function onPageChange(value: number): void {
++  currentPage.value = value
++  void load()
++}
++
++function onSizeChange(value: number): void {
++  pageSize.value = value
++  currentPage.value = 1
++  void load()
++}
++
++// ---------- Detail drawer ----------------------------------------------------
++
++const drawerVisible = ref(false)
++const activeAudit = ref<AccessAudit | null>(null)
++
++function openDetail(row: AccessAudit): void {
++  activeAudit.value = row
++  drawerVisible.value = true
++}
++
++/** Renders a stored JSON payload for display; a malformed payload is echoed as its raw string. */
++function jsonText(value: unknown): string {
++  if (value == null) {
++    return 'null'
++  }
++  if (typeof value === 'string') {
++    return value
++  }
++  return JSON.stringify(value, null, 2)
++}
++
++function resultTagType(result: string): 'success' | 'danger' {
++  return result === 'SUCCESS' ? 'success' : 'danger'
++}
++
++function resultLabel(result: string): string {
++  return result === 'SUCCESS' ? '成功' : '拒绝'
++}
++
++function formatTime(value: number): string {
++  return new Date(value).toLocaleString('zh-CN', { hour12: false })
++}
++
++onMounted(() => {
++  if (canRead.value) {
++    void load()
++  }
++})
++</script>
++
++<template>
++  <div class="audit">
++    <div v-if="!canRead" class="ac-empty-state ac-empty-state--bordered">
++      <span class="ac-empty-state__title">没有查看审计记录的权限</span>
++      <span class="ac-empty-state__text">需要 audit.read 权限才能查看访问控制审计，请联系管理员。</span>
++    </div>
++
++    <template v-else>
++      <div class="audit__filters">
++        <el-input
++          v-model="actorFilter"
++          class="audit__input"
++          placeholder="操作者 ID"
++          clearable
++          @keyup.enter="search"
++        />
++        <el-input
++          v-model="actionFilter"
++          class="audit__input"
++          placeholder="操作（如 role.create）"
++          clearable
++          @keyup.enter="search"
++        />
++        <el-input
++          v-model="entityTypeFilter"
++          class="audit__input"
++          placeholder="实体类型"
++          clearable
++          @keyup.enter="search"
++        />
++        <el-select v-model="resultFilter" class="audit__result" placeholder="结果" clearable>
++          <el-option label="成功" value="SUCCESS" />
++          <el-option label="拒绝" value="DENIED" />
++        </el-select>
++        <el-date-picker
++          v-model="timeRange"
++          class="audit__range"
++          type="datetimerange"
++          range-separator="至"
++          start-placeholder="开始时间"
++          end-placeholder="结束时间"
++        />
++        <div class="ac-action-bar">
++          <el-button type="primary" :icon="Search" :loading="loading" @click="search">查询</el-button>
++          <el-button :icon="Refresh" @click="resetFilters">重置</el-button>
++        </div>
++      </div>
++
++      <div class="ac-table-wrapper">
++        <el-table v-loading="loading" :data="page.items" row-key="id" stripe>
++          <el-table-column label="时间" width="180">
++            <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
++          </el-table-column>
++          <el-table-column prop="actorId" label="操作者" min-width="140" show-overflow-tooltip />
++          <el-table-column label="操作" min-width="180">
++            <template #default="{ row }">
++              <code class="audit__code">{{ row.action }}</code>
++            </template>
++          </el-table-column>
++          <el-table-column label="实体" min-width="160">
++            <template #default="{ row }">
++              <span class="audit__entity">
++                <span>{{ row.entityType }}</span>
++                <span v-if="row.entityId" class="ac-text-meta">{{ row.entityId }}</span>
++              </span>
++            </template>
++          </el-table-column>
++          <el-table-column label="结果" width="90">
++            <template #default="{ row }">
++              <el-tag size="small" :type="resultTagType(row.result)">
++                {{ resultLabel(row.result) }}
++              </el-tag>
++            </template>
++          </el-table-column>
++          <el-table-column label="原因" min-width="180" show-overflow-tooltip>
++            <template #default="{ row }">{{ row.reason || '—' }}</template>
++          </el-table-column>
++          <el-table-column label="操作" width="90" fixed="right">
++            <template #default="{ row }">
++              <el-button size="small" text :icon="View" @click="openDetail(row)">详情</el-button>
++            </template>
++          </el-table-column>
++
++          <template #empty>
++            <div class="ac-empty-state">
++              <span class="ac-empty-state__title">暂无审计记录</span>
++              <span class="ac-empty-state__text">权限变更会在此留下记录，调整筛选条件再试。</span>
++            </div>
++          </template>
++        </el-table>
++      </div>
++
++      <el-pagination
++        class="audit__pagination"
++        background
++        layout="total, sizes, prev, pager, next"
++        :total="page.total"
++        :current-page="currentPage"
++        :page-size="pageSize"
++        :page-sizes="[20, 50, 100]"
++        @current-change="onPageChange"
++        @size-change="onSizeChange"
++      />
++
++      <el-drawer
++        v-model="drawerVisible"
++        class="ac-drawer"
++        title="审计详情"
++        size="min(860px, 94vw)"
++        append-to-body
++      >
++        <template v-if="activeAudit">
++          <dl class="audit__meta">
++            <div class="audit__meta-row">
++              <dt>时间</dt>
++              <dd>{{ formatTime(activeAudit.createdAt) }}</dd>
++            </div>
++            <div class="audit__meta-row">
++              <dt>操作者</dt>
++              <dd>{{ activeAudit.actorId }}</dd>
++            </div>
++            <div class="audit__meta-row">
++              <dt>操作</dt>
++              <dd><code class="audit__code">{{ activeAudit.action }}</code></dd>
++            </div>
++            <div class="audit__meta-row">
++              <dt>实体</dt>
++              <dd>{{ activeAudit.entityType }}{{ activeAudit.entityId ? ` · ${activeAudit.entityId}` : '' }}</dd>
++            </div>
++            <div class="audit__meta-row">
++              <dt>结果</dt>
++              <dd>
++                <el-tag size="small" :type="resultTagType(activeAudit.result)">
++                  {{ resultLabel(activeAudit.result) }}
++                </el-tag>
++              </dd>
++            </div>
++            <div v-if="activeAudit.reason" class="audit__meta-row">
++              <dt>原因</dt>
++              <dd>{{ activeAudit.reason }}</dd>
++            </div>
++          </dl>
++
++          <div class="audit__diff">
++            <div class="audit__pane">
++              <h4 class="audit__pane-title">变更前</h4>
++              <pre class="audit__json">{{ jsonText(activeAudit.before) }}</pre>
++            </div>
++            <div class="audit__pane">
++              <h4 class="audit__pane-title">变更后</h4>
++              <pre class="audit__json">{{ jsonText(activeAudit.after) }}</pre>
++            </div>
++          </div>
++        </template>
++      </el-drawer>
++    </template>
++  </div>
++</template>
++
++<style scoped>
++.audit__filters {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.audit__input {
++  width: 180px;
++  max-width: 100%;
++}
++
++.audit__result {
++  width: 120px;
++}
++
++.audit__range {
++  width: 320px;
++  max-width: 100%;
++}
++
++.audit__code {
++  color: var(--ac-text);
++  font-size: 13px;
++}
++
++.audit__entity {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++}
++
++.audit__pagination {
++  justify-content: flex-end;
++  margin-top: var(--ac-space-12);
++}
++
++.audit__meta {
++  display: flex;
++  flex-direction: column;
++  gap: var(--ac-space-8);
++  margin: 0 0 var(--ac-space-16);
++}
++
++.audit__meta-row {
++  display: flex;
++  gap: var(--ac-space-12);
++}
++
++.audit__meta-row dt {
++  flex: none;
++  width: 72px;
++  color: var(--ac-muted);
++}
++
++.audit__meta-row dd {
++  margin: 0;
++  color: var(--ac-text);
++  overflow-wrap: anywhere;
++}
++
++.audit__diff {
++  display: grid;
++  grid-template-columns: 1fr 1fr;
++  gap: var(--ac-space-16);
++}
++
++.audit__pane {
++  min-width: 0;
++}
++
++.audit__pane-title {
++  margin: 0 0 var(--ac-space-8);
++  color: var(--ac-ink);
++  font-size: var(--ac-text-body);
++  font-weight: 600;
++}
++
++.audit__json {
++  margin: 0;
++  padding: var(--ac-space-12) var(--ac-space-16);
++  overflow: auto;
++  color: var(--ac-code-text);
++  font-size: 12px;
++  line-height: 1.5;
++  background: var(--ac-code-surface);
++  border-radius: var(--ac-radius-sm);
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++}
++
++@media (max-width: 767px) {
++  .audit__diff {
++    grid-template-columns: 1fr;
++  }
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/DataScopeRuleDialog.vue b/text2sql-frontend/src/components/access-control/DataScopeRuleDialog.vue
+new file mode 100644
+index 0000000..81ccc24
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/DataScopeRuleDialog.vue
+@@ -0,0 +1,381 @@
++<script setup lang="ts">
++import { computed, reactive, ref, watch } from 'vue'
++import { ElMessage } from 'element-plus'
++import { getDatasourceSchema, normalizeAccessControlError, upsertDataScope } from '@/api/accessControl'
++import type {
++  AccessRole,
++  DataScope,
++  DataScopeRequest,
++  DatasourceDetail,
++  DatasourceSchema,
++} from '@/types'
++
++type Policy = 'ALL' | 'FILTER' | 'DENY'
++
++/** The closed principal-attribute catalog, with the pairing kind used to validate a column. */
++interface PrincipalAttributeOption {
++  code: string
++  label: string
++  kind: 'numeric' | 'text' | 'multi'
++}
++
++const PRINCIPAL_ATTRIBUTES: PrincipalAttributeOption[] = [
++  { code: 'userId', label: '用户 ID（userId）', kind: 'text' },
++  { code: 'username', label: '用户名（username）', kind: 'text' },
++  { code: 'studentId', label: '学号 ID（studentId，数值）', kind: 'numeric' },
++  { code: 'studentNo', label: '学号（studentNo）', kind: 'text' },
++  { code: 'classIds', label: '班级 ID 集合（classIds）', kind: 'multi' },
++]
++
++/** SQL type names that hold text / numeric values (mirrors the backend's normalization). */
++const TEXT_TYPES = new Set([
++  'CHAR', 'VARCHAR', 'VARCHAR2', 'NCHAR', 'NVARCHAR', 'NVARCHAR2', 'TEXT', 'CLOB',
++  'MEDIUMTEXT', 'LONGTEXT', 'TINYTEXT', 'STRING',
++])
++const NUMERIC_TYPES = new Set([
++  'TINYINT', 'SMALLINT', 'INT', 'INTEGER', 'BIGINT', 'DECIMAL', 'NUMERIC', 'FLOAT',
++  'DOUBLE', 'REAL', 'DOUBLE PRECISION', 'SMALLSERIAL', 'SERIAL', 'BIGSERIAL', 'MONEY',
++])
++
++const props = defineProps<{
++  modelValue: boolean
++  roles: AccessRole[]
++  datasources: DatasourceDetail[]
++  /** The rule to edit, or `null` to create a new one. */
++  rule: DataScope | null
++  defaultRoleId: string
++  defaultDatasourceId: string
++}>()
++
++const emit = defineEmits<{
++  (e: 'update:modelValue', value: boolean): void
++  (e: 'saved'): void
++}>()
++
++const visible = computed({
++  get: () => props.modelValue,
++  set: (value: boolean) => emit('update:modelValue', value),
++})
++
++interface DataScopeFormState {
++  roleId: string
++  datasourceId: string
++  tableName: string
++  policy: Policy
++  columnName: string
++  principalAttribute: string
++}
++
++const saving = ref(false)
++const formError = ref('')
++const schema = ref<DatasourceSchema | null>(null)
++const schemaLoading = ref(false)
++const form = reactive<DataScopeFormState>({
++  roleId: '',
++  datasourceId: '',
++  tableName: '',
++  policy: 'ALL',
++  columnName: '',
++  principalAttribute: '',
++})
++
++const tables = computed(() => schema.value?.tables ?? [])
++const selectedTable = computed(() => tables.value.find((table) => table.name === form.tableName))
++const columns = computed(() => selectedTable.value?.columns ?? [])
++
++/** Re-initializes the form and loads the schema each time the dialog opens. */
++watch(
++  () => props.modelValue,
++  (open) => {
++    if (!open) {
++      return
++    }
++    if (props.rule) {
++      Object.assign(form, {
++        roleId: props.rule.roleId,
++        datasourceId: props.rule.datasourceId,
++        tableName: props.rule.tableName,
++        policy: props.rule.policy as Policy,
++        columnName: props.rule.columnName ?? '',
++        principalAttribute: props.rule.principalAttribute ?? '',
++      })
++    } else {
++      Object.assign(form, {
++        roleId: props.defaultRoleId,
++        datasourceId: props.defaultDatasourceId,
++        tableName: '',
++        policy: 'ALL' as Policy,
++        columnName: '',
++        principalAttribute: '',
++      })
++    }
++    formError.value = ''
++    schema.value = null
++    if (form.datasourceId) {
++      void loadSchema(form.datasourceId)
++    }
++  },
++)
++
++async function loadSchema(datasourceId: string): Promise<void> {
++  schemaLoading.value = true
++  schema.value = null
++  try {
++    schema.value = await getDatasourceSchema(datasourceId)
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载数据源结构失败').message)
++  } finally {
++    schemaLoading.value = false
++  }
++}
++
++function onDatasourceChange(datasourceId: string): void {
++  form.tableName = ''
++  form.columnName = ''
++  schema.value = null
++  if (datasourceId) {
++    void loadSchema(datasourceId)
++  }
++}
++
++function onTableChange(): void {
++  form.columnName = ''
++}
++
++/** Rejects a FILTER pairing that the backend (or the type rule) would refuse. */
++function incompatibleReason(): string | null {
++  if (form.policy !== 'FILTER' || !form.columnName || !form.principalAttribute) {
++    return null
++  }
++  const attribute = PRINCIPAL_ATTRIBUTES.find((entry) => entry.code === form.principalAttribute)
++  const column = columns.value.find((entry) => entry.name === form.columnName)
++  if (!attribute || !column) {
++    return null
++  }
++  const kind = columnKind(column.typeName)
++  if (attribute.kind === 'numeric' && kind === 'text') {
++    return 'studentId 按数值比较，请选择数值类型字段'
++  }
++  if (attribute.kind === 'text' && kind === 'numeric') {
++    return '该主体属性按文本比较，请选择文本类型字段'
++  }
++  return null
++}
++
++const blockedReason = computed(() => {
++  if (form.policy !== 'FILTER') {
++    return null
++  }
++  if (!form.columnName || !form.principalAttribute) {
++    return 'FILTER 策略必须同时选择过滤字段与主体属性'
++  }
++  return incompatibleReason()
++})
++
++const canSubmit = computed(() => {
++  if (!form.roleId || !form.datasourceId || !form.tableName || !form.policy) {
++    return false
++  }
++  return blockedReason.value == null
++})
++
++async function submit(): Promise<void> {
++  const block = blockedReason.value
++  if (block) {
++    formError.value = block
++    return
++  }
++  if (!form.roleId || !form.datasourceId || !form.tableName) {
++    formError.value = '请选择角色、数据源与表'
++    return
++  }
++  saving.value = true
++  formError.value = ''
++  const request: DataScopeRequest = {
++    roleId: form.roleId,
++    datasourceId: form.datasourceId,
++    tableName: form.tableName,
++    policy: form.policy,
++  }
++  if (form.policy === 'FILTER') {
++    request.columnName = form.columnName
++    request.principalAttribute = form.principalAttribute
++  }
++  try {
++    await upsertDataScope(request)
++    ElMessage.success('数据范围规则已保存')
++    visible.value = false
++    emit('saved')
++  } catch (error) {
++    formError.value = normalizeAccessControlError(error, '保存数据范围失败').message
++  } finally {
++    saving.value = false
++  }
++}
++
++/** Normalizes a type name and classifies it as text, numeric, or other. */
++function columnKind(typeName: string): 'text' | 'numeric' | 'other' {
++  const normalized = normalizeType(typeName)
++  if (TEXT_TYPES.has(normalized)) {
++    return 'text'
++  }
++  if (NUMERIC_TYPES.has(normalized)) {
++    return 'numeric'
++  }
++  return 'other'
++}
++
++function normalizeType(typeName: string): string {
++  const upper = typeName.trim().toUpperCase()
++  const paren = upper.indexOf('(')
++  const base = paren > 0 ? upper.substring(0, paren).trim() : upper
++  if (base === 'CHARACTER VARYING' || base === 'CHAR VARYING') {
++    return 'VARCHAR'
++  }
++  if (base === 'CHARACTER') {
++    return 'CHAR'
++  }
++  if (base === 'NATIONAL CHARACTER VARYING') {
++    return 'NVARCHAR'
++  }
++  if (base === 'CHARACTER LARGE OBJECT') {
++    return 'CLOB'
++  }
++  return base
++}
++</script>
++
++<template>
++  <el-dialog
++    v-model="visible"
++    class="ac-dialog"
++    title="数据范围规则"
++    width="min(640px, calc(100vw - 32px))"
++    :close-on-click-modal="false"
++  >
++    <el-alert
++      v-if="formError"
++      class="scope-dialog__error"
++      type="error"
++      :closable="false"
++      show-icon
++      :title="formError"
++    />
++
++    <el-form label-width="96px">
++      <el-form-item label="角色" required>
++        <el-select v-model="form.roleId" class="scope-dialog__control" placeholder="选择角色" filterable>
++          <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
++        </el-select>
++      </el-form-item>
++      <el-form-item label="数据源" required>
++        <el-select
++          v-model="form.datasourceId"
++          class="scope-dialog__control"
++          placeholder="选择数据源"
++          filterable
++          @change="onDatasourceChange"
++        >
++          <el-option
++            v-for="datasource in datasources"
++            :key="datasource.id"
++            :label="datasource.name"
++            :value="datasource.id"
++          />
++        </el-select>
++      </el-form-item>
++      <el-form-item label="表" required>
++        <el-select
++          v-model="form.tableName"
++          class="scope-dialog__control"
++          placeholder="选择表"
++          filterable
++          :loading="schemaLoading"
++          :disabled="!form.datasourceId"
++          @change="onTableChange"
++        >
++          <el-option v-for="table in tables" :key="table.name" :label="table.name" :value="table.name" />
++        </el-select>
++      </el-form-item>
++      <el-form-item label="策略" required>
++        <el-radio-group v-model="form.policy">
++          <el-radio-button value="ALL">全部</el-radio-button>
++          <el-radio-button value="FILTER">过滤</el-radio-button>
++          <el-radio-button value="DENY">拒绝</el-radio-button>
++        </el-radio-group>
++      </el-form-item>
++
++      <template v-if="form.policy === 'FILTER'">
++        <el-form-item label="过滤字段" required>
++          <el-select
++            v-model="form.columnName"
++            class="scope-dialog__control"
++            placeholder="选择该表的字段"
++            filterable
++            :disabled="!form.tableName"
++          >
++            <el-option
++              v-for="column in columns"
++              :key="column.name"
++              :label="`${column.name}（${column.typeName}）`"
++              :value="column.name"
++            />
++          </el-select>
++        </el-form-item>
++        <el-form-item label="主体属性" required>
++          <el-select
++            v-model="form.principalAttribute"
++            class="scope-dialog__control"
++            placeholder="选择主体属性"
++          >
++            <el-option
++              v-for="attribute in PRINCIPAL_ATTRIBUTES"
++              :key="attribute.code"
++              :label="attribute.label"
++              :value="attribute.code"
++            />
++          </el-select>
++        </el-form-item>
++        <p v-if="blockedReason" class="scope-dialog__blocked">
++          {{ blockedReason }}
++        </p>
++      </template>
++    </el-form>
++
++    <template #footer>
++      <div class="scope-dialog__footer">
++        <span class="scope-dialog__spacer" />
++        <el-button @click="visible = false">取消</el-button>
++        <el-button type="primary" :loading="saving" :disabled="!canSubmit" @click="submit">
++          保存
++        </el-button>
++      </div>
++    </template>
++  </el-dialog>
++</template>
++
++<style scoped>
++.scope-dialog__error {
++  margin-bottom: var(--ac-space-16);
++}
++
++.scope-dialog__control {
++  width: 100%;
++}
++
++.scope-dialog__blocked {
++  margin: 0 0 0 var(--ac-space-8);
++  color: var(--el-color-danger);
++  font-size: var(--ac-text-meta);
++}
++
++.scope-dialog__footer {
++  display: flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.scope-dialog__spacer {
++  flex: 1;
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/DataScopeTab.vue b/text2sql-frontend/src/components/access-control/DataScopeTab.vue
+new file mode 100644
+index 0000000..6d6cb21
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/DataScopeTab.vue
+@@ -0,0 +1,263 @@
++<script setup lang="ts">
++import { computed, onMounted, ref } from 'vue'
++import { Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
++import { ElMessage } from 'element-plus'
++import { listDatasources } from '@/api/datasources'
++import {
++  deleteDataScope,
++  listDataScopes,
++  listRoles,
++  normalizeAccessControlError,
++} from '@/api/accessControl'
++import type { AccessRole, DataScope, DatasourceDetail } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++import DataScopeRuleDialog from '@/components/access-control/DataScopeRuleDialog.vue'
++
++const auth = useAuthStore()
++const canWrite = computed(() => auth.can('access.manage'))
++
++type Policy = 'ALL' | 'FILTER' | 'DENY'
++
++const policyLabels: Record<Policy, string> = { ALL: '全部', FILTER: '过滤', DENY: '拒绝' }
++const policyTagTypes: Record<Policy, 'success' | 'primary' | 'danger'> = {
++  ALL: 'success',
++  FILTER: 'primary',
++  DENY: 'danger',
++}
++
++const loading = ref(false)
++const roles = ref<AccessRole[]>([])
++const datasources = ref<DatasourceDetail[]>([])
++const rules = ref<DataScope[]>([])
++
++const filterRoleId = ref('')
++const filterDatasourceId = ref('')
++
++const dialogVisible = ref(false)
++const dialogRule = ref<DataScope | null>(null)
++
++async function loadRoles(): Promise<void> {
++  try {
++    roles.value = await listRoles()
++    if (!filterRoleId.value && roles.value.length > 0) {
++      filterRoleId.value = roles.value[0].id
++    }
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载角色失败').message)
++  }
++}
++
++async function loadDatasources(): Promise<void> {
++  try {
++    datasources.value = await listDatasources()
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载数据源失败').message)
++  }
++}
++
++async function loadRules(): Promise<void> {
++  if (!filterRoleId.value) {
++    rules.value = []
++    return
++  }
++  loading.value = true
++  try {
++    rules.value = await listDataScopes({
++      roleId: filterRoleId.value,
++      datasourceId: filterDatasourceId.value || undefined,
++    })
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载数据范围失败').message)
++  } finally {
++    loading.value = false
++  }
++}
++
++onMounted(async () => {
++  await Promise.all([loadRoles(), loadDatasources()])
++  await loadRules()
++})
++
++function openCreate(): void {
++  dialogRule.value = null
++  dialogVisible.value = true
++}
++
++function openEdit(row: DataScope): void {
++  dialogRule.value = row
++  dialogVisible.value = true
++}
++
++function onDialogSaved(): void {
++  void loadRules()
++}
++
++async function remove(row: DataScope): Promise<void> {
++  try {
++    await deleteDataScope(row.id)
++    ElMessage.success('规则已删除')
++    await loadRules()
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '删除数据范围失败').message)
++  }
++}
++
++function datasourceName(id: string): string {
++  return datasources.value.find((item) => item.id === id)?.name ?? id
++}
++</script>
++
++<template>
++  <div class="scope">
++    <div class="scope__filters">
++      <div class="scope__field">
++        <span class="ac-text-meta">角色</span>
++        <el-select
++          v-model="filterRoleId"
++          class="scope__select"
++          placeholder="选择角色"
++          filterable
++          @change="loadRules"
++        >
++          <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
++        </el-select>
++      </div>
++      <div class="scope__field">
++        <span class="ac-text-meta">数据源</span>
++        <el-select
++          v-model="filterDatasourceId"
++          class="scope__select"
++          placeholder="全部"
++          clearable
++          filterable
++          @change="loadRules"
++        >
++          <el-option
++            v-for="datasource in datasources"
++            :key="datasource.id"
++            :label="datasource.name"
++            :value="datasource.id"
++          />
++        </el-select>
++      </div>
++      <div class="ac-action-bar scope__actions">
++        <el-button :icon="Refresh" :loading="loading" @click="loadRules">刷新</el-button>
++        <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate">
++          新增规则
++        </el-button>
++      </div>
++    </div>
++
++    <el-alert
++      class="scope__hint"
++      type="info"
++      :closable="false"
++      show-icon
++      title="未配置规则的表现在默认拒绝访问；仅拥有 access.bypass_data_scope 的角色不受影响。"
++    />
++
++    <div class="ac-table-wrapper">
++      <el-table v-loading="loading" :data="rules" row-key="id" stripe>
++        <el-table-column prop="tableName" label="表" min-width="160" />
++        <el-table-column label="数据源" min-width="140">
++          <template #default="{ row }">{{ datasourceName(row.datasourceId) }}</template>
++        </el-table-column>
++        <el-table-column label="策略" width="110">
++          <template #default="{ row }">
++            <el-tag size="small" effect="plain" :type="policyTagTypes[row.policy as Policy]">
++              {{ policyLabels[row.policy as Policy] }}
++            </el-tag>
++          </template>
++        </el-table-column>
++        <el-table-column label="过滤字段 / 主体属性" min-width="220">
++          <template #default="{ row }">
++            <span v-if="row.policy === 'FILTER'" class="scope__pair">
++              <code class="scope__code">{{ row.columnName }}</code>
++              <span class="ac-text-meta">←</span>
++              <code class="scope__code">{{ row.principalAttribute }}</code>
++            </span>
++            <span v-else class="ac-muted">—</span>
++          </template>
++        </el-table-column>
++        <el-table-column label="操作" width="150" fixed="right">
++          <template #default="{ row }">
++            <el-button size="small" text :icon="Edit" :disabled="!canWrite" @click="openEdit(row)">
++              编辑
++            </el-button>
++            <el-popconfirm
++              :title="`删除表「${row.tableName}」的规则？`"
++              confirm-button-text="删除"
++              cancel-button-text="取消"
++              confirm-button-type="danger"
++              @confirm="remove(row)"
++            >
++              <template #reference>
++                <el-button size="small" type="danger" text :icon="Delete" :disabled="!canWrite">
++                  删除
++                </el-button>
++              </template>
++            </el-popconfirm>
++          </template>
++        </el-table-column>
++
++        <template #empty>
++          <div class="ac-empty-state">
++            <span class="ac-empty-state__title">暂无数据范围规则</span>
++            <span class="ac-empty-state__text">
++              未配置规则的表现在默认拒绝访问，点击「新增规则」为表授予访问或过滤条件。
++            </span>
++          </div>
++        </template>
++      </el-table>
++    </div>
++
++    <DataScopeRuleDialog
++      v-model="dialogVisible"
++      :roles="roles"
++      :datasources="datasources"
++      :rule="dialogRule"
++      :default-role-id="filterRoleId"
++      :default-datasource-id="filterDatasourceId || (datasources[0]?.id ?? '')"
++      @saved="onDialogSaved"
++    />
++  </div>
++</template>
++
++<style scoped>
++.scope__filters {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: var(--ac-space-12) var(--ac-space-24);
++}
++
++.scope__field {
++  display: inline-flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.scope__select {
++  width: 200px;
++  max-width: 100%;
++}
++
++.scope__actions {
++  margin-left: auto;
++}
++
++.scope__hint {
++  padding: var(--ac-space-12) var(--ac-space-16);
++}
++
++.scope__pair {
++  display: inline-flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.scope__code {
++  color: var(--ac-text);
++  font-size: 13px;
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/DatasourceAccessTab.vue b/text2sql-frontend/src/components/access-control/DatasourceAccessTab.vue
+new file mode 100644
+index 0000000..fb238d7
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/DatasourceAccessTab.vue
+@@ -0,0 +1,195 @@
++<script setup lang="ts">
++import { computed, onMounted, reactive, ref } from 'vue'
++import { Refresh } from '@element-plus/icons-vue'
++import { ElMessage } from 'element-plus'
++import {
++  getDatasourceMatrix,
++  normalizeAccessControlError,
++  replaceRoleDatasources,
++} from '@/api/accessControl'
++import type { DatasourceMatrix } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++
++const auth = useAuthStore()
++const canWrite = computed(() => auth.can('access.manage'))
++
++const loading = ref(false)
++const matrix = ref<DatasourceMatrix>({ roles: [], datasources: [] })
++const savingRoleId = ref<string | null>(null)
++
++/** Per-role drafts of the datasource grant set; only changed roles are saved. */
++const drafts = reactive<Record<string, string[]>>({})
++
++async function load(): Promise<void> {
++  loading.value = true
++  try {
++    matrix.value = await getDatasourceMatrix()
++    for (const role of matrix.value.roles) {
++      drafts[role.id] = [...role.datasourceIds]
++    }
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载数据源授权失败').message)
++  } finally {
++    loading.value = false
++  }
++}
++
++onMounted(load)
++
++function isBypass(roleId: string): boolean {
++  const role = matrix.value.roles.find((entry) => entry.id === roleId)
++  return role?.builtIn === true && role.code === 'admin'
++}
++
++function isChecked(roleId: string, datasourceId: string): boolean {
++  return (drafts[roleId] ?? []).includes(datasourceId)
++}
++
++function toggle(roleId: string, datasourceId: string, value: string | number | boolean): void {
++  const set = new Set(drafts[roleId] ?? [])
++  if (value === true) {
++    set.add(datasourceId)
++  } else {
++    set.delete(datasourceId)
++  }
++  drafts[roleId] = [...set]
++}
++
++function isDirty(roleId: string): boolean {
++  const role = matrix.value.roles.find((entry) => entry.id === roleId)
++  if (!role) {
++    return false
++  }
++  const before = [...role.datasourceIds].sort()
++  const after = [...(drafts[roleId] ?? [])].sort()
++  return before.length !== after.length || before.some((id, index) => id !== after[index])
++}
++
++async function saveRole(roleId: string): Promise<void> {
++  if (!isDirty(roleId)) {
++    return
++  }
++  savingRoleId.value = roleId
++  try {
++    await replaceRoleDatasources(roleId, drafts[roleId] ?? [])
++    const role = matrix.value.roles.find((entry) => entry.id === roleId)
++    if (role) {
++      role.datasourceIds = [...(drafts[roleId] ?? [])]
++    }
++    ElMessage.success('已保存，下一个请求立即生效')
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '保存数据源授权失败').message)
++    await load()
++  } finally {
++    savingRoleId.value = null
++  }
++}
++</script>
++
++<template>
++  <div class="matrix">
++    <div class="matrix__bar">
++      <span class="ac-text-meta">按角色勾选可访问的数据源，逐行保存</span>
++      <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
++    </div>
++
++    <el-alert
++      class="matrix__hint"
++      type="info"
++      :closable="false"
++      show-icon
++      title="数据源授权仅在角色拥有 datasource.read 时才有意义；内置管理员绕过数据源限制，可访问全部数据源。"
++    />
++
++    <div class="ac-table-wrapper">
++      <el-table v-loading="loading" :data="matrix.roles" row-key="id">
++        <el-table-column label="角色" min-width="180" fixed="left">
++          <template #default="{ row }">
++            <div class="matrix__role">
++              <span class="matrix__role-name">{{ row.name }}</span>
++              <div class="matrix__role-meta">
++                <code class="matrix__code">{{ row.code }}</code>
++                <el-tag v-if="isBypass(row.id)" size="small" type="warning" effect="plain">绕过</el-tag>
++              </div>
++            </div>
++          </template>
++        </el-table-column>
++
++        <el-table-column
++          v-for="datasource in matrix.datasources"
++          :key="datasource.id"
++          :label="datasource.name"
++          min-width="120"
++          align="center"
++        >
++          <template #default="{ row }">
++            <el-checkbox
++              :model-value="isChecked(row.id, datasource.id)"
++              :disabled="!canWrite"
++              @change="(value: string | number | boolean) => toggle(row.id, datasource.id, value)"
++            />
++          </template>
++        </el-table-column>
++
++        <el-table-column label="操作" width="120" fixed="right" align="center">
++          <template #default="{ row }">
++            <el-button
++              size="small"
++              type="primary"
++              :disabled="!canWrite || !isDirty(row.id)"
++              :loading="savingRoleId === row.id"
++              @click="saveRole(row.id)"
++            >
++              保存
++            </el-button>
++          </template>
++        </el-table-column>
++
++        <template #empty>
++          <div class="ac-empty-state">
++            <span class="ac-empty-state__title">暂无可授权数据源</span>
++            <span class="ac-empty-state__text">
++              先到「数据源」页面登记数据源，再回到这里为角色授权。
++            </span>
++          </div>
++        </template>
++      </el-table>
++    </div>
++  </div>
++</template>
++
++<style scoped>
++.matrix__bar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--ac-space-8) var(--ac-space-16);
++}
++
++.matrix__hint {
++  padding: var(--ac-space-12) var(--ac-space-16);
++}
++
++.matrix__role {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++}
++
++.matrix__role-name {
++  color: var(--ac-ink);
++  font-weight: 600;
++}
++
++.matrix__role-meta {
++  display: flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.matrix__code {
++  color: var(--ac-muted);
++  font-size: var(--ac-text-meta);
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/PermissionsTab.vue b/text2sql-frontend/src/components/access-control/PermissionsTab.vue
+new file mode 100644
+index 0000000..ac5e9f0
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/PermissionsTab.vue
+@@ -0,0 +1,350 @@
++<script setup lang="ts">
++import { computed, onMounted, ref } from 'vue'
++import { ElMessage } from 'element-plus'
++import {
++  getRolePermissions,
++  listPermissions,
++  listRoles,
++  normalizeAccessControlError,
++  replaceRolePermissions,
++} from '@/api/accessControl'
++import type { AccessPermission, AccessRole } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++
++const auth = useAuthStore()
++const canWrite = computed(() => auth.can('access.manage'))
++
++const loading = ref(false)
++const saving = ref(false)
++const roles = ref<AccessRole[]>([])
++const catalog = ref<AccessPermission[]>([])
++
++const selectedRoleId = ref('')
++const originalKeys = ref<string[]>([])
++const selectedKeys = ref<string[]>([])
++
++/** The two permission keys the built-in administrator must keep. */
++const ADMIN_LOCKED_KEYS = ['access.manage', 'access.bypass_data_scope']
++
++const moduleLabels: Record<string, string> = {
++  chat: '对话',
++  datasource: '数据源',
++  model: '模型',
++  access: '权限管理',
++  user: '用户',
++  audit: '审计',
++}
++
++/** Built-in roles first, then custom roles, each in code order (the API already sorts by code). */
++const builtInRoles = computed(() => roles.value.filter((role) => role.builtIn))
++const customRoles = computed(() => roles.value.filter((role) => !role.builtIn))
++
++const selectedRole = computed(() => roles.value.find((role) => role.id === selectedRoleId.value))
++
++/** Whether the selected role is the built-in administrator (its two keys are locked). */
++const isBuiltInAdmin = computed(
++  () => selectedRole.value?.builtIn === true && selectedRole.value.code === 'admin',
++)
++
++/** The catalog grouped by module, preserving catalog order within each module. */
++const groupedCatalog = computed(() => {
++  const groups: Array<{ module: string; permissions: AccessPermission[] }> = []
++  const byModule = new Map<string, AccessPermission[]>()
++  for (const permission of catalog.value) {
++    const list = byModule.get(permission.module) ?? []
++    list.push(permission)
++    byModule.set(permission.module, list)
++  }
++  for (const [module, permissions] of byModule) {
++    groups.push({ module, permissions })
++  }
++  return groups
++})
++
++const dirty = computed(() => {
++  const a = [...selectedKeys.value].sort()
++  const b = [...originalKeys.value].sort()
++  return a.length !== b.length || a.some((key, index) => key !== b[index])
++})
++
++function moduleLabel(module: string): string {
++  return moduleLabels[module] ?? module
++}
++
++/** Every key of a module's catalog. */
++function moduleKeys(module: string): string[] {
++  return catalog.value.filter((permission) => permission.module === module).map((permission) => permission.key)
++}
++
++function isModuleAllChecked(module: string): boolean {
++  const keys = moduleKeys(module)
++  return keys.length > 0 && keys.every((key) => selectedKeys.value.includes(key))
++}
++
++function isModuleIndeterminate(module: string): boolean {
++  const keys = moduleKeys(module)
++  const selected = keys.filter((key) => selectedKeys.value.includes(key)).length
++  return selected > 0 && selected < keys.length
++}
++
++function toggleModule(module: string, checked: string | number | boolean): void {
++  const keys = moduleKeys(module)
++  const set = new Set(selectedKeys.value)
++  if (checked === true) {
++    keys.forEach((key) => set.add(key))
++  } else {
++    keys.forEach((key) => set.delete(key))
++  }
++  selectedKeys.value = [...set]
++}
++
++/** A locked key cannot be toggled off for the built-in administrator. */
++function isKeyDisabled(key: string): boolean {
++  return isBuiltInAdmin.value && ADMIN_LOCKED_KEYS.includes(key)
++}
++
++async function loadRoles(): Promise<void> {
++  try {
++    roles.value = await listRoles()
++    if (!selectedRoleId.value && roles.value.length > 0) {
++      selectedRoleId.value = roles.value[0].id
++    }
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载角色失败').message)
++  }
++}
++
++async function loadCatalog(): Promise<void> {
++  try {
++    catalog.value = await listPermissions()
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载权限目录失败').message)
++  }
++}
++
++async function loadRolePermissions(): Promise<void> {
++  if (!selectedRoleId.value) {
++    originalKeys.value = []
++    selectedKeys.value = []
++    return
++  }
++  loading.value = true
++  try {
++    const result = await getRolePermissions(selectedRoleId.value)
++    originalKeys.value = [...result.permissions]
++    selectedKeys.value = [...result.permissions]
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载角色权限失败').message)
++  } finally {
++    loading.value = false
++  }
++}
++
++function onRoleChange(): void {
++  void loadRolePermissions()
++}
++
++async function save(): Promise<void> {
++  if (!selectedRoleId.value) {
++    return
++  }
++  saving.value = true
++  try {
++    await replaceRolePermissions(selectedRoleId.value, [...selectedKeys.value])
++    ElMessage.success('权限已保存')
++    // Reload the stored set so the UI reflects the exact state the backend persisted.
++    await loadRolePermissions()
++  } catch (error) {
++    // A denied escalation (403) keeps the previous state and surfaces the backend reason.
++    ElMessage.error(normalizeAccessControlError(error, '保存权限失败').message)
++    await loadRolePermissions()
++  } finally {
++    saving.value = false
++  }
++}
++
++function reset(): void {
++  selectedKeys.value = [...originalKeys.value]
++}
++
++onMounted(async () => {
++  await Promise.all([loadRoles(), loadCatalog()])
++  await loadRolePermissions()
++})
++</script>
++
++<template>
++  <div class="permissions">
++    <div class="permissions__bar">
++      <div class="permissions__selector">
++        <span class="ac-text-meta">角色</span>
++        <el-select
++          v-model="selectedRoleId"
++          class="permissions__role"
++          placeholder="选择角色"
++          @change="onRoleChange"
++        >
++          <el-option-group v-if="builtInRoles.length" label="内置角色">
++            <el-option
++              v-for="role in builtInRoles"
++              :key="role.id"
++              :label="role.name"
++              :value="role.id"
++            />
++          </el-option-group>
++          <el-option-group v-if="customRoles.length" label="自定义角色">
++            <el-option
++              v-for="role in customRoles"
++              :key="role.id"
++              :label="role.name"
++              :value="role.id"
++            />
++          </el-option-group>
++        </el-select>
++      </div>
++
++      <div class="ac-action-bar">
++        <el-button :disabled="!dirty" @click="reset">重置</el-button>
++        <el-button
++          type="primary"
++          :disabled="!dirty || !canWrite"
++          :loading="saving"
++          @click="save"
++        >
++          保存
++        </el-button>
++      </div>
++    </div>
++
++    <el-alert
++      v-if="isBuiltInAdmin"
++      class="permissions__hint"
++      type="warning"
++      :closable="false"
++      show-icon
++      title="内置管理员必须保留 access.manage 与 access.bypass_data_scope，无法移除。"
++    />
++
++    <p v-if="selectedRole" class="ac-text-meta">
++      {{ selectedRole.name }}（{{ selectedRole.code }}）当前拥有
++      {{ selectedKeys.length }} 项权限，已选择后点击「保存」整体替换。
++    </p>
++
++    <div v-loading="loading" class="permissions__groups">
++      <section
++        v-for="group in groupedCatalog"
++        :key="group.module"
++        class="permissions__group"
++      >
++        <header class="permissions__group-head">
++          <el-checkbox
++            :model-value="isModuleAllChecked(group.module)"
++            :indeterminate="isModuleIndeterminate(group.module)"
++            :disabled="!canWrite"
++            @change="(value: string | number | boolean) => toggleModule(group.module, value)"
++          >
++            {{ moduleLabel(group.module) }}
++          </el-checkbox>
++        </header>
++
++        <el-checkbox-group v-model="selectedKeys" class="permissions__list">
++          <el-checkbox
++            v-for="permission in group.permissions"
++            :key="permission.key"
++            class="permissions__item"
++            :value="permission.key"
++            :disabled="!canWrite || isKeyDisabled(permission.key)"
++          >
++            <span class="permissions__item-main">
++              <code class="permissions__key">{{ permission.key }}</code>
++              <span v-if="permission.description" class="permissions__desc">
++                {{ permission.description }}
++              </span>
++            </span>
++          </el-checkbox>
++        </el-checkbox-group>
++      </section>
++    </div>
++
++    <div v-if="!loading && catalog.length === 0" class="ac-empty-state ac-empty-state--bordered">
++      <span class="ac-empty-state__title">暂无权限目录</span>
++      <span class="ac-empty-state__text">权限目录由后端初始化，请联系管理员。</span>
++    </div>
++  </div>
++</template>
++
++<style scoped>
++.permissions__bar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--ac-space-8) var(--ac-space-16);
++}
++
++.permissions__selector {
++  display: inline-flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.permissions__role {
++  width: 220px;
++  max-width: 100%;
++}
++
++.permissions__hint {
++  margin-top: var(--ac-space-8);
++}
++
++.permissions__groups {
++  display: flex;
++  flex-direction: column;
++  gap: var(--ac-space-16);
++  min-height: 60px;
++}
++
++.permissions__group {
++  padding: var(--ac-space-12) var(--ac-space-16);
++  background: var(--ac-surface);
++  border: 1px solid var(--ac-border-soft);
++  border-radius: var(--ac-radius);
++  box-shadow: var(--ac-shadow-sm);
++}
++
++.permissions__group-head {
++  padding-bottom: var(--ac-space-8);
++  border-bottom: 1px solid var(--ac-border-soft);
++}
++
++.permissions__list {
++  display: grid;
++  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
++  gap: var(--ac-space-4) var(--ac-space-16);
++  padding-top: var(--ac-space-8);
++}
++
++.permissions__item {
++  height: auto;
++  margin-right: 0;
++  align-items: flex-start;
++}
++
++.permissions__item-main {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  white-space: normal;
++}
++
++.permissions__key {
++  color: var(--ac-text);
++  font-size: 13px;
++}
++
++.permissions__desc {
++  color: var(--ac-muted);
++  font-size: var(--ac-text-meta);
++  line-height: 1.4;
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/RolesTab.vue b/text2sql-frontend/src/components/access-control/RolesTab.vue
+new file mode 100644
+index 0000000..e4f5215
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/RolesTab.vue
+@@ -0,0 +1,383 @@
++<script setup lang="ts">
++import { computed, onMounted, reactive, ref } from 'vue'
++import { Plus, Edit, Refresh } from '@element-plus/icons-vue'
++import { ElMessage } from 'element-plus'
++import type { FormInstance, FormRules } from 'element-plus'
++import {
++  createRole,
++  listRoles,
++  normalizeAccessControlError,
++  updateRole,
++} from '@/api/accessControl'
++import type { AccessRole, AccessRoleRequest } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++
++const auth = useAuthStore()
++/** The role catalog itself is `access.manage`-gated, so a caller here may always write. */
++const canWrite = computed(() => auth.can('access.manage'))
++
++const loading = ref(false)
++const roles = ref<AccessRole[]>([])
++const savingToggleId = ref<string | null>(null)
++
++/** Role-code pattern mirroring the backend (`^[a-z][a-z0-9_-]{1,63}$`, i.e. 2-64 chars). */
++const CODE_PATTERN = /^[a-z][a-z0-9_-]{1,63}$/
++
++async function load(): Promise<void> {
++  loading.value = true
++  try {
++    roles.value = await listRoles()
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载角色失败').message)
++  } finally {
++    loading.value = false
++  }
++}
++
++onMounted(load)
++
++// ---------- Create / edit --------------------------------------------------
++
++interface RoleFormState {
++  code: string
++  name: string
++  description: string
++  parentId: string
++  enabled: boolean
++}
++
++const dialogVisible = ref(false)
++const editingId = ref<string | null>(null)
++const saving = ref(false)
++const formError = ref('')
++const formRef = ref<FormInstance>()
++const form = reactive<RoleFormState>({ code: '', name: '', description: '', parentId: '', enabled: true })
++
++const dialogTitle = computed(() => (editingId.value ? '编辑角色' : '新增角色'))
++
++/** Roles that may be a parent: for edit, exclude the role itself and its descendants. */
++const parentOptions = computed(() => {
++  const excluded = new Set<string>()
++  if (editingId.value) {
++    excluded.add(editingId.value)
++    for (const id of descendantsOf(editingId.value)) {
++      excluded.add(id)
++    }
++  }
++  return roles.value.filter((role) => !excluded.has(role.id))
++})
++
++const rules: FormRules<RoleFormState> = {
++  code: [
++    { required: true, message: '请输入角色编码', trigger: 'blur' },
++    {
++      validator: (_rule, value: string, callback) => {
++        if (!value || CODE_PATTERN.test(value.trim())) {
++          callback()
++        } else {
++          callback(new Error('编码需以小写字母开头，仅含小写字母、数字、下划线和短横线（2-64 位）'))
++        }
++      },
++      trigger: 'blur',
++    },
++  ],
++  name: [
++    { required: true, message: '请输入角色名称', trigger: 'blur' },
++    { max: 100, message: '角色名称不能超过 100 个字符', trigger: 'blur' },
++  ],
++  description: [{ max: 512, message: '角色描述不能超过 512 个字符', trigger: 'blur' }],
++}
++
++/** Descendants of a role (by id), used to forbid a cycle via the parent selector. */
++function descendantsOf(id: string): string[] {
++  const result = new Set<string>()
++  const walk = (parentId: string): void => {
++    for (const role of roles.value) {
++      if (role.parentId === parentId && !result.has(role.id)) {
++        result.add(role.id)
++        walk(role.id)
++      }
++    }
++  }
++  walk(id)
++  return [...result]
++}
++
++function openCreate(): void {
++  editingId.value = null
++  Object.assign(form, { code: '', name: '', description: '', parentId: '', enabled: true })
++  formError.value = ''
++  dialogVisible.value = true
++}
++
++function openEdit(row: AccessRole): void {
++  editingId.value = row.id
++  Object.assign(form, {
++    code: row.code,
++    name: row.name,
++    description: row.description ?? '',
++    parentId: row.parentId ?? '',
++    enabled: row.enabled,
++  })
++  formError.value = ''
++  dialogVisible.value = true
++}
++
++function buildPayload(): AccessRoleRequest {
++  const description = form.description.trim()
++  const enabled = form.enabled
++  if (editingId.value) {
++    return {
++      name: form.name.trim(),
++      description,
++      // An empty parent id clears the parent on update; a non-empty one is sent verbatim.
++      parentId: form.parentId,
++      enabled,
++    }
++  }
++  const payload: AccessRoleRequest = {
++    code: form.code.trim(),
++    name: form.name.trim(),
++    description,
++    enabled,
++  }
++  if (form.parentId) {
++    payload.parentId = form.parentId
++  }
++  return payload
++}
++
++async function submit(): Promise<void> {
++  const valid = await formRef.value?.validate().catch(() => false)
++  if (!valid) {
++    return
++  }
++  saving.value = true
++  formError.value = ''
++  try {
++    if (editingId.value) {
++      await updateRole(editingId.value, buildPayload())
++      ElMessage.success('角色已更新')
++    } else {
++      await createRole(buildPayload())
++      ElMessage.success('角色已创建')
++    }
++    dialogVisible.value = false
++    await load()
++  } catch (error) {
++    formError.value = normalizeAccessControlError(error, editingId.value ? '更新角色失败' : '创建角色失败').message
++  } finally {
++    saving.value = false
++  }
++}
++
++// ---------- Enabled toggle ---------------------------------------------------
++
++/** The built-in administrator role cannot be disabled (backend enforced). */
++function toggleDisabled(row: AccessRole): boolean {
++  return row.builtIn && row.code === 'admin'
++}
++
++async function toggleEnabled(row: AccessRole, value: string | number | boolean): Promise<void> {
++  const enabled = value === true
++  savingToggleId.value = row.id
++  try {
++    await updateRole(row.id, { enabled })
++    row.enabled = enabled
++    ElMessage.success(enabled ? '角色已启用' : '角色已停用')
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '更新角色状态失败').message)
++    await load()
++  } finally {
++    savingToggleId.value = null
++  }
++}
++
++function parentName(parentId: string | null): string {
++  if (!parentId) {
++    return '—'
++  }
++  return roles.value.find((role) => role.id === parentId)?.name ?? parentId
++}
++</script>
++
++<template>
++  <div class="roles">
++    <div class="roles__bar">
++      <span class="ac-text-meta">共 {{ roles.length }} 个角色</span>
++      <div class="ac-action-bar">
++        <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
++        <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate">
++          新增角色
++        </el-button>
++      </div>
++    </div>
++
++    <div class="ac-table-wrapper">
++      <el-table v-loading="loading" :data="roles" row-key="id" stripe>
++        <el-table-column label="编码" min-width="160">
++          <template #default="{ row }">
++            <code class="roles__code">{{ row.code }}</code>
++          </template>
++        </el-table-column>
++        <el-table-column prop="name" label="名称" min-width="140" />
++        <el-table-column label="描述" min-width="200" show-overflow-tooltip>
++          <template #default="{ row }">{{ row.description || '—' }}</template>
++        </el-table-column>
++        <el-table-column label="父角色" min-width="140">
++          <template #default="{ row }">{{ parentName(row.parentId) }}</template>
++        </el-table-column>
++        <el-table-column label="类型" width="110">
++          <template #default="{ row }">
++            <el-tag v-if="row.builtIn" size="small" effect="plain" type="info">内置</el-tag>
++            <el-tag v-else size="small" effect="plain">自定义</el-tag>
++          </template>
++        </el-table-column>
++        <el-table-column label="启用" width="90">
++          <template #default="{ row }">
++            <el-tooltip
++              :disabled="!toggleDisabled(row)"
++              content="内置管理员角色不能停用"
++              placement="top"
++            >
++              <span>
++                <el-switch
++                  :model-value="row.enabled"
++                  :disabled="!canWrite || toggleDisabled(row)"
++                  :loading="savingToggleId === row.id"
++                  @change="(value: string | number | boolean) => toggleEnabled(row, value)"
++                />
++              </span>
++            </el-tooltip>
++          </template>
++        </el-table-column>
++        <el-table-column label="操作" width="110" fixed="right">
++          <template #default="{ row }">
++            <el-button
++              size="small"
++              text
++              :icon="Edit"
++              :disabled="!canWrite"
++              @click="openEdit(row)"
++            >
++              编辑
++            </el-button>
++          </template>
++        </el-table-column>
++
++        <template #empty>
++          <div class="ac-empty-state">
++            <span class="ac-empty-state__title">暂无角色</span>
++            <span class="ac-empty-state__text">点击「新增角色」创建第一个角色。</span>
++          </div>
++        </template>
++      </el-table>
++    </div>
++
++    <el-dialog
++      v-model="dialogVisible"
++      class="ac-dialog"
++      :title="dialogTitle"
++      width="min(600px, calc(100vw - 32px))"
++      :close-on-click-modal="false"
++    >
++      <el-alert
++        v-if="formError"
++        class="roles__error"
++        type="error"
++        :closable="false"
++        show-icon
++        :title="formError"
++      />
++
++      <el-form ref="formRef" :model="form" :rules="rules" label-width="96px">
++        <el-form-item label="编码" prop="code">
++          <el-input
++            v-model="form.code"
++            :disabled="editingId !== null"
++            placeholder="例如 teacher"
++            maxlength="64"
++          />
++        </el-form-item>
++        <el-form-item label="名称" prop="name">
++          <el-input v-model="form.name" placeholder="角色名称" maxlength="100" />
++        </el-form-item>
++        <el-form-item label="描述" prop="description">
++          <el-input
++            v-model="form.description"
++            type="textarea"
++            :rows="3"
++            maxlength="512"
++            show-word-limit
++            placeholder="角色职责说明（可选）"
++          />
++        </el-form-item>
++        <el-form-item label="父角色">
++          <el-select v-model="form.parentId" class="roles__control" placeholder="无（顶层角色）" clearable>
++            <el-option label="无（顶层角色）" value="" />
++            <el-option
++              v-for="option in parentOptions"
++              :key="option.id"
++              :label="option.name"
++              :value="option.id"
++              :disabled="!option.enabled"
++            >
++              <span>{{ option.name }}</span>
++              <span v-if="!option.enabled" class="roles__option-disabled">（已停用）</span>
++            </el-option>
++          </el-select>
++        </el-form-item>
++        <el-form-item label="启用">
++          <el-switch v-model="form.enabled" />
++        </el-form-item>
++      </el-form>
++
++      <template #footer>
++        <div class="roles__footer">
++          <span class="roles__spacer" />
++          <el-button @click="dialogVisible = false">取消</el-button>
++          <el-button type="primary" :loading="saving" @click="submit">保存</el-button>
++        </div>
++      </template>
++    </el-dialog>
++  </div>
++</template>
++
++<style scoped>
++.roles__bar {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  justify-content: space-between;
++  gap: var(--ac-space-8) var(--ac-space-16);
++}
++
++.roles__code {
++  color: var(--ac-text);
++  font-size: 13px;
++}
++
++.roles__error {
++  margin-bottom: var(--ac-space-16);
++}
++
++.roles__control {
++  width: 100%;
++}
++
++.roles__option-disabled {
++  margin-left: var(--ac-space-8);
++  color: var(--ac-placeholder);
++  font-size: var(--ac-text-meta);
++}
++
++.roles__footer {
++  display: flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.roles__spacer {
++  flex: 1;
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/UserDialogs.vue b/text2sql-frontend/src/components/access-control/UserDialogs.vue
+new file mode 100644
+index 0000000..b3eba5f
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/UserDialogs.vue
+@@ -0,0 +1,443 @@
++<script setup lang="ts">
++import { computed, reactive, ref, watch } from 'vue'
++import { ElMessage } from 'element-plus'
++import type { FormInstance, FormRules } from 'element-plus'
++import {
++  createUser,
++  normalizeAccessControlError,
++  replaceUserRoles,
++  resetUserPassword,
++  updateUserDisplayName,
++} from '@/api/accessControl'
++import type { AccessRole, AccessUser } from '@/types'
++
++/** Mirrors the backend's username and password rules. */
++const USERNAME_PATTERN = /^[A-Za-z0-9._-]{3,64}$/
++
++const props = defineProps<{
++  roles: AccessRole[]
++  /** The user the row dialogs operate on, or `null` when no row dialog is open. */
++  editingUser: AccessUser | null
++  createOpen: boolean
++  editNameOpen: boolean
++  resetOpen: boolean
++  assignOpen: boolean
++}>()
++
++const emit = defineEmits<{
++  (e: 'update:createOpen', value: boolean): void
++  (e: 'update:editNameOpen', value: boolean): void
++  (e: 'update:resetOpen', value: boolean): void
++  (e: 'update:assignOpen', value: boolean): void
++  (e: 'saved'): void
++}>()
++
++const createOpenModel = computed({
++  get: () => props.createOpen,
++  set: (value: boolean) => emit('update:createOpen', value),
++})
++const editNameOpenModel = computed({
++  get: () => props.editNameOpen,
++  set: (value: boolean) => emit('update:editNameOpen', value),
++})
++const resetOpenModel = computed({
++  get: () => props.resetOpen,
++  set: (value: boolean) => emit('update:resetOpen', value),
++})
++const assignOpenModel = computed({
++  get: () => props.assignOpen,
++  set: (value: boolean) => emit('update:assignOpen', value),
++})
++
++// ---------- Create ----------------------------------------------------------
++
++interface CreateFormState {
++  username: string
++  displayName: string
++  password: string
++  confirmPassword: string
++  roleIds: string[]
++}
++
++const createSaving = ref(false)
++const createFormRef = ref<FormInstance>()
++const createForm = reactive<CreateFormState>({
++  username: '',
++  displayName: '',
++  password: '',
++  confirmPassword: '',
++  roleIds: [],
++})
++
++const createRules: FormRules<CreateFormState> = {
++  username: [
++    { required: true, message: '请输入用户名', trigger: 'blur' },
++    {
++      validator: (_rule, value: string, callback) => {
++        if (!value || USERNAME_PATTERN.test(value.trim())) {
++          callback()
++        } else {
++          callback(new Error('用户名需为 3-64 位字母、数字、点、短横线或下划线'))
++        }
++      },
++      trigger: 'blur',
++    },
++  ],
++  password: [
++    { required: true, message: '请输入初始密码', trigger: 'blur' },
++    {
++      validator: (_rule, value: string, callback) => {
++        if (value.length >= 8 && value.length <= 72) {
++          callback()
++        } else {
++          callback(new Error('密码长度必须为 8-72 个字符'))
++        }
++      },
++      trigger: 'blur',
++    },
++  ],
++  confirmPassword: [
++    { required: true, message: '请再次输入密码', trigger: 'blur' },
++    {
++      validator: (_rule, value: string, callback) => {
++        if (value === createForm.password) {
++          callback()
++        } else {
++          callback(new Error('两次输入的密码不一致'))
++        }
++      },
++      trigger: 'blur',
++    },
++  ],
++  roleIds: [
++    {
++      validator: (_rule, value: string[], callback) => {
++        if (value && value.length > 0) {
++          callback()
++        } else {
++          callback(new Error('请至少选择一个角色'))
++        }
++      },
++      trigger: 'change',
++    },
++  ],
++}
++
++watch(
++  () => props.createOpen,
++  (open) => {
++    if (open) {
++      Object.assign(createForm, {
++        username: '',
++        displayName: '',
++        password: '',
++        confirmPassword: '',
++        roleIds: [],
++      })
++    }
++  },
++)
++
++async function submitCreate(): Promise<void> {
++  const valid = await createFormRef.value?.validate().catch(() => false)
++  if (!valid) {
++    return
++  }
++  createSaving.value = true
++  try {
++    await createUser({
++      username: createForm.username.trim(),
++      password: createForm.password,
++      displayName: createForm.displayName.trim() || undefined,
++      roleIds: createForm.roleIds,
++    })
++    ElMessage.success('用户已创建')
++    createOpenModel.value = false
++    emit('saved')
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '创建用户失败').message)
++  } finally {
++    createSaving.value = false
++  }
++}
++
++// ---------- Edit display name -------------------------------------------------
++
++const editNameSaving = ref(false)
++const editNameForm = reactive({ displayName: '' })
++
++watch(
++  () => props.editNameOpen,
++  (open) => {
++    if (open) {
++      editNameForm.displayName = props.editingUser?.displayName ?? ''
++    }
++  },
++)
++
++async function submitEditName(): Promise<void> {
++  if (!props.editingUser) {
++    return
++  }
++  editNameSaving.value = true
++  try {
++    await updateUserDisplayName(props.editingUser.id, {
++      displayName: editNameForm.displayName.trim() || null,
++    })
++    ElMessage.success('显示名称已更新')
++    editNameOpenModel.value = false
++    emit('saved')
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '更新显示名称失败').message)
++  } finally {
++    editNameSaving.value = false
++  }
++}
++
++// ---------- Reset password ---------------------------------------------------
++
++const resetSaving = ref(false)
++const resetForm = reactive({ password: '', confirmPassword: '' })
++const resetFormRef = ref<FormInstance>()
++
++const resetRules: FormRules<{ password: string; confirmPassword: string }> = {
++  password: [
++    { required: true, message: '请输入新密码', trigger: 'blur' },
++    {
++      validator: (_rule, value: string, callback) => {
++        if (value.length >= 8 && value.length <= 72) {
++          callback()
++        } else {
++          callback(new Error('密码长度必须为 8-72 个字符'))
++        }
++      },
++      trigger: 'blur',
++    },
++  ],
++  confirmPassword: [
++    { required: true, message: '请再次输入密码', trigger: 'blur' },
++    {
++      validator: (_rule, value: string, callback) => {
++        if (value === resetForm.password) {
++          callback()
++        } else {
++          callback(new Error('两次输入的密码不一致'))
++        }
++      },
++      trigger: 'blur',
++    },
++  ],
++}
++
++watch(
++  () => props.resetOpen,
++  (open) => {
++    if (open) {
++      resetForm.password = ''
++      resetForm.confirmPassword = ''
++    }
++  },
++)
++
++async function submitReset(): Promise<void> {
++  if (!props.editingUser) {
++    return
++  }
++  const valid = await resetFormRef.value?.validate().catch(() => false)
++  if (!valid) {
++    return
++  }
++  resetSaving.value = true
++  try {
++    await resetUserPassword(props.editingUser.id, { password: resetForm.password })
++    ElMessage.success('密码已重置')
++    resetOpenModel.value = false
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '重置密码失败').message)
++  } finally {
++    resetSaving.value = false
++  }
++}
++
++// ---------- Assign roles -----------------------------------------------------
++
++const assignSaving = ref(false)
++const assignForm = reactive({ roleIds: [] as string[] })
++
++watch(
++  () => props.assignOpen,
++  (open) => {
++    if (open) {
++      assignForm.roleIds = props.editingUser?.roles.map((role) => role.id) ?? []
++    }
++  },
++)
++
++async function submitAssign(): Promise<void> {
++  if (!props.editingUser) {
++    return
++  }
++  assignSaving.value = true
++  try {
++    await replaceUserRoles(props.editingUser.id, { roleIds: assignForm.roleIds })
++    ElMessage.success('角色分配已保存')
++    assignOpenModel.value = false
++    emit('saved')
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '保存角色分配失败').message)
++  } finally {
++    assignSaving.value = false
++  }
++}
++</script>
++
++<template>
++  <!-- Create -->
++  <el-dialog
++    v-model="createOpenModel"
++    class="ac-dialog"
++    title="新增用户"
++    width="min(560px, calc(100vw - 32px))"
++    :close-on-click-modal="false"
++  >
++    <el-form ref="createFormRef" :model="createForm" :rules="createRules" label-width="96px">
++      <el-form-item label="用户名" prop="username">
++        <el-input v-model="createForm.username" maxlength="64" placeholder="3-64 位字母、数字、点、短横线或下划线" />
++      </el-form-item>
++      <el-form-item label="显示名称">
++        <el-input v-model="createForm.displayName" maxlength="100" placeholder="可选" />
++      </el-form-item>
++      <el-form-item label="初始密码" prop="password">
++        <el-input
++          v-model="createForm.password"
++          type="password"
++          show-password
++          autocomplete="new-password"
++          placeholder="8-72 个字符"
++        />
++      </el-form-item>
++      <el-form-item label="确认密码" prop="confirmPassword">
++        <el-input
++          v-model="createForm.confirmPassword"
++          type="password"
++          show-password
++          autocomplete="new-password"
++          placeholder="再次输入密码"
++        />
++      </el-form-item>
++      <el-form-item label="角色" prop="roleIds">
++        <el-select v-model="createForm.roleIds" class="user-dialogs__control" multiple filterable>
++          <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
++        </el-select>
++      </el-form-item>
++    </el-form>
++    <template #footer>
++      <div class="user-dialogs__footer">
++        <span class="user-dialogs__spacer" />
++        <el-button @click="createOpenModel = false">取消</el-button>
++        <el-button type="primary" :loading="createSaving" @click="submitCreate">创建</el-button>
++      </div>
++    </template>
++  </el-dialog>
++
++  <!-- Edit display name -->
++  <el-dialog
++    v-model="editNameOpenModel"
++    class="ac-dialog"
++    title="编辑显示名称"
++    width="min(440px, calc(100vw - 32px))"
++    :close-on-click-modal="false"
++  >
++    <el-form label-width="96px">
++      <el-form-item label="显示名称">
++        <el-input v-model="editNameForm.displayName" maxlength="100" placeholder="留空清除显示名称" />
++      </el-form-item>
++    </el-form>
++    <template #footer>
++      <div class="user-dialogs__footer">
++        <span class="user-dialogs__spacer" />
++        <el-button @click="editNameOpenModel = false">取消</el-button>
++        <el-button type="primary" :loading="editNameSaving" @click="submitEditName">保存</el-button>
++      </div>
++    </template>
++  </el-dialog>
++
++  <!-- Reset password -->
++  <el-dialog
++    v-model="resetOpenModel"
++    class="ac-dialog"
++    title="重置密码"
++    width="min(440px, calc(100vw - 32px))"
++    :close-on-click-modal="false"
++  >
++    <p class="ac-text-meta">为用户「{{ editingUser?.username }}」设置新密码，密码不会回显。</p>
++    <el-form ref="resetFormRef" :model="resetForm" :rules="resetRules" label-width="96px">
++      <el-form-item label="新密码" prop="password">
++        <el-input
++          v-model="resetForm.password"
++          type="password"
++          show-password
++          autocomplete="new-password"
++          placeholder="8-72 个字符"
++        />
++      </el-form-item>
++      <el-form-item label="确认密码" prop="confirmPassword">
++        <el-input
++          v-model="resetForm.confirmPassword"
++          type="password"
++          show-password
++          autocomplete="new-password"
++          placeholder="再次输入密码"
++        />
++      </el-form-item>
++    </el-form>
++    <template #footer>
++      <div class="user-dialogs__footer">
++        <span class="user-dialogs__spacer" />
++        <el-button @click="resetOpenModel = false">取消</el-button>
++        <el-button type="primary" :loading="resetSaving" @click="submitReset">重置</el-button>
++      </div>
++    </template>
++  </el-dialog>
++
++  <!-- Assign roles -->
++  <el-dialog
++    v-model="assignOpenModel"
++    class="ac-dialog"
++    title="分配角色"
++    width="min(480px, calc(100vw - 32px))"
++    :close-on-click-modal="false"
++  >
++    <p class="ac-text-meta">为用户「{{ editingUser?.username }}」选择角色，保存后整体替换现有角色。</p>
++    <el-form label-width="96px">
++      <el-form-item label="角色">
++        <el-select v-model="assignForm.roleIds" class="user-dialogs__control" multiple filterable>
++          <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
++        </el-select>
++      </el-form-item>
++    </el-form>
++    <template #footer>
++      <div class="user-dialogs__footer">
++        <span class="user-dialogs__spacer" />
++        <el-button @click="assignOpenModel = false">取消</el-button>
++        <el-button type="primary" :loading="assignSaving" @click="submitAssign">保存</el-button>
++      </div>
++    </template>
++  </el-dialog>
++</template>
++
++<style scoped>
++.user-dialogs__control {
++  width: 100%;
++}
++
++.user-dialogs__footer {
++  display: flex;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.user-dialogs__spacer {
++  flex: 1;
++}
++</style>
+diff --git a/text2sql-frontend/src/components/access-control/UsersTab.vue b/text2sql-frontend/src/components/access-control/UsersTab.vue
+new file mode 100644
+index 0000000..847efe8
+--- /dev/null
++++ b/text2sql-frontend/src/components/access-control/UsersTab.vue
+@@ -0,0 +1,354 @@
++<script setup lang="ts">
++import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
++import { Plus, Refresh, Search } from '@element-plus/icons-vue'
++import { ElMessage } from 'element-plus'
++import {
++  listRoles,
++  listUsers,
++  normalizeAccessControlError,
++  updateUserStatus,
++} from '@/api/accessControl'
++import type { AccessRole, AccessUser, AccessUserPage } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++import UserDialogs from '@/components/access-control/UserDialogs.vue'
++
++const auth = useAuthStore()
++const canRead = computed(() => auth.can('user.read'))
++const canWrite = computed(() => auth.can('user.manage'))
++
++/** Tooltip shown on write controls when the caller can read users but not manage them. */
++const writeTip = computed(() => (canWrite.value ? '' : '缺少 user.manage 权限，无法修改用户'))
++
++const loading = ref(false)
++const roles = ref<AccessRole[]>([])
++const page = ref<AccessUserPage>({ items: [], total: 0, page: 0, size: 20 })
++
++const query = ref('')
++const enabledFilter = ref('')
++const roleFilter = ref('')
++const currentPage = ref(1)
++const pageSize = ref(20)
++
++let debounceTimer: number | undefined
++
++// Row-dialog state handed to the shared dialog component.
++const editingUser = ref<AccessUser | null>(null)
++const createOpen = ref(false)
++const editNameOpen = ref(false)
++const resetOpen = ref(false)
++const assignOpen = ref(false)
++
++async function loadRoles(): Promise<void> {
++  try {
++    roles.value = await listRoles()
++  } catch {
++    // The role filter and role pickers degrade to empty; the user list still works.
++    roles.value = []
++  }
++}
++
++async function loadUsers(): Promise<void> {
++  if (!canRead.value) {
++    return
++  }
++  loading.value = true
++  try {
++    page.value = await listUsers({
++      query: query.value.trim() || undefined,
++      enabled: enabledFilter.value === '' ? undefined : enabledFilter.value === 'true',
++      roleId: roleFilter.value || undefined,
++      page: currentPage.value - 1,
++      size: pageSize.value,
++    })
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '加载用户失败').message)
++  } finally {
++    loading.value = false
++  }
++}
++
++function onQueryChange(): void {
++  currentPage.value = 1
++  window.clearTimeout(debounceTimer)
++  debounceTimer = window.setTimeout(() => {
++    void loadUsers()
++  }, 300)
++}
++
++function onFilterChange(): void {
++  currentPage.value = 1
++  void loadUsers()
++}
++
++function onPageChange(value: number): void {
++  currentPage.value = value
++  void loadUsers()
++}
++
++function onSizeChange(value: number): void {
++  pageSize.value = value
++  currentPage.value = 1
++  void loadUsers()
++}
++
++function openCreate(): void {
++  createOpen.value = true
++}
++
++function openEditName(row: AccessUser): void {
++  editingUser.value = row
++  editNameOpen.value = true
++}
++
++function openReset(row: AccessUser): void {
++  editingUser.value = row
++  resetOpen.value = true
++}
++
++function openAssign(row: AccessUser): void {
++  editingUser.value = row
++  assignOpen.value = true
++}
++
++function onDialogsSaved(): void {
++  void loadUsers()
++}
++
++async function toggleStatus(row: AccessUser): Promise<void> {
++  try {
++    await updateUserStatus(row.id, { enabled: !row.enabled })
++    ElMessage.success(row.enabled ? '用户已停用' : '用户已启用')
++    await loadUsers()
++  } catch (error) {
++    ElMessage.error(normalizeAccessControlError(error, '更新用户状态失败').message)
++  }
++}
++
++function formatTime(value: number): string {
++  return new Date(value).toLocaleString('zh-CN', { hour12: false })
++}
++
++watch(
++  () => canRead.value,
++  (readable) => {
++    if (readable) {
++      void loadUsers()
++    }
++  },
++)
++
++onMounted(() => {
++  void loadRoles()
++  if (canRead.value) {
++    void loadUsers()
++  }
++})
++
++onBeforeUnmount(() => {
++  window.clearTimeout(debounceTimer)
++})
++</script>
++
++<template>
++  <div class="users">
++    <div v-if="!canRead" class="ac-empty-state ac-empty-state--bordered">
++      <span class="ac-empty-state__title">没有查看用户的权限</span>
++      <span class="ac-empty-state__text">需要 user.read 权限才能查看用户列表，请联系管理员。</span>
++    </div>
++
++    <template v-else>
++      <div class="users__filters">
++        <el-input
++          v-model="query"
++          class="users__search"
++          placeholder="搜索用户名或显示名称"
++          clearable
++          :prefix-icon="Search"
++          @input="onQueryChange"
++        />
++        <el-select
++          v-model="enabledFilter"
++          class="users__select"
++          placeholder="状态"
++          clearable
++          @change="onFilterChange"
++        >
++          <el-option label="启用" value="true" />
++          <el-option label="停用" value="false" />
++        </el-select>
++        <el-select
++          v-model="roleFilter"
++          class="users__select"
++          placeholder="角色"
++          clearable
++          filterable
++          @change="onFilterChange"
++        >
++          <el-option v-for="role in roles" :key="role.id" :label="role.name" :value="role.id" />
++        </el-select>
++        <div class="ac-action-bar users__actions">
++          <el-button :icon="Refresh" :loading="loading" @click="loadUsers">刷新</el-button>
++          <el-tooltip :disabled="canWrite" :content="writeTip" placement="top">
++            <span>
++              <el-button type="primary" :icon="Plus" :disabled="!canWrite" @click="openCreate">
++                新增用户
++              </el-button>
++            </span>
++          </el-tooltip>
++        </div>
++      </div>
++
++      <div class="ac-table-wrapper">
++        <el-table v-loading="loading" :data="page.items" row-key="id" stripe>
++          <el-table-column label="用户名" min-width="140">
++            <template #default="{ row }">
++              <div class="users__name">
++                <span class="users__name-main">{{ row.username }}</span>
++                <span v-if="row.displayName" class="users__name-sub">{{ row.displayName }}</span>
++              </div>
++            </template>
++          </el-table-column>
++          <el-table-column label="角色" min-width="200">
++            <template #default="{ row }">
++              <div class="users__tags">
++                <el-tag v-for="role in row.roles" :key="role.id" size="small" effect="plain">
++                  {{ role.name }}
++                </el-tag>
++                <span v-if="row.roles.length === 0" class="ac-muted">—</span>
++              </div>
++            </template>
++          </el-table-column>
++          <el-table-column label="状态" width="90">
++            <template #default="{ row }">
++              <el-tag size="small" :type="row.enabled ? 'success' : 'info'">
++                {{ row.enabled ? '启用' : '停用' }}
++              </el-tag>
++            </template>
++          </el-table-column>
++          <el-table-column label="创建时间" width="180">
++            <template #default="{ row }">{{ formatTime(row.createdAt) }}</template>
++          </el-table-column>
++          <el-table-column label="操作" width="300" fixed="right">
++            <template #default="{ row }">
++              <el-tooltip :disabled="canWrite" :content="writeTip" placement="top">
++                <span class="users__row-actions">
++                  <el-button size="small" text :disabled="!canWrite" @click="openEditName(row)">
++                    编辑名称
++                  </el-button>
++                  <el-button size="small" text :disabled="!canWrite" @click="openAssign(row)">
++                    分配角色
++                  </el-button>
++                  <el-button size="small" text :disabled="!canWrite" @click="openReset(row)">
++                    重置密码
++                  </el-button>
++                  <el-popconfirm
++                    :title="row.enabled ? '确定停用该用户？' : '确定启用该用户？'"
++                    confirm-button-text="确定"
++                    cancel-button-text="取消"
++                    :confirm-button-type="row.enabled ? 'danger' : 'primary'"
++                    @confirm="toggleStatus(row)"
++                  >
++                    <template #reference>
++                      <el-button
++                        size="small"
++                        :type="row.enabled ? 'danger' : 'success'"
++                        text
++                        :disabled="!canWrite"
++                      >
++                        {{ row.enabled ? '停用' : '启用' }}
++                      </el-button>
++                    </template>
++                  </el-popconfirm>
++                </span>
++              </el-tooltip>
++            </template>
++          </el-table-column>
++
++          <template #empty>
++            <div class="ac-empty-state">
++              <span class="ac-empty-state__title">暂无用户</span>
++              <span class="ac-empty-state__text">调整筛选条件，或点击「新增用户」创建账号。</span>
++            </div>
++          </template>
++        </el-table>
++      </div>
++
++      <el-pagination
++        class="users__pagination"
++        background
++        layout="total, sizes, prev, pager, next"
++        :total="page.total"
++        :current-page="currentPage"
++        :page-size="pageSize"
++        :page-sizes="[10, 20, 50]"
++        @current-change="onPageChange"
++        @size-change="onSizeChange"
++      />
++
++      <UserDialogs
++        :roles="roles"
++        :editing-user="editingUser"
++        v-model:create-open="createOpen"
++        v-model:edit-name-open="editNameOpen"
++        v-model:reset-open="resetOpen"
++        v-model:assign-open="assignOpen"
++        @saved="onDialogsSaved"
++      />
++    </template>
++  </div>
++</template>
++
++<style scoped>
++.users__filters {
++  display: flex;
++  flex-wrap: wrap;
++  align-items: center;
++  gap: var(--ac-space-8);
++}
++
++.users__search {
++  width: 240px;
++  max-width: 100%;
++}
++
++.users__select {
++  width: 140px;
++}
++
++.users__actions {
++  margin-left: auto;
++}
++
++.users__name {
++  display: flex;
++  flex-direction: column;
++  gap: 2px;
++  min-width: 0;
++}
++
++.users__name-main {
++  color: var(--ac-ink);
++  font-weight: 600;
++}
++
++.users__name-sub {
++  color: var(--ac-muted);
++  font-size: var(--ac-text-meta);
++}
++
++.users__tags {
++  display: flex;
++  flex-wrap: wrap;
++  gap: var(--ac-space-4);
++}
++
++.users__row-actions {
++  display: inline-flex;
++  align-items: center;
++}
++
++.users__pagination {
++  justify-content: flex-end;
++  margin-top: var(--ac-space-12);
++}
++</style>
+diff --git a/text2sql-frontend/src/router/index.ts b/text2sql-frontend/src/router/index.ts
+index 0d2634e..c714d07 100644
+--- a/text2sql-frontend/src/router/index.ts
++++ b/text2sql-frontend/src/router/index.ts
+@@ -1,20 +1,22 @@
+ import { createRouter, createWebHistory } from 'vue-router'
+ import { useAuthStore } from '@/stores/auth'
+ 
+ declare module 'vue-router' {
+   interface RouteMeta {
+     title?: string
+     /** Routes reachable without a session (the login page). */
+     public?: boolean
+     /** Routes only administrators may open. */
+     admin?: boolean
++    /** Routes gated by a specific permission key, checked via `auth.can(...)`. */
++    permission?: string
+   }
+ }
+ 
+ const router = createRouter({
+   history: createWebHistory(),
+   routes: [
+     {
+       path: '/login',
+       name: 'login',
+       component: () => import('@/views/LoginView.vue'),
+@@ -37,42 +39,56 @@ const router = createRouter({
+       name: 'model-settings',
+       component: () => import('@/views/ModelSettingsView.vue'),
+       meta: { title: '模型配置' },
+     },
+     {
+       path: '/admin/datasource-access',
+       name: 'datasource-access',
+       component: () => import('@/views/DataSourceAccessView.vue'),
+       meta: { title: '数据源权限', admin: true },
+     },
++    {
++      path: '/admin/access-control',
++      name: 'access-control',
++      component: () => import('@/views/AccessControlView.vue'),
++      meta: { title: '权限管理', permission: 'access.manage' },
++    },
+     {
+       path: '/knowledge',
+       name: 'knowledge',
+       component: () => import('@/views/KnowledgeView.vue'),
+       meta: { title: '知识库', admin: true },
+     },
+     // The About page was removed; keep old links and bookmarks working.
+     { path: '/about', redirect: '/' },
+   ],
+ })
+ 
+ // Session guard: rehydrate the auth store (so a page refresh keeps the session), send
+-// guests to /login and keep signed-in users out of it.
++// guests to /login and keep signed-in users out of it. A route carrying `meta.permission`
++// refreshes the profile first, so a stale localStorage snapshot can never grant (or deny)
++// access against the server's current permission set.
+ router.beforeEach(async (to) => {
+   const auth = useAuthStore()
+   await auth.restore()
+   if (to.meta.public !== true && !auth.isAuthenticated) {
+     return { name: 'login' }
+   }
+   if (to.meta.public === true && auth.isAuthenticated) {
+     return { name: 'chat' }
+   }
++  if (to.meta.permission) {
++    await auth.refreshProfile()
++    if (!auth.can(to.meta.permission)) {
++      return { name: 'chat' }
++    }
++  }
+   if (to.meta.admin === true && auth.user?.role !== 'admin') {
+     return { name: 'chat' }
+   }
+   return true
+ })
+ 
+ router.afterEach((to) => {
+   const title = to.meta.title
+   document.title = title ? `${title} · Text2SQL` : 'Text2SQL'
+ })
+diff --git a/text2sql-frontend/src/stores/auth.ts b/text2sql-frontend/src/stores/auth.ts
+index 6305efb..b455973 100644
+--- a/text2sql-frontend/src/stores/auth.ts
++++ b/text2sql-frontend/src/stores/auth.ts
+@@ -8,20 +8,23 @@ import { clearStoredAuth, readToken, readUser, writeAuth } from '@/utils/authSto
+ import { hasAdminPermission, hasPermission } from '@/utils/permissions'
+ 
+ /**
+  * Session state for the auth flow: the JWT, the current user and the localStorage
+  * mirror that the router guard and the axios interceptors fall back on.
+  */
+ export const useAuthStore = defineStore('auth', () => {
+   const token = ref<string | null>(readToken())
+   const user = ref<AuthUser | null>(readUser())
+ 
++  /** In-flight profile refresh, coalescing concurrent callers. */
++  let profileRefresh: Promise<void> | null = null
++
+   /** True when a token is on record; the backend rejects it if it has expired. */
+   const isAuthenticated = computed(() => token.value !== null)
+ 
+   /**
+    * True when the current user holds the `access.manage` permission. Backed by the effective
+    * permission set from the profile, never the display-only `role` field.
+    */
+   const isAdmin = computed(() => hasAdminPermission(user.value?.permissions))
+ 
+   /** Applies a register/login response to the store and to localStorage. */
+@@ -82,22 +85,56 @@ export const useAuthStore = defineStore('auth', () => {
+       user.value = current
+       writeAuth(storedToken, current)
+     } catch (error) {
+       // Only an explicit 401 invalidates the session; an unreachable backend does not.
+       if (isAxiosError(error) && error.response?.status === 401) {
+         logout()
+       }
+     }
+   }
+ 
++  /**
++   * Re-fetches the profile from `me()` and applies it, so `can()`/`isAdmin` reflect the server's
++   * current permission set rather than a stale localStorage snapshot. An explicit 401 clears the
++   * session; any other failure keeps the stored profile (fail closed on the caller's side).
++   *
++   * <p>Concurrent callers share one in-flight request. Used on app boot (fire-and-forget, so the
++   * app is not blocked) and by the router guard before a permission-gated route is rendered.
++   */
++  function refreshProfile(): Promise<void> {
++    if (!token.value) {
++      return Promise.resolve()
++    }
++    if (profileRefresh) {
++      return profileRefresh
++    }
++    profileRefresh = (async () => {
++      try {
++        const current = await me()
++        user.value = current
++        if (token.value) {
++          writeAuth(token.value, current)
++        }
++      } catch (error) {
++        if (isAxiosError(error) && error.response?.status === 401) {
++          logout()
++        }
++      } finally {
++        profileRefresh = null
++      }
++    })()
++    return profileRefresh
++  }
++
+   return {
+     token,
+     user,
+     isAuthenticated,
+     isAdmin,
+     can,
+     login,
+     register,
+     logout,
+     restore,
++    refreshProfile,
+   }
+ })
+diff --git a/text2sql-frontend/src/types.ts b/text2sql-frontend/src/types.ts
+index f54c493..bb71213 100644
+--- a/text2sql-frontend/src/types.ts
++++ b/text2sql-frontend/src/types.ts
+@@ -311,20 +311,38 @@ export interface DatasourceMatrixDatasource {
+   name: string
+   default: boolean
+ }
+ 
+ /** The role → datasource matrix (roles + datasources). */
+ export interface DatasourceMatrix {
+   roles: DatasourceMatrixRole[]
+   datasources: DatasourceMatrixDatasource[]
+ }
+ 
++/** One column of a datasource's live metadata, for the data-scope editor's selectors. */
++export interface DatasourceSchemaColumn {
++  name: string
++  typeName: string
++}
++
++/** One table of a datasource's live metadata. */
++export interface DatasourceSchemaTable {
++  name: string
++  columns: DatasourceSchemaColumn[]
++}
++
++/** A datasource's live table/column metadata, never including connection secrets. */
++export interface DatasourceSchema {
++  datasourceId: string
++  tables: DatasourceSchemaTable[]
++}
++
+ /** A user as returned to admin clients (never any password material). */
+ export interface AccessUser {
+   id: string
+   username: string
+   displayName: string | null
+   enabled: boolean
+   roles: AccessUserRole[]
+   createdAt: number
+ }
+ 
+diff --git a/text2sql-frontend/src/views/AccessControlView.vue b/text2sql-frontend/src/views/AccessControlView.vue
+new file mode 100644
+index 0000000..7b38cb1
+--- /dev/null
++++ b/text2sql-frontend/src/views/AccessControlView.vue
+@@ -0,0 +1,66 @@
++<script setup lang="ts">
++import { ref } from 'vue'
++import RolesTab from '@/components/access-control/RolesTab.vue'
++import PermissionsTab from '@/components/access-control/PermissionsTab.vue'
++import DataScopeTab from '@/components/access-control/DataScopeTab.vue'
++import UsersTab from '@/components/access-control/UsersTab.vue'
++import DatasourceAccessTab from '@/components/access-control/DatasourceAccessTab.vue'
++import AuditTab from '@/components/access-control/AuditTab.vue'
++
++/**
++ * The permission-management area: six tabs over the typed access-control client. The route is gated
++ * by `access.manage`, so the page never renders for a caller without it; each tab is lazy-rendered
++ * on first activation so a visit does not fire six parallel loads.
++ */
++const activeTab = ref('roles')
++</script>
++
++<template>
++  <section class="ac-page ac-control">
++    <header class="ac-page-header">
++      <div>
++        <h1 class="ac-page-title">权限管理</h1>
++        <p class="ac-page-description">
++          管理角色、权限、数据范围、用户与数据源授权，并查看权限变更审计记录。后端接口始终是权限边界。
++        </p>
++      </div>
++    </header>
++
++    <el-tabs v-model="activeTab" class="ac-control__tabs">
++      <el-tab-pane label="角色" name="roles" lazy>
++        <RolesTab />
++      </el-tab-pane>
++      <el-tab-pane label="权限" name="permissions" lazy>
++        <PermissionsTab />
++      </el-tab-pane>
++      <el-tab-pane label="数据范围" name="data-scope" lazy>
++        <DataScopeTab />
++      </el-tab-pane>
++      <el-tab-pane label="用户" name="users" lazy>
++        <UsersTab />
++      </el-tab-pane>
++      <el-tab-pane label="数据源授权" name="datasource-access" lazy>
++        <DatasourceAccessTab />
++      </el-tab-pane>
++      <el-tab-pane label="审计" name="audit" lazy>
++        <AuditTab />
++      </el-tab-pane>
++    </el-tabs>
++  </section>
++</template>
++
++<style scoped>
++.ac-control__tabs :deep(.el-tabs__header) {
++  margin-bottom: var(--ac-space-16);
++}
++
++/* On narrow screens the tab strip scrolls horizontally instead of wrapping or overflowing. */
++.ac-control__tabs :deep(.el-tabs__nav-wrap) {
++  overflow-x: auto;
++  overflow-y: hidden;
++}
++
++.ac-control__tabs :deep(.el-tabs__item) {
++  font-size: var(--ac-text-body);
++}
++</style>

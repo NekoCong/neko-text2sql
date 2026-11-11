@@ -31,14 +31,14 @@ services:
       - mysql-data:/var/lib/mysql
       # Schema and seed data. These init scripts run only on an empty data directory; on a
       # preemptible instance that is exactly what happens on every fresh boot.
-      - ../text2sql-backend/src/main/resources/db/app-schema.sql:/docker-entrypoint-initdb.d/01-app-schema.sql:ro
-      - ../text2sql-backend/src/main/resources/db/app-data.sql:/docker-entrypoint-initdb.d/02-app-data.sql:ro
+      - ../neko-text2sql-backend/src/main/resources/db/app-schema.sql:/docker-entrypoint-initdb.d/01-app-schema.sql:ro
+      - ../neko-text2sql-backend/src/main/resources/db/app-data.sql:/docker-entrypoint-initdb.d/02-app-data.sql:ro
       # Idempotent migrations for volumes created before a column was added. Also executed by
       # deploy/bootstrap.sh on every deploy, because init scripts only run on empty volumes.
       - ./app-migrate.sql:/docker-entrypoint-initdb.d/03-app-migrate.sql:ro
       # Access-control migration (app_user.enabled/token_version + access_* tables/seed): additive and
       # idempotent. On a fresh volume it runs once here; on an existing volume bootstrap.sh runs it.
-      - ../text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql:/docker-entrypoint-initdb.d/04-access-control.sql:ro
+      - ../neko-text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql:/docker-entrypoint-initdb.d/04-access-control.sql:ro
     healthcheck:
       # $$ escapes to a literal $ inside the container, where MYSQL_ROOT_PASSWORD is already set,
       # so the password is not duplicated into the compose file's environment.
@@ -73,7 +73,7 @@ services:
       - pgvector-data:/var/lib/postgresql/data
       # Applied on an empty data directory; the backend also runs the same DDL (idempotently) on
       # startup, so an already-initialised volume still gets new tables/indexes.
-      - ../text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
+      - ../neko-text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
     healthcheck:
       # pg_isready has no --silent flag on PostgreSQL 16; the exit code is what matters.
       test: ["CMD-SHELL", "pg_isready -U postgres -d $$POSTGRES_DB"]
@@ -107,7 +107,7 @@ services:
 
   backend:
     build:
-      context: ../text2sql-backend
+      context: ../neko-text2sql-backend
       args:
         MAVEN_IMAGE: ${MAVEN_IMAGE:-maven:3.9.16-eclipse-temurin-25-noble}
         JRE_IMAGE: ${JRE_IMAGE:-eclipse-temurin:25-jre-alpine}
@@ -153,7 +153,7 @@ services:
 
   frontend:
     build:
-      context: ../text2sql-frontend
+      context: ../neko-text2sql-frontend
       args:
         NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
         NGINX_IMAGE: ${NGINX_IMAGE:-nginx:alpine}

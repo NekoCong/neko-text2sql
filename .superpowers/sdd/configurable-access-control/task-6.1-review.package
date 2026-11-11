@@ -1,0 +1,975 @@
+﻿## Commits
+2115003 feat(access-control): enrich profile with effective roles/permissions + typed access-control API client
+
+## Stat
+ .../text2sql/access/AccessContextResolver.java     |  21 +++
+ .../text2sql/controller/AuthController.java        |  37 +++-
+ .../nekocong/text2sql/controller/dto/UserView.java |  23 ++-
+ .../nekocong/text2sql/web/AuthControllerTest.java  | 117 +++++++++++++
+ text2sql-frontend/src/api/accessControl.ts         | 194 +++++++++++++++++++++
+ text2sql-frontend/src/stores/auth.ts               |  19 ++
+ text2sql-frontend/src/types.ts                     | 184 ++++++++++++++++++-
+ text2sql-frontend/src/utils/permissions.ts         |  28 +++
+ text2sql-frontend/tests/permissions.test.mjs       |  35 ++++
+ 9 files changed, 647 insertions(+), 11 deletions(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessContextResolver.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessContextResolver.java
+index ffd4a9d..02ef4a6 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessContextResolver.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessContextResolver.java
+@@ -65,20 +65,41 @@ public class AccessContextResolver {
+      * directly or through inheritance?" without failing on a disabled or stale account. An unknown
+      * user resolves to an empty list (fails closed).
+      *
+      * @param userId the user id
+      * @return the effective role ids
+      */
+     public Mono<List<String>> effectiveRoleIdsOf(String userId) {
+         return repository.rolesOf(userId).flatMap(this::effectiveRoleIdsFor);
+     }
+ 
++    /**
++     * Computes the effective role codes of one user (the user's enabled direct roles plus their
++     * enabled ancestors), reusing the same roles-of + inheritance walk as {@link #resolve}. Codes are
++     * sorted for a stable, testable order.
++     *
++     * <p>Unlike {@link #resolve}, this never fails on a disabled or stale account: an unknown user, or
++     * a user without enabled roles, resolves to an empty list (fails closed). It is used to surface
++     * the caller's roles in the profile, where an identity problem must not break the {@code /me}
++     * shape.
++     *
++     * @param userId the user id
++     * @return the effective role codes, sorted
++     */
++    public Mono<List<String>> effectiveRoleCodes(String userId) {
++        return repository
++                .rolesOf(userId)
++                .zipWith(repository.allRoles())
++                .map(roles -> effectiveRoles(roles.getT1(), roles.getT2()))
++                .map(roles -> roles.stream().map(AccessRole::code).sorted().toList());
++    }
++
+     /**
+      * Computes the effective role ids for the given direct roles (each enabled direct role plus its
+      * enabled ancestors), loading every role for the walk. Rejects a cycle.
+      *
+      * @param direct the directly assigned roles
+      * @return the effective role ids, including inherited ones
+      */
+     public Mono<List<String>> effectiveRoleIdsFor(Collection<AccessRole> direct) {
+         return repository
+                 .allRoles()
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AuthController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AuthController.java
+index b92b061..4053954 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AuthController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AuthController.java
+@@ -1,12 +1,13 @@
+ package com.nekocong.text2sql.controller;
+ 
++import com.nekocong.text2sql.access.AccessContextResolver;
+ import com.nekocong.text2sql.controller.dto.AuthResponse;
+ import com.nekocong.text2sql.controller.dto.LoginRequest;
+ import com.nekocong.text2sql.controller.dto.RegisterRequest;
+ import com.nekocong.text2sql.controller.dto.UserView;
+ import com.nekocong.text2sql.service.AuthResult;
+ import com.nekocong.text2sql.service.AuthService;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.security.core.annotation.AuthenticationPrincipal;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.web.bind.annotation.GetMapping;
+@@ -18,65 +19,83 @@ import org.springframework.web.bind.annotation.RestController;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Controller layer for authentication. Delegates all business logic to {@link AuthService}.
+  */
+ @RestController
+ @RequestMapping("/api/auth")
+ public class AuthController {
+ 
+     private final AuthService authService;
++    private final AccessContextResolver accessContext;
+ 
+     /**
+      * Creates the controller.
+      *
+      * @param authService the authentication service
++     * @param accessContext the resolver that computes the caller's effective roles/permissions
+      */
+-    public AuthController(AuthService authService) {
++    public AuthController(AuthService authService, AccessContextResolver accessContext) {
+         this.authService = authService;
++        this.accessContext = accessContext;
+     }
+ 
+     /**
+      * Registers a new user and returns a token.
+      *
+      * @param request the registration request
+      * @return the auth response
+      */
+     @PostMapping("/register")
+     @ResponseStatus(HttpStatus.CREATED)
+     public Mono<AuthResponse> register(@RequestBody RegisterRequest request) {
+         return authService
+                 .register(request.username(), request.password(), request.displayName())
+-                .map(AuthController::toResponse);
++                .flatMap(this::toResponse);
+     }
+ 
+     /**
+      * Authenticates a user and returns a token.
+      *
+      * @param request the login request
+      * @return the auth response
+      */
+     @PostMapping("/login")
+     public Mono<AuthResponse> login(@RequestBody LoginRequest request) {
+-        return authService.login(request.username(), request.password()).map(AuthController::toResponse);
++        return authService.login(request.username(), request.password()).flatMap(this::toResponse);
+     }
+ 
+     /**
+      * Returns the currently authenticated user.
+      *
+      * @param jwt the bearer token
+      * @return the user
+      */
+     @GetMapping("/me")
+     public Mono<UserView> me(@AuthenticationPrincipal Jwt jwt) {
+         return authService
+                 .requireUser(jwt.getSubject())
+-                .map(user -> new UserView(user.id(), user.username(), user.displayName(), user.role()));
++                .flatMap(user -> toView(user.id(), user.username(), user.displayName(), user.role()));
+     }
+ 
+-    private static AuthResponse toResponse(AuthResult result) {
+-        return new AuthResponse(
+-                result.token(),
+-                result.expiresIn(),
+-                new UserView(result.userId(), result.username(), result.displayName(), result.role()));
++    /**
++     * Resolves the caller's effective roles and permissions from the access-control tables and
++     * builds the enriched view, keeping the legacy {@code role} field display-only.
++     */
++    private Mono<UserView> toView(String userId, String username, String displayName, String role) {
++        return Mono.zip(
++                        accessContext.effectiveRoleCodes(userId),
++                        accessContext.effectivePermissions(userId))
++                .map(tuple -> new UserView(
++                        userId,
++                        username,
++                        displayName,
++                        role,
++                        tuple.getT1(),
++                        tuple.getT2().stream().sorted().toList()));
++    }
++
++    private Mono<AuthResponse> toResponse(AuthResult result) {
++        return toView(result.userId(), result.username(), result.displayName(), result.role())
++                .map(view -> new AuthResponse(result.token(), result.expiresIn(), view));
+     }
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/UserView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/UserView.java
+index f64c5d0..b9beb54 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/UserView.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/UserView.java
+@@ -1,11 +1,32 @@
+ package com.nekocong.text2sql.controller.dto;
+ 
++import java.util.List;
++
+ /**
+  * The authenticated user, as returned to the client.
+  *
++ * <p>{@code role} is the legacy display-only claim from the JWT; {@code roles} and {@code permissions}
++ * are the caller's <em>effective</em> access resolved from the access-control tables on every call, so
++ * navigation and route guards can gate on them without trusting the token.
++ *
+  * @param id the user id
+  * @param username the username
+  * @param displayName the display name (may be {@code null})
+  * @param role the role name ({@code admin}, {@code student} or {@code counselor})
++ * @param roles the effective role codes (enabled direct roles + enabled ancestors), sorted
++ * @param permissions the effective permission keys, sorted
+  */
+-public record UserView(String id, String username, String displayName, String role) {}
++public record UserView(
++        String id,
++        String username,
++        String displayName,
++        String role,
++        List<String> roles,
++        List<String> permissions) {
++
++    /** Normalizes the collections so the view is structurally immutable. */
++    public UserView {
++        roles = roles == null ? List.of() : List.copyOf(roles);
++        permissions = permissions == null ? List.of() : List.copyOf(permissions);
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
+index bd98b99..71ce995 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
+@@ -1,25 +1,29 @@
+ package com.nekocong.text2sql.web;
+ 
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.util.List;
+ import java.util.Map;
+ import java.util.UUID;
+ import com.nekocong.text2sql.access.AccessControlRepository;
+ import com.nekocong.text2sql.repository.UserRepository;
+ import com.nekocong.text2sql.security.Roles;
+ import com.nekocong.text2sql.user.AppUser;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.boot.test.context.SpringBootTest;
+ import org.springframework.boot.test.web.server.LocalServerPort;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.test.web.reactive.server.WebTestClient;
+ 
+ /**
+  * End-to-end authentication tests: registration, login, current-user, and access control on a
+  * protected endpoint.
+  */
+ @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+ class AuthControllerTest {
+ 
+@@ -28,20 +32,23 @@ class AuthControllerTest {
+ 
+     @Autowired
+     private UserRepository users;
+ 
+     @Autowired
+     private PasswordEncoder passwordEncoder;
+ 
+     @Autowired
+     private AccessControlRepository access;
+ 
++    @Autowired
++    private DatabaseClient db;
++
+     private WebTestClient client;
+ 
+     @BeforeEach
+     void setUp() {
+         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
+     }
+ 
+     @Test
+     void registerLoginAndMe() {
+         String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+@@ -130,11 +137,121 @@ class AuthControllerTest {
+                 .bodyValue(Map.of("username", username, "password", "wrong-password"))
+                 .exchange()
+                 .expectStatus()
+                 .isUnauthorized();
+     }
+ 
+     @Test
+     void protectedEndpointRequiresToken() {
+         client.get().uri("/api/conversations").exchange().expectStatus().isUnauthorized();
+     }
++
++    @Test
++    void meReturnsEffectiveRolesAndPermissionsForAdmin() {
++        String username = unique("adm");
++        AppUser admin = users.insert(username, passwordEncoder.encode("secret123"), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++
++        String token = TestAuth.login(client, username, "secret123");
++
++        client.get()
++                .uri("/api/auth/me")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.roles[0]")
++                .isEqualTo("admin")
++                .jsonPath("$.permissions")
++                .value(value -> assertThat((List<Object>) value)
++                        .contains("access.manage", "user.manage", "audit.read"))
++                .jsonPath("$.password")
++                .doesNotExist()
++                .jsonPath("$.passwordHash")
++                .doesNotExist();
++    }
++
++    @Test
++    void registrationReturnsStudentRoleAndPermissions() {
++        String username = unique("u");
++        client.post()
++                .uri("/api/auth/register")
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("username", username, "password", "secret123", "displayName", "Alice"))
++                .exchange()
++                .expectStatus()
++                .isCreated()
++                .expectBody()
++                .jsonPath("$.token")
++                .isNotEmpty()
++                .jsonPath("$.user.username")
++                .isEqualTo(username)
++                .jsonPath("$.user.roles")
++                .value(value -> assertThat((List<Object>) value).containsExactly("student"))
++                .jsonPath("$.user.permissions")
++                .value(value -> assertThat((List<Object>) value).containsExactly("chat.use", "datasource.read"))
++                .jsonPath("$.user.password")
++                .doesNotExist()
++                .jsonPath("$.user.passwordHash")
++                .doesNotExist();
++    }
++
++    @Test
++    void meReflectsARoleChangeOnTheNextCall() {
++        String username = unique("u");
++        client.post()
++                .uri("/api/auth/register")
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("username", username, "password", "secret123"))
++                .exchange()
++                .expectStatus()
++                .isCreated();
++
++        String token = TestAuth.login(client, username, "secret123");
++        String userId = TestAuth.currentUserId(client, token);
++
++        // A freshly registered account starts as a student.
++        client.get()
++                .uri("/api/auth/me")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.roles[0]")
++                .isEqualTo("student")
++                .jsonPath("$.permissions")
++                .value(value -> assertThat((List<Object>) value).doesNotContain("access.manage"));
++
++        // The administrator reassigns the account to the admin role.
++        replaceRole(userId, Roles.ADMIN);
++
++        // The very next /me reflects the new role and its permissions.
++        client.get()
++                .uri("/api/auth/me")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.roles[0]")
++                .isEqualTo("admin")
++                .jsonPath("$.permissions")
++                .value(value -> assertThat((List<Object>) value)
++                        .contains("access.manage", "user.manage", "audit.read"));
++    }
++
++    /** Replaces every role assignment of a user with the single role carrying the given code. */
++    private void replaceRole(String userId, String roleCode) {
++        db.sql("DELETE FROM access_user_role WHERE user_id = :userId")
++                .bind("userId", userId)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        access.assignRoleByCode(userId, roleCode).block();
++    }
++
++    private static String unique(String prefix) {
++        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++    }
+ }
+diff --git a/text2sql-frontend/src/api/accessControl.ts b/text2sql-frontend/src/api/accessControl.ts
+new file mode 100644
+index 0000000..7f7fbb9
+--- /dev/null
++++ b/text2sql-frontend/src/api/accessControl.ts
+@@ -0,0 +1,194 @@
++import { http } from './http'
++import type {
++  AccessAuditPage,
++  AccessPermission,
++  AccessRole,
++  AccessRolePermissions,
++  AccessRoleRequest,
++  AccessUser,
++  AccessUserCreateRequest,
++  AccessUserDisplayNameRequest,
++  AccessUserPage,
++  AccessUserPasswordRequest,
++  AccessUserRolesRequest,
++  AccessUserStatusRequest,
++  AuditFilters,
++  DataScope,
++  DataScopeRequest,
++  DatasourceMatrix,
++  RoleDatasources,
++} from '@/types'
++
++/**
++ * Typed client for the access-control admin API (`/api/admin/access-control`). Every route is
++ * gated server-side by the `access.manage` permission; a caller without it gets a 401/403 from the
++ * shared `http` instance.
++ */
++const BASE = '/admin/access-control'
++
++// --- Roles --------------------------------------------------------------------------------------
++
++/** Lists every role, ordered by code. */
++export async function listRoles(): Promise<AccessRole[]> {
++  const { data } = await http.get<AccessRole[]>(`${BASE}/roles`)
++  return data
++}
++
++/** Creates a role. */
++export async function createRole(request: AccessRoleRequest): Promise<AccessRole> {
++  const { data } = await http.post<AccessRole>(`${BASE}/roles`, request)
++  return data
++}
++
++/** Updates a role (`code` is immutable; omitted fields keep their current value). */
++export async function updateRole(id: string, request: AccessRoleRequest): Promise<AccessRole> {
++  const { data } = await http.put<AccessRole>(`${BASE}/roles/${id}`, request)
++  return data
++}
++
++// --- Permissions --------------------------------------------------------------------------------
++
++/** Lists the permission catalog, ordered by module then key. */
++export async function listPermissions(): Promise<AccessPermission[]> {
++  const { data } = await http.get<AccessPermission[]>(`${BASE}/permissions`)
++  return data
++}
++
++/** Reads a role's own permission set. */
++export async function getRolePermissions(roleId: string): Promise<AccessRolePermissions> {
++  const { data } = await http.get<AccessRolePermissions>(`${BASE}/roles/${roleId}/permissions`)
++  return data
++}
++
++/** Replaces a role's permission set with the complete requested set. */
++export async function replaceRolePermissions(
++  roleId: string,
++  permissions: string[],
++): Promise<AccessRolePermissions> {
++  const { data } = await http.put<AccessRolePermissions>(`${BASE}/roles/${roleId}/permissions`, {
++    permissions,
++  })
++  return data
++}
++
++// --- Data scopes --------------------------------------------------------------------------------
++
++/** Parameters for listing a role's data-scope rules. */
++export interface ListDataScopesParams {
++  roleId: string
++  datasourceId?: string
++}
++
++/** Lists a role's data-scope rules, ordered by datasource then table. */
++export async function listDataScopes(params: ListDataScopesParams): Promise<DataScope[]> {
++  const { data } = await http.get<DataScope[]>(`${BASE}/data-scopes`, { params })
++  return data
++}
++
++/** Inserts or updates the rule for a role, datasource and table. */
++export async function upsertDataScope(request: DataScopeRequest): Promise<DataScope> {
++  const { data } = await http.put<DataScope>(`${BASE}/data-scopes`, request)
++  return data
++}
++
++/** Deletes one data-scope rule. */
++export async function deleteDataScope(id: string): Promise<void> {
++  await http.delete(`${BASE}/data-scopes/${id}`)
++}
++
++// --- Datasource matrix --------------------------------------------------------------------------
++
++/** Reads the full role → datasource matrix. */
++export async function getDatasourceMatrix(): Promise<DatasourceMatrix> {
++  const { data } = await http.get<DatasourceMatrix>(`${BASE}/datasource-access`)
++  return data
++}
++
++/** Reads a role's own datasource grant set. */
++export async function getRoleDatasources(roleId: string): Promise<RoleDatasources> {
++  const { data } = await http.get<RoleDatasources>(`${BASE}/roles/${roleId}/datasources`)
++  return data
++}
++
++/** Replaces a role's datasource grant set with the complete requested set. */
++export async function replaceRoleDatasources(
++  roleId: string,
++  datasourceIds: string[],
++): Promise<RoleDatasources> {
++  const { data } = await http.put<RoleDatasources>(`${BASE}/roles/${roleId}/datasources`, {
++    datasourceIds,
++  })
++  return data
++}
++
++// --- Users --------------------------------------------------------------------------------------
++
++/** Parameters for listing users. */
++export interface ListUsersParams {
++  query?: string
++  enabled?: boolean
++  roleId?: string
++  page?: number
++  size?: number
++}
++
++/** Lists users, ordered by username, paginated. */
++export async function listUsers(params: ListUsersParams = {}): Promise<AccessUserPage> {
++  const { data } = await http.get<AccessUserPage>(`${BASE}/users`, { params })
++  return data
++}
++
++/** Reads one user. */
++export async function getUser(id: string): Promise<AccessUser> {
++  const { data } = await http.get<AccessUser>(`${BASE}/users/${id}`)
++  return data
++}
++
++/** Creates a user. */
++export async function createUser(request: AccessUserCreateRequest): Promise<AccessUser> {
++  const { data } = await http.post<AccessUser>(`${BASE}/users`, request)
++  return data
++}
++
++/** Edits a user's display name. */
++export async function updateUserDisplayName(
++  id: string,
++  request: AccessUserDisplayNameRequest,
++): Promise<AccessUser> {
++  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}`, request)
++  return data
++}
++
++/** Enables or disables a user. */
++export async function updateUserStatus(
++  id: string,
++  request: AccessUserStatusRequest,
++): Promise<AccessUser> {
++  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}/status`, request)
++  return data
++}
++
++/** Resets a user's password. */
++export async function resetUserPassword(
++  id: string,
++  request: AccessUserPasswordRequest,
++): Promise<void> {
++  await http.post(`${BASE}/users/${id}/reset-password`, request)
++}
++
++/** Replaces a user's role assignments. */
++export async function replaceUserRoles(
++  id: string,
++  request: AccessUserRolesRequest,
++): Promise<AccessUser> {
++  const { data } = await http.put<AccessUser>(`${BASE}/users/${id}/roles`, request)
++  return data
++}
++
++// --- Audit --------------------------------------------------------------------------------------
++
++/** Lists the access-control audit trail, newest first, paginated and filtered. */
++export async function listAudit(filters: AuditFilters = {}): Promise<AccessAuditPage> {
++  const { data } = await http.get<AccessAuditPage>(`${BASE}/audit`, { params: filters })
++  return data
++}
+diff --git a/text2sql-frontend/src/stores/auth.ts b/text2sql-frontend/src/stores/auth.ts
+index caa4a2e..6305efb 100644
+--- a/text2sql-frontend/src/stores/auth.ts
++++ b/text2sql-frontend/src/stores/auth.ts
+@@ -1,29 +1,36 @@
+ import { computed, ref } from 'vue'
+ import { defineStore } from 'pinia'
+ import { isAxiosError } from 'axios'
+ import type { AuthResponse, AuthUser } from '@/types'
+ import { login as loginRequest, me, register as registerRequest } from '@/api/auth'
+ import type { LoginPayload, RegisterPayload } from '@/api/auth'
+ import { clearStoredAuth, readToken, readUser, writeAuth } from '@/utils/authStorage'
++import { hasAdminPermission, hasPermission } from '@/utils/permissions'
+ 
+ /**
+  * Session state for the auth flow: the JWT, the current user and the localStorage
+  * mirror that the router guard and the axios interceptors fall back on.
+  */
+ export const useAuthStore = defineStore('auth', () => {
+   const token = ref<string | null>(readToken())
+   const user = ref<AuthUser | null>(readUser())
+ 
+   /** True when a token is on record; the backend rejects it if it has expired. */
+   const isAuthenticated = computed(() => token.value !== null)
+ 
++  /**
++   * True when the current user holds the `access.manage` permission. Backed by the effective
++   * permission set from the profile, never the display-only `role` field.
++   */
++  const isAdmin = computed(() => hasAdminPermission(user.value?.permissions))
++
+   /** Applies a register/login response to the store and to localStorage. */
+   function applySession(response: AuthResponse): void {
+     token.value = response.token
+     user.value = response.user
+     writeAuth(response.token, response.user)
+   }
+ 
+   /**
+    * Signs in and stores the issued session.
+    *
+@@ -42,20 +49,30 @@ export const useAuthStore = defineStore('auth', () => {
+     applySession(await registerRequest(payload))
+   }
+ 
+   /** Clears the session from the store and from localStorage. */
+   function logout(): void {
+     token.value = null
+     user.value = null
+     clearStoredAuth()
+   }
+ 
++  /**
++   * Reports whether the current user holds the given permission, backed by the effective permission
++   * set from the profile. Returns `false` when no profile is loaded (fails closed).
++   *
++   * @param permission the permission key to check (e.g. `access.manage`)
++   */
++  function can(permission: string): boolean {
++    return hasPermission(user.value?.permissions, permission)
++  }
++
+   /**
+    * Rehydrates the session after a page reload. When only the JWT survived (the user
+    * entry is missing or corrupted) the profile is fetched via `me()`.
+    */
+   async function restore(): Promise<void> {
+     const storedToken = readToken()
+     token.value = storedToken
+     user.value = readUser()
+     if (!storedToken || user.value) {
+       return
+@@ -69,16 +86,18 @@ export const useAuthStore = defineStore('auth', () => {
+       if (isAxiosError(error) && error.response?.status === 401) {
+         logout()
+       }
+     }
+   }
+ 
+   return {
+     token,
+     user,
+     isAuthenticated,
++    isAdmin,
++    can,
+     login,
+     register,
+     logout,
+     restore,
+   }
+ })
+diff --git a/text2sql-frontend/src/types.ts b/text2sql-frontend/src/types.ts
+index f1ce7cb..f54c493 100644
+--- a/text2sql-frontend/src/types.ts
++++ b/text2sql-frontend/src/types.ts
+@@ -1,19 +1,23 @@
+ import type { Citation } from '@/api/knowledge'
+ 
+ /** The authenticated user surfaced by the auth endpoints. */
+ export interface AuthUser {
+   id: string
+   username: string
+   displayName: string | null
+-  /** Backend role: `admin` | `student` | `counselor`. */
++  /** Backend role: `admin` | `student` | `counselor`. Display-only. */
+   role?: string
++  /** Effective role codes (enabled direct roles + ancestors), sorted. */
++  roles?: string[]
++  /** Effective permission keys, sorted. */
++  permissions?: string[]
+ }
+ 
+ /** Successful `register` / `login` response: the JWT plus the resolved user. */
+ export interface AuthResponse {
+   token: string
+   expiresIn: number
+   user: AuthUser
+ }
+ 
+ /** A datasource the backend can generate SQL against. */
+@@ -218,10 +222,188 @@ export interface ModelConfig {
+ /** Request body for creating or updating a model configuration. */
+ export interface ModelConfigPayload {
+   name: string
+   provider: string
+   model: string
+   /** On update, a blank value keeps the stored key. */
+   apiKey?: string
+   baseUrl?: string
+   isDefault?: boolean
+ }
++
++// --- Configurable access control (mirrors the backend DTOs under access/api/dto) ----------------
++
++/** A role in the access-control catalog. */
++export interface AccessRole {
++  id: string
++  code: string
++  name: string
++  description: string | null
++  parentId: string | null
++  builtIn: boolean
++  enabled: boolean
++}
++
++/** Request body for creating or updating a role. On update, omitted fields keep their value. */
++export interface AccessRoleRequest {
++  code?: string
++  name?: string
++  description?: string
++  parentId?: string
++  enabled?: boolean
++}
++
++/** An entry of the permission catalog. */
++export interface AccessPermission {
++  id: string
++  key: string
++  module: string
++  action: string
++  description: string | null
++  builtIn: boolean
++}
++
++/** One role's permission set, as permission keys. */
++export interface AccessRolePermissions {
++  roleId: string
++  permissions: string[]
++}
++
++/** A data-scope rule. */
++export interface DataScope {
++  id: string
++  roleId: string
++  datasourceId: string
++  tableName: string
++  policy: 'ALL' | 'FILTER' | 'DENY'
++  columnName: string | null
++  principalAttribute: string | null
++}
++
++/** Request body for upserting one data-scope rule. */
++export interface DataScopeRequest {
++  roleId: string
++  datasourceId: string
++  tableName: string
++  policy: 'ALL' | 'FILTER' | 'DENY'
++  columnName?: string
++  principalAttribute?: string
++}
++
++/** One role's datasource grant set, as datasource ids. */
++export interface RoleDatasources {
++  roleId: string
++  datasourceIds: string[]
++}
++
++/** One role row of the role → datasource matrix. */
++export interface DatasourceMatrixRole {
++  id: string
++  code: string
++  name: string
++  builtIn: boolean
++  enabled: boolean
++  datasourceIds: string[]
++}
++
++/** One datasource row of the role → datasource matrix. */
++export interface DatasourceMatrixDatasource {
++  id: string
++  name: string
++  default: boolean
++}
++
++/** The role → datasource matrix (roles + datasources). */
++export interface DatasourceMatrix {
++  roles: DatasourceMatrixRole[]
++  datasources: DatasourceMatrixDatasource[]
++}
++
++/** A user as returned to admin clients (never any password material). */
++export interface AccessUser {
++  id: string
++  username: string
++  displayName: string | null
++  enabled: boolean
++  roles: AccessUserRole[]
++  createdAt: number
++}
++
++/** A role reference inside an {@link AccessUser}. */
++export interface AccessUserRole {
++  id: string
++  code: string
++  name: string
++}
++
++/** A page of access-control users. */
++export interface AccessUserPage {
++  items: AccessUser[]
++  total: number
++  page: number
++  size: number
++}
++
++/** Request body for creating a user. */
++export interface AccessUserCreateRequest {
++  username: string
++  password: string
++  displayName?: string
++  roleIds: string[]
++}
++
++/** Request body for editing a user's display name. */
++export interface AccessUserDisplayNameRequest {
++  displayName: string | null
++}
++
++/** Request body for enabling or disabling a user. */
++export interface AccessUserStatusRequest {
++  enabled: boolean
++}
++
++/** Request body for resetting a user's password. */
++export interface AccessUserPasswordRequest {
++  password: string
++}
++
++/** Request body for replacing a user's role assignments. */
++export interface AccessUserRolesRequest {
++  roleIds: string[]
++}
++
++/** One access-control audit entry. */
++export interface AccessAudit {
++  id: string
++  actorId: string
++  action: string
++  entityType: string
++  entityId: string | null
++  before: unknown
++  after: unknown
++  result: string
++  reason: string | null
++  createdAt: number
++}
++
++/** A page of the access-control audit trail. */
++export interface AccessAuditPage {
++  items: AccessAudit[]
++  total: number
++  page: number
++  size: number
++}
++
++/** Optional filters for the audit listing. */
++export interface AuditFilters {
++  actorId?: string
++  action?: string
++  entityType?: string
++  entityId?: string
++  result?: 'SUCCESS' | 'DENIED'
++  /** Inclusive lower time bound (epoch millis). */
++  from?: number
++  /** Exclusive upper time bound (epoch millis). */
++  to?: number
++  page?: number
++  size?: number
++}
+diff --git a/text2sql-frontend/src/utils/permissions.ts b/text2sql-frontend/src/utils/permissions.ts
+new file mode 100644
+index 0000000..d5a488f
+--- /dev/null
++++ b/text2sql-frontend/src/utils/permissions.ts
+@@ -0,0 +1,28 @@
++/**
++ * Pure predicates over a caller's effective permission keys, shared by the auth store and its unit
++ * tests. Kept free of any store/Vue import so the node test runner can exercise it directly.
++ */
++
++/** Permission key that gates the access-control admin surface. */
++export const ACCESS_MANAGE = 'access.manage'
++
++/**
++ * Reports whether a permission set contains the given key.
++ *
++ * @param permissions the effective permission keys, or `undefined` when the profile is absent
++ * @param permission the permission key to check
++ * @returns `true` only when the key is present (fails closed on a missing set)
++ */
++export function hasPermission(permissions: string[] | undefined, permission: string): boolean {
++  return permissions != null && permissions.includes(permission)
++}
++
++/**
++ * Reports whether a permission set grants `access.manage` (administrator access).
++ *
++ * @param permissions the effective permission keys, or `undefined` when the profile is absent
++ * @returns `true` only when `access.manage` is present (fails closed on a missing set)
++ */
++export function hasAdminPermission(permissions: string[] | undefined): boolean {
++  return hasPermission(permissions, ACCESS_MANAGE)
++}
+diff --git a/text2sql-frontend/tests/permissions.test.mjs b/text2sql-frontend/tests/permissions.test.mjs
+new file mode 100644
+index 0000000..9049bfa
+--- /dev/null
++++ b/text2sql-frontend/tests/permissions.test.mjs
+@@ -0,0 +1,35 @@
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import { ACCESS_MANAGE, hasAdminPermission, hasPermission } from '../src/utils/permissions.ts'
++
++/**
++ * Pure unit tests for the permission predicates backing the auth store's `can()` and `isAdmin`
++ * getters. These are the exact functions the store delegates to, so testing them here pins the
++ * fail-closed behaviour without needing a Pinia/Vue/DOM environment.
++ */
++test('hasPermission reports true only for a present key', () => {
++  const permissions = ['chat.use', 'datasource.read', 'access.manage']
++
++  assert.equal(hasPermission(permissions, 'chat.use'), true)
++  assert.equal(hasPermission(permissions, 'access.manage'), true)
++  assert.equal(hasPermission(permissions, 'user.manage'), false)
++})
++
++test('hasPermission fails closed on an absent permission set', () => {
++  assert.equal(hasPermission(undefined, 'access.manage'), false)
++  assert.equal(hasPermission([], 'access.manage'), false)
++})
++
++test('hasAdminPermission is true only with access.manage, independent of the legacy role', () => {
++  assert.equal(hasAdminPermission(['chat.use', 'access.manage']), true)
++  // A user may carry the display-only `role === 'admin'` string, but authorization must come from
++  // the permission set. The helper only sees the permission list, so a list without access.manage
++  // is never an administrator.
++  assert.equal(hasAdminPermission(['chat.use', 'datasource.read']), false)
++  assert.equal(hasAdminPermission(undefined), false)
++  assert.equal(hasAdminPermission([]), false)
++})
++
++test('ACCESS_MANAGE is the access.manage key the store gates on', () => {
++  assert.equal(ACCESS_MANAGE, 'access.manage')
++})

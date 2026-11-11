@@ -1,0 +1,106 @@
+# SDD ledger — plan: openspec/changes/configurable-access-control/tasks.md
+
+Plan: `configurable-access-control` (41 tasks)
+Spec: `openspec/changes/configurable-access-control/specs/access-control/spec.md`
+Baseline: `03efc62` (schema + resolver foundation)
+
+## Progress
+
+- Group 1: schema/seed/migration implemented. 1.1 and the schema half of 1.4 verified on H2; 1.2 seed and 1.3 migration still need a MySQL run.
+- Group 2: complete (2.1–2.4; 185 backend tests green).
+- Task 3.5: in progress (fixer session `ses_e43f70edcffeD6ENketnIEKIE7`).
+- Group 3.1–3.4: not started; needs the `DataScope` → `EffectiveAccess` enforcement refactor.
+
+- Task 3.5: complete (commits 03efc62..d82aa85, review clean after 1 fix round)
+- Task 3.5: minor (deferred): stale comment in R2dbcAccessControlRepository about the NOT EXISTS insert
+- Task 3.5: minor (deferred): no test for the assignRoleByCode 0-row/exists() branch
+- Task 3.5: minor (deferred): AccessStatusIntegrationTest asserts only 401 for disabled+wrong-password
+- Task 3.5: minor (deferred): assignRoleByCode message says "角色不存在" for a disabled role
+- Task 3.1: in progress (fixer session ses_e43b47518ffeiHXrX7HBjBw02d; brief `.superpowers/sdd/configurable-access-control/task-3.1-brief.md`)
+- Task 3.1: complete (commits 9818fd0..6c671ac, review clean after 1 fix round)
+- Task 3.2: complete (deny/unconfigured table throws before execution; `Text2SqlPolicyEnforcementTest` counts zero executions)
+- Task 3.3: complete (scopedExplanation/callerContext derive from EffectiveAccess; seeded wording preserved)
+- Task 3.1: minor (deferred): no knowledge-enabled WebTestClient test for citations/search (C1 compile-verified only)
+- Task 3.1: minor (deferred): revokeDatasourceByCode does not validate role existence (grant does)
+- Task 3.1: minor (deferred): multi-grant knowledge retrieval with a null request datasource yields an empty whitelist
+- Task 3.1: minor (deferred): cosmetic long lines / redundant resolve assertion
+- Task 3.4: in progress (fixer session ses_e42399e6fffeYK1zH6azFGhgzR; brief `.superpowers/sdd/configurable-access-control/task-3.4-brief.md`)
+- Task 3.4: complete (commits 239cb5a..7b6b076, review approved, no fix round)
+- Task 3.4: minor (deferred): duplicated EffectiveAccess attribute key in filter and permission manager
+- Task 3.4: minor (deferred): stale role-gating Javadoc in Roles/KnowledgeAdminController/KnowledgeCitationController
+- Task 3.4: minor (deferred): no assertion that the issued token carries role=admin
+- Task 3.4: minor (deferred): no unit test for the permission manager's denial branches
+- Task 3.4: minor (deferred): style nits in DatasourceAccessController/PermissionAuthorizationManager
+- Task 4.1-4.3: in progress (fixer session ses_e422eb62bffe7FQmP54b1YAEsS; brief task-4.1-brief.md)
+- Task 4.1-4.3: complete (commits 87cf616..4bf9cf8, review clean after 1 fix round)
+- Task 4.1: minor (deferred): verifyPredicate unused parts param / overstated javadoc
+- Task 4.1: minor (deferred): configuredTables vs visibleTables identifier-filter asymmetry
+- Task 4.1: minor (deferred): test name drift for current-name CTE invisibility
+- Task 5.1: in progress (fixer session ses_e42057dfdffeHVK8s1gNXA8ffK; brief task-5.1-brief.md)
+- Task 5.1: complete (commits 7684793..eeb8471, review clean after 2 fix rounds)
+- Task 5.1: minor (deferred): audit Javadoc bullets contradict the update-path 400 rule
+- Task 5.1: minor (deferred): ConversationControllerTest Javadoc/assertion mismatch
+- Task 5.1: minor (deferred): fix report commit hash stale; audit-insert failure still drops the DENIED row (logged)
+- Task 5.1: carry to 5.7: built-in admin can still be reparented under a custom role (inheritance direction)
+- Task 5.1: note: concurrent create race -> 500; REQUIRES_NEW holds two pooled connections briefly
+- Task 5.2: in progress (fixer session ses_e40f7c92bffeVqfo06tlTcQ7re; brief task-5.2-brief.md)
+- Task 5.2: complete (commits eeb8471..7a8bc9e, review clean after 1 fix round)
+- Task 5.2: minor (deferred): stale AccessRolePermissionsRequest javadoc (null clears)
+- Task 5.2: minor (deferred): guard Mono.empty() is fail-open and undocumented; duplicated audit plumbing/ID_PATTERN between the two services
+- Task 5.2: minor (deferred): test JSON-string body case; 106-char line
+- Task 5.3: in progress (fixer session ses_e40dcdaf8ffeYZXZwBxd7y5EO9; brief task-5.3-brief.md)
+- Task 5.3: fix round 1 reviewed: Important addressed; 2 minors open (double datasource resolve, multi-datasource ordering test) + dead branches/stale docs; round 2 dispatched
+- Task 5.4: brief written (task-5.4-brief.md), not dispatched yet
+- Task 5.3: complete (commits 7a8bc9e..e7b118c; Important addressed in f384d38, minors closed in e7b118c; round-2 minor diff self-verified, fixer session hit upstream 429)
+- Task 5.4: in progress (fixer session ses_e40ba8c37ffesEpB5XmuULLMV7; brief task-5.4-brief.md)
+- Task 5.4: in progress (fixer session ses_e4079b82cffeH1cDjT1qs24YLz, model deepseek-v4-pro per user switch; brief task-5.4-brief.md)
+- Task 5.4: addendum in progress (user.read/user.manage route gating, pagination, display-name edit + detail; fixer ses_e4079b82cffeH1cDjT1qs24YLz)
+- Task 5.4: complete (commits f0a94dc..8824a7b; review + fix + addendum re-review clean); addendum: user.read/user.manage gating, pagination, detail, display-name edit
+- Task 5.4: minors deferred: duplicateRace nested REQUIRES_NEW holds 3 connections; trailing-slash GET /users/ gates as user.manage but 404s; empty PUT body clears displayName
+- Task 5.5: in progress (fixer ses_e3f03791bffeSyTfTjGY35Qwaj, deepseek-v4-pro; brief task-5.5-brief.md)
+- Task 5.7: brief written (task-5.7-brief.md), not dispatched
+- Task 5.5: complete (commit 4b8d669, review approved, no fix round)
+- Task 5.5: minors deferred: duplicated audit helpers across 3 services; unknown-role DENIED row untested; matrix datasource-order test brittle; DATASOURCE_ID_PATTERN restrictive
+- Task 5.7: in progress (fixer ses_e3ef3f34effecLQvSbLirFB1NQ, deepseek-v4-pro; brief task-5.7-brief.md; includes route-gating verification)
+- Frontend prerequisite found: /api/auth/me returns only legacy role; 6.1/6.2 need effective permissions (and roles) in the profile so nav/route guards are permission-aware
+- Task 5.6: brief written (task-5.6-brief.md), not dispatched (sequential after 5.7 to avoid shared-file conflicts)
+- Task 5.7: complete (commit da9c9d5, review approved, no fix round)
+- Task 5.7: minors deferred: lockout allows changes when before=false (recovery semantics); empty effective set bypass (disabled role/parent latent privilege); dead lockoutGate roleId param; shared-H2 admin-disable test order fragility
+- Task 5.6: complete (commit 0d8be55, review approved, no fix round); all 5.x backend admin APIs done
+- Task 5.6: minors deferred: non-numeric page/size app-wide error shape; trailing-slash /audit/ falls to access.manage (fail-closed); total/items not atomic; blank filters mean any
+- Task 6.1: in progress (fixer ses_e3ebc9369ffebVHJrXK95WE6Jb, deepseek-v4-pro; brief task-6.1-brief.md; backend /api/auth/me permissions + typed API client)
+- Tasks 6.2-6.8: next designer lane (access-control shell + 6 tabs + permission-aware nav); brief not written yet
+- Task 6.1: complete (commit 2115003; backend 363 + frontend build + 8 tests green; review in progress)
+- Docs/deploy: 7.1-7.3 drafted and committed (4009b2e): nl2sql RBAC, deploy migration/backup/rollback, README admin page; 04-access-control.sql mounted + bootstrap executes
+- Tasks 6.2-6.7: designer lane in progress (ses_e3eb179a5ffeULah5EAkSTHp5d, deepseek-v4-pro)
+- 8.3 MySQL migration: blocked (no local Docker); must verify on deploy
+- 8.4 Agent E2E: no full AgentScope stub test exists; likely manual/blocked without DASHSCOPE_API_KEY
+- Task 6.1: review approved (minor: profile double-fetch, effectiveRoleCodes javadoc, stale localStorage permissions, unencoded path ids)
+- Tasks 6.2-6.7: implemented/committed (84b0ffb schema endpoint, ba674cb UI, 2a43be1 dialog split); backend 366 + frontend build/8 tests green
+- Tasks 6.2-6.7: review Needs fixes -> fix lane dispatched (ses_e3cffbf5fffe8bbuddR07nA2hw, kimi-k3.1-pro); Important: enabled-filter clear bug, permissions select-all locked keys
+- Task 6.8: brief ready; waits for UI fixes
+- Tasks 6.2-6.7: complete (commits 84b0ffb, ba674cb, 2a43be1, 81f238d, e88f49d; review Needs fixes then fixed; build + 8 tests + backend 366 green; fix diff self-verified)
+- Task 6.8: in progress (designer ses_e3cf7cf5affe4AujH5mYj9JJ7o, kimi-k3.1-pro)
+- Task 8.5: PASS (DataScopeRewriterTest + DataScopePolicyEngineTest, 58 tests)
+- Task 8.6: scope check PASS: no pom/package dependency changes, no sandbox/approval/container files in bd8de40..HEAD
+- Task 8.7: covered by AccessControlUserTest (disable/enable/reset token_version + secret-free audit), to re-confirm in final run
+- Task 6.8: UI complete (df265f2; 14 frontend tests + build green); route guards/nav/datasource-write/chat visibility done
+- Gap found: backend routes for chat.use/datasource.read/model.manage were only authenticated; server-side gating fix in progress (ses_e3ceadf73ffeh25kE5XMzw4GmB)
+- Task 6.8: review APPROVED (qwen3.8-max); minors: chat-only role needs datasource.read, history load for non-chat users, store comment, unreachable read-only chat mode, profile refresh per navigation
+- Post-review fix: chat history loads only with chat.use + accurate refreshProfile comment (3ad8e23)
+- Tasks marked complete: 1.2-1.4, 7.1-7.3, 8.5, 8.6 (dc657bf); 36/41 checked
+- Whole-branch review dispatched (ses_e3b314267ffe1w6mcs1GZcIg1E, qwen3.8-max) at head dc657bf
+- Task 8.7: PASS via AccessControlUserTest (create→login→disable 401→re-enable old token still 401→reset old password fails/new works→audit secret-free); added the re-enable assertion (51a12af)
+- Task 8.4: pipeline half being proven by CustomRolePipelineScopeTest (fixer ses_e3b2ff32fffeq2l7qnpeGiLGOM); AgentScope/model half blocked (no DASHSCOPE_API_KEY locally; server has one)
+- Deploy: server 47.108.66.221 reachable (repo /root/text2sql-demo at bd8de40, stack up 3 days); local master 48 commits ahead, push dry-run OK; deploy pending review verdict
+- Whole-branch review: backend lane blocked by provider quota after 3 attempts; self-reviewed SQL/seed/migration parity (7 tables column-identical, indexes migration-only, 3 roles/9 permissions/10 scopes/datasource grants identical, backfill skips unknown roles)
+- Whole-branch review frontend+deploy lane (grok-4.7): verdict ready with fixes; contract 20/20 endpoints matched; I-1 data-scope tab needed datasource.read (fixed: uses matrix), I-2 bootstrap raced MySQL (fixed earlier), M-1 type pairing (fixed to mirror backend), M-3 README meta.admin + schema row (fixed), M-4 bootstrap stale accounts (fixed)
+- Task 8.1/8.2: PASS (backend 372 tests BUILD SUCCESS; frontend 14 tests + build)
+- Deploy started: push 068fdf6..e6f0dce, server /root/text2sql-demo fast-forward, bootstrap.sh running (backup /root/backup-pre-access-20261110-1757.sql; pre-change app_user had no enabled/token_version, 0 access_* tables)
+- Deployed: e6f0dce -> f00db5b -> 66d1362 on 47.108.66.221; bootstrap built images, ran migrations, all containers up, backend health 200
+- Live verification 8.3: real MySQL migration applied to the existing volume; 5 seed users / 3 roles / 9 permissions / 5 user_roles / 2 role_datasources / 10 scopes; student01 sees only own rows (student_no IN (2023001), student_id IN (1)), counselor01 sees class_id IN (1,2) (16 rows), admin unrestricted; CTE attempt rewritten inside the CTE body; unauthorized routes all 403
+- Live verification 8.4: custom role via admin API (chat.use + datasource.read + campus + FILTER scopes) -> pipeline SQL student_id IN (3) -> exactly 4 own rows, explanation states the data scope; unconfigured table fails closed ("表 student 不在当前数据范围内"); AgentScope /agent/stream returns scoped SQL (student_no IN (2023001) AND student_id IN (1)), no other students leak; revoking the role -> 403 before any SQL
+- Live verification 8.7: create -> login -> disable (401) -> re-enable (old token still 401) -> reset password (204, old password 401, pre-reset token 401, new password 200); 13 audit rows across 8 action types, all SUCCESS, no password/hash material
+- Deploy defects found and fixed: (1) migration had no SET NAMES utf8mb4 so Chinese seed text was double-encoded on upgrade - added SET NAMES + idempotent repair keyed on HEX(name) LIKE C3%; (2) bootstrap executed the container copy of the migration, and a file bind mount keeps its old inode after git pull - now reads migrations from the host; (3) the role/grant backfill re-ran on every deploy and resurrected removed roles/revoked grants - now runs only when the target table is empty
+- 41/41 tasks complete; E2E fixtures cleaned up (5 seed users, 3 roles, 9 permissions, 10 scopes remain); knowledge gate re-verified (admin 200, student 403)
+- Open technical debt (unchanged): profile refresh per navigation (~5 queries, no TTL); permissions tab loses unsaved edits on role switch; audit/user filters are placeholder-labelled; no browser E2E

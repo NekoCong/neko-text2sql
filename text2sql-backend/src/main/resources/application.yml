@@ -3,7 +3,7 @@ server:
 
 spring:
   application:
-    name: text2sql-backend
+    name: neko-text2sql-backend
   # --- Application database (users, model configs, conversations, messages) ---
   # Reactive via Spring Data R2DBC (MySQL by default; tests use H2 via the `test` profile).
   r2dbc:
@@ -31,7 +31,7 @@ text2sql:
   # would silently keep signing tokens with the built-in demo key below, which is public in this
   # repository and therefore lets anyone mint an admin token.
   security:
-    jwt-secret: "${TEXT2SQL_JWT_SECRET:text2sql-demo-jwt-secret-change-me-please-32bytes+}"
+    jwt-secret: "${TEXT2SQL_JWT_SECRET:neko-text2sql-dev-jwt-secret-change-me-please-32b+}"
 
   # --- JDBC datasources (multi-datasource, config-switchable) ---
   # Each entry becomes a cached Hikari pool; the agent queries a datasource by `id`.

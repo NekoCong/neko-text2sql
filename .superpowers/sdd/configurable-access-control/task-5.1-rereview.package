@@ -1,0 +1,1833 @@
+﻿## Commits
+f8d8033 fix(access): make role mutations transactional and close review gaps
+
+## Stat
+ .../text2sql/access/AccessAdminService.java        | 515 ++++++++++++++-------
+ .../access/R2dbcAccessAdminRepository.java         |   1 -
+ .../access/api/AccessControlController.java        |  45 +-
+ .../text2sql/access/api/dto/AccessRoleRequest.java |  14 +-
+ .../access/AccessAdminServiceTransactionTest.java  | 175 +++++++
+ .../text2sql/web/AccessControlRoleTest.java        | 349 ++++++++++----
+ 6 files changed, 818 insertions(+), 281 deletions(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+index 567acb8..30d8fbf 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+@@ -1,96 +1,123 @@
+ package com.nekocong.text2sql.access;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import com.nekocong.text2sql.security.Roles;
+-import java.util.HashMap;
+ import java.util.HashSet;
+ import java.util.List;
+-import java.util.Map;
+ import java.util.Set;
+ import java.util.regex.Pattern;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.stereotype.Service;
++import org.springframework.transaction.ReactiveTransactionManager;
++import org.springframework.transaction.TransactionDefinition;
++import org.springframework.transaction.reactive.TransactionalOperator;
++import org.springframework.transaction.support.DefaultTransactionDefinition;
+ import org.springframework.web.server.ResponseStatusException;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Administrative role catalog: list, create and update (including enable/disable), with
+  * single-parent inheritance validated in the application.
+  *
+  * <p>Rules enforced here:
+  *
+  * <ul>
+  *   <li>{@code code} is required on create, matches {@value #CODE_PATTERN_DESCRIPTION}, and is
+  *       immutable and unique afterwards.
+- *   <li>{@code name} is required, at most {@value #MAX_NAME_LENGTH} characters.
++ *   <li>{@code name} is required, at most {@value #MAX_NAME_LENGTH} characters; {@code description}
++ *       is at most {@value #MAX_DESCRIPTION_LENGTH} characters (the column width).
+  *   <li>{@code parentId} must reference an existing role and must not create a cycle. A disabled
+  *       parent is allowed: it contributes nothing at resolution time.
++ *   <li>The built-in administrator role may not be used as a parent until inheritance subset checks
++ *       exist: a role holding {@code access.manage} would otherwise inherit
++ *       {@code access.bypass_data_scope} from it.
+  *   <li>Built-in roles keep their {@code code}; the built-in administrator role cannot be disabled.
+  *       Other built-in roles may be renamed or disabled.
+  * </ul>
+  *
+- * <p>Every mutation appends exactly one {@code access_audit} row, and every rejected mutation appends
+- * a {@code DENIED} row carrying the reason. The application database has no transaction manager, so
+- * the mutation and its audit row are two statements: the audit row is issued after the mutation and
+- * a failed audit insert is logged rather than failing the request (the mutation may stand without
+- * its audit row; the reverse cannot occur).
++ * <p>Each mutation runs in one reactive transaction (the R2DBC {@code TransactionalOperator}): the
++ * role write and its {@code access_audit} row commit together or not at all, so a failed audit insert
++ * also rolls the mutation back. A rejected mutation writes exactly one {@code DENIED} row in its own
++ * transaction before the rejection is returned.
++ *
++ * <p>Request validation that runs before a role or parent can be identified (a malformed code, a
++ * missing name, an oversized description, a malformed path id) writes no audit row: there is no
++ * entity to reference. Every rejection that names an existing entity, or a parent id supplied by the
++ * client, is audited.
+  */
+ @Service
+ public class AccessAdminService {
+ 
+     private static final Logger log = LoggerFactory.getLogger(AccessAdminService.class);
+ 
+     /** A role code: a lowercase letter, then lowercase letters/digits/underscore/dash (2-64 chars). */
+     static final String CODE_PATTERN_DESCRIPTION = "^[a-z][a-z0-9_-]{1,63}$";
+ 
+     private static final Pattern CODE_PATTERN = Pattern.compile(CODE_PATTERN_DESCRIPTION);
+ 
+     /** The alphabet role ids are generated from (UUIDs and the deterministic seed ids). */
+     private static final Pattern ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+ 
+     private static final int MAX_NAME_LENGTH = 100;
+ 
++    /** Matches {@code access_role.description VARCHAR(512)}. */
++    private static final int MAX_DESCRIPTION_LENGTH = 512;
++
++    /** Matches {@code access_audit.reason VARCHAR(512)}. */
+     private static final int MAX_REASON_LENGTH = 512;
+ 
+     private static final String ENTITY_TYPE = "ROLE";
+ 
+     private static final String ACTION_CREATE = "role.create";
+     private static final String ACTION_UPDATE = "role.update";
+     private static final String ACTION_DISABLE = "role.disable";
+ 
+     private static final String RESULT_SUCCESS = "SUCCESS";
+     private static final String RESULT_DENIED = "DENIED";
+ 
+     private static final String REASON_DUPLICATE_CODE = "角色编码已存在";
+     private static final String REASON_IMMUTABLE_CODE = "角色编码不可修改";
+     private static final String REASON_BUILT_IN_ADMIN = "内置管理员角色不能停用";
++    private static final String REASON_BUILT_IN_ADMIN_PARENT = "内置管理员角色不能作为父角色";
+     private static final String REASON_CYCLE = "会形成循环继承";
+     private static final String REASON_PARENT_MISSING = "父角色不存在";
+     private static final String REASON_ROLE_MISSING = "角色不存在";
+ 
+     private final AccessAdminRepository repository;
++    private final TransactionalOperator transactions;
++    private final TransactionalOperator newTransactions;
+     private final ObjectMapper objectMapper;
+ 
+     /**
+      * Creates the service.
+      *
+      * @param repository the admin repository
++     * @param transactionManager the R2DBC reactive transaction manager
+      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
+      */
+-    public AccessAdminService(AccessAdminRepository repository, ObjectMapper objectMapper) {
++    public AccessAdminService(
++            AccessAdminRepository repository,
++            ReactiveTransactionManager transactionManager,
++            ObjectMapper objectMapper) {
+         this.repository = repository;
++        this.transactions = TransactionalOperator.create(transactionManager);
++        this.newTransactions =
++                TransactionalOperator.create(
++                        transactionManager,
++                        new DefaultTransactionDefinition(
++                                TransactionDefinition.PROPAGATION_REQUIRES_NEW));
+         this.objectMapper = objectMapper;
+     }
+ 
+     /**
+      * Lists every role, ordered by code.
+      *
+      * @return the role views
+      */
+     public Mono<List<AccessRoleView>> list() {
+         return repository.roles().map(roles -> roles.stream().map(AccessRoleView::of).toList());
+@@ -98,158 +125,212 @@ public class AccessAdminService {
+ 
+     /**
+      * Creates a role.
+      *
+      * @param actorId the acting user id
+      * @param request the request (required)
+      * @return the created role
+      */
+     public Mono<AccessRoleView> create(String actorId, AccessRoleRequest request) {
+         return Mono.defer(
+-                () -> {
+-                    AccessRoleRequest body =
+-                            request == null
+-                                    ? new AccessRoleRequest(null, null, null, null, null)
+-                                    : request;
+-                    String code = validateCode(body.code());
+-                    String name = validateName(body.name());
+-                    String description = normalizeDescription(body.description());
+-                    String parentId = blankToNull(body.parentId());
+-                    boolean enabled = body.enabled() == null || body.enabled();
+-                    return repository
+-                            .roleByCode(code)
+-                            .flatMap(
+-                                    existing ->
+-                                            deny(
+-                                                    actorId,
+-                                                    ACTION_CREATE,
+-                                                    existing.id(),
+-                                                    null,
+-                                                    Map.of("code", code),
+-                                                    REASON_DUPLICATE_CODE))
+-                            .switchIfEmpty(
+-                                    Mono.defer(
+-                                            () ->
+-                                                    requireParentExists(parentId)
+-                                                            .then(
+-                                                                    repository.insertRole(
+-                                                                            code,
+-                                                                            name,
+-                                                                            description,
+-                                                                            parentId,
+-                                                                            enabled))
+-                                                            .flatMap(
+-                                                                    role ->
+-                                                                            audit(
+-                                                                                    actorId,
+-                                                                                    ACTION_CREATE,
+-                                                                                    role.id(),
+-                                                                                    null,
+-                                                                                    roleMap(role)))));
+-                });
++                        () -> {
++                            AccessRoleRequest body = request == null ? empty() : request;
++                            String code = validateCode(body.code());
++                            String name = validateName(body.name());
++                            String description = normalizeDescription(body.description());
++                            // A new role has no stored parent, so null and "" both mean "none".
++                            String parentId = blankToNull(body.parentId());
++                            boolean enabled = body.enabled() == null || body.enabled();
++                            AccessRole requested =
++                                    roleView(
++                                            null,
++                                            code,
++                                            name,
++                                            description,
++                                            parentId,
++                                            false,
++                                            enabled);
++                            return repository
++                                    .roleByCode(code)
++                                    .flatMap(
++                                            existing ->
++                                                    deny(
++                                                            actorId,
++                                                            ACTION_CREATE,
++                                                            existing.id(),
++                                                            null,
++                                                            requested,
++                                                            REASON_DUPLICATE_CODE))
++                                    .switchIfEmpty(
++                                            Mono.defer(
++                                                    () -> insert(actorId, requested)))
++                                    .map(AccessRoleView::of);
++                        })
++                .as(transactions::transactional);
++    }
++
++    /** Validates the parent, inserts the role and appends its audit row. */
++    private Mono<AccessRole> insert(String actorId, AccessRole requested) {
++        return requireUsableParent(requested.parentId())
++                .onErrorResume(
++                        Denial.class,
++                        denial ->
++                                deny(
++                                                actorId,
++                                                ACTION_CREATE,
++                                                requested.parentId(),
++                                                null,
++                                                requested,
++                                                denial.getMessage())
++                                        .then())
++                .then(
++                        Mono.defer(
++                                () ->
++                                        repository.insertRole(
++                                                requested.code(),
++                                                requested.name(),
++                                                requested.description(),
++                                                requested.parentId(),
++                                                requested.enabled())))
++                .flatMap(role -> audit(actorId, ACTION_CREATE, null, role));
+     }
+ 
+     /**
+      * Updates a role's mutable fields: name, description, parent and enabled.
+      *
+-     * <p>The code may be omitted or repeated verbatim but never changed. {@code null} name,
+-     * description or enabled keeps the current value; {@code parentId} is taken literally, so
+-     * {@code null} clears the parent. Turning an enabled role off is audited as
+-     * {@code role.disable}.
++     * <p>The code may be omitted or repeated verbatim but never changed. {@code null} (or omitted)
++     * name, description, parent or enabled keeps the current value; an empty-string {@code parentId}
++     * clears the parent. Turning an enabled role off is audited as {@code role.disable}.
+      *
+      * @param actorId the acting user id
+      * @param roleId the role id
+      * @param request the request (an empty body keeps every field unchanged)
+      * @return the updated role
+      */
+     public Mono<AccessRoleView> update(String actorId, String roleId, AccessRoleRequest request) {
+         return Mono.defer(
+-                () -> {
+-                    requireIdentifier(roleId);
+-                    AccessRoleRequest body =
+-                            request == null
+-                                    ? new AccessRoleRequest(null, null, null, null, null)
+-                                    : request;
+-                    return repository
+-                            .role(roleId)
+-                            .switchIfEmpty(Mono.error(notFound(REASON_ROLE_MISSING)))
+-                            .flatMap(before -> denyIfBad(actorId, before, body));
+-                });
++                        () -> {
++                            requireIdentifier(roleId);
++                            AccessRoleRequest body = request == null ? empty() : request;
++                            return repository
++                                    .role(roleId)
++                                    .switchIfEmpty(
++                                            Mono.defer(
++                                                    () ->
++                                                            deny(
++                                                                    actorId,
++                                                                    ACTION_UPDATE,
++                                                                    roleId,
++                                                                    null,
++                                                                    roleView(
++                                                                            roleId,
++                                                                            body.code(),
++                                                                            body.name(),
++                                                                            body.description(),
++                                                                            body.parentId(),
++                                                                            false,
++                                                                            body.enabled()),
++                                                                    REASON_ROLE_MISSING)))
++                                    .flatMap(before -> update(actorId, before, body))
++                                    .map(AccessRoleView::of);
++                        })
++                .as(transactions::transactional);
+     }
+ 
+     /**
+-     * Applies an update request to a loaded role. The denial checks (immutable code, built-in admin)
+-     * run first because they are audited; the validation and cycle check happen in
+-     * {@link #applyUpdate}.
++     * Applies an update request to a loaded role. The denial checks run first (they are audited); the
++     * validation and cycle check happen in {@link #applyUpdate}.
+      */
+-    private Mono<AccessRoleView> denyIfBad(
+-            String actorId, AccessRole before, AccessRoleRequest body) {
++    private Mono<AccessRole> update(String actorId, AccessRole before, AccessRoleRequest body) {
+         if (body.code() != null
+                 && !body.code().isBlank()
+                 && !before.code().equals(body.code().trim())) {
+             return deny(
+                     actorId,
+                     ACTION_UPDATE,
+                     before.id(),
+-                    roleMap(before),
+-                    Map.of("code", body.code()),
++                    before,
++                    roleView(
++                            before.id(),
++                            body.code(),
++                            body.name(),
++                            body.description(),
++                            body.parentId(),
++                            before.builtIn(),
++                            body.enabled()),
+                     REASON_IMMUTABLE_CODE);
+         }
+         boolean enabled = body.enabled() == null ? before.enabled() : body.enabled();
+         if (before.builtIn() && Roles.ADMIN.equals(before.code()) && !enabled) {
+             return deny(
+                     actorId,
+                     ACTION_DISABLE,
+                     before.id(),
+-                    roleMap(before),
+-                    Map.of("enabled", false),
++                    before,
++                    roleView(
++                            before.id(),
++                            before.code(),
++                            before.name(),
++                            before.description(),
++                            before.parentId(),
++                            true,
++                            false),
+                     REASON_BUILT_IN_ADMIN);
+         }
+         return applyUpdate(actorId, before, body);
+     }
+ 
+-    private Mono<AccessRoleView> applyUpdate(
++    private Mono<AccessRole> applyUpdate(
+             String actorId, AccessRole before, AccessRoleRequest body) {
+         String name = body.name() == null ? before.name() : validateName(body.name());
+         String description =
+                 body.description() == null
+                         ? before.description()
+                         : normalizeDescription(body.description());
+-        String parentId = body.parentId() == null ? null : blankToNull(body.parentId());
++        // null keeps the current parent; "" (or blank) clears it.
++        String parentId = body.parentId() == null ? before.parentId() : blankToNull(body.parentId());
+         boolean enabled = body.enabled() == null ? before.enabled() : body.enabled();
+         String action = actionFor(before, enabled);
+-        // The state this request would produce; only used for the DENIED audit row.
+-        Map<String, Object> requested = new HashMap<>(roleMap(before));
+-        requested.put("name", name);
+-        requested.put("description", description);
+-        requested.put("parentId", parentId);
+-        requested.put("enabled", enabled);
+-        return validateParent(before, parentId)
++        AccessRole requested =
++                roleView(
++                        before.id(),
++                        before.code(),
++                        name,
++                        description,
++                        parentId,
++                        before.builtIn(),
++                        enabled);
++        // Re-sending the current parent is a no-op; only a different one needs validating.
++        Mono<Void> parentCheck =
++                parentId == null || parentId.equals(before.parentId())
++                        ? Mono.empty()
++                        : validateParent(before, parentId);
++        return parentCheck
+                 .onErrorResume(
+-                        CycleDenied.class,
++                        Denial.class,
+                         denial ->
+                                 deny(
+                                                 actorId,
+                                                 action,
+                                                 before.id(),
+-                                                roleMap(before),
++                                                before,
+                                                 requested,
+                                                 denial.getMessage())
+                                         .then())
+                 .then(
+                         Mono.defer(
+                                 () ->
+                                         repository.updateRole(
+                                                 before.id(), name, description, parentId, enabled)))
+                 .then(repository.role(before.id()))
+-                .flatMap(
+-                        after -> audit(actorId, action, after.id(), roleMap(before), roleMap(after)));
++                .switchIfEmpty(Mono.error(new IllegalStateException("角色更新后丢失：" + before.id())))
++                .flatMap(after -> audit(actorId, action, before, after));
+     }
+ 
+     // --- validation -------------------------------------------------------------------------
+ 
+     private static String validateCode(String code) {
+         String value = code == null ? null : code.trim();
+         if (value == null || value.isEmpty()) {
+             throw badRequest("角色编码不能为空");
+         }
+         if (!CODE_PATTERN.matcher(value).matches()) {
+@@ -267,220 +348,300 @@ public class AccessAdminService {
+             throw badRequest("角色名称不能超过 " + MAX_NAME_LENGTH + " 个字符");
+         }
+         return value;
+     }
+ 
+     private static String normalizeDescription(String description) {
+         if (description == null) {
+             return null;
+         }
+         String value = description.trim();
+-        return value.isEmpty() ? null : value;
++        if (value.isEmpty()) {
++            return null;
++        }
++        if (value.length() > MAX_DESCRIPTION_LENGTH) {
++            throw badRequest("角色描述不能超过 " + MAX_DESCRIPTION_LENGTH + " 个字符");
++        }
++        return value;
+     }
+ 
+     /**
+      * Rejects a path id outside the identifier alphabet ids are generated from (letters, digits,
+      * {@code -} and {@code _}). Ids are never interpolated into SQL; this only rejects obviously
+      * malformed input early.
+      */
+     private static void requireIdentifier(String roleId) {
+         if (roleId == null || roleId.isBlank() || !ID_PATTERN.matcher(roleId).matches()) {
+             throw badRequest("角色标识无效");
+         }
+     }
+ 
+-    /** On create, a parent only has to exist; a new role cannot close a cycle. */
+-    private Mono<Void> requireParentExists(String parentId) {
++    /**
++     * On create, a parent only has to exist and be a permitted parent; a new role cannot close a
++     * cycle.
++     *
++     * @param parentId the requested parent, or {@code null}
++     */
++    private Mono<Void> requireUsableParent(String parentId) {
+         if (parentId == null) {
+             return Mono.empty();
+         }
+         return repository
+                 .role(parentId)
+-                .switchIfEmpty(Mono.error(notFound(REASON_PARENT_MISSING)))
+-                .then();
++                .switchIfEmpty(Mono.error(new Denial(REASON_PARENT_MISSING, HttpStatus.NOT_FOUND)))
++                .flatMap(AccessAdminService::permitParent);
+     }
+ 
+     /**
+-     * On update, the parent must exist and linking the role under it must keep the single-parent
+-     * graph acyclic.
++     * On update, the parent must exist, be a permitted parent, and linking the role under it must
++     * keep the single-parent graph acyclic.
+      *
+      * <p>Walks up from the prospective parent, one lookup at a time, following the stored parent
+      * chain. Reaching the role itself means the new link would close a cycle: its own id, any
+      * descendant, or an ancestor that already leads back. A disabled parent is fine (it contributes
+      * nothing at resolution time); a dangling or looping existing chain is refused rather than
+      * extended, so the stored configuration stays acyclic.
+      */
+     private Mono<Void> validateParent(AccessRole role, String parentId) {
+         if (parentId == null) {
+             return Mono.empty();
+         }
+         if (parentId.equals(role.id())) {
+-            return Mono.error(new CycleDenied());
++            return Mono.error(new Denial(REASON_CYCLE, HttpStatus.CONFLICT));
+         }
+-        return climbToRoot(role.id(), role, parentId, parentId, new HashSet<>());
++        return repository
++                .role(parentId)
++                .switchIfEmpty(Mono.error(new Denial(REASON_PARENT_MISSING, HttpStatus.NOT_FOUND)))
++                .flatMap(AccessAdminService::permitParent)
++                .then(climbToRoot(role, parentId, parentId, new HashSet<>()));
++    }
++
++    /**
++     * Rejects the built-in administrator role as a parent. Inheriting it would hand
++     * {@code access.bypass_data_scope} to any role its holder can attach, so a caller with {@code
++     * access.manage} could grant themselves an uncontrolled scope; subset checks arrive in a later
++     * task.
++     *
++     * @param parent the prospective parent
++     * @return completion, or a denial
++     */
++    private static Mono<Void> permitParent(AccessRole parent) {
++        if (parent.builtIn() && Roles.ADMIN.equals(parent.code())) {
++            return Mono.error(new Denial(REASON_BUILT_IN_ADMIN_PARENT, HttpStatus.CONFLICT));
++        }
++        return Mono.empty();
+     }
+ 
+     /**
+      * Walks the parent chain starting at {@code current}, failing on the role or on a visited node.
++     * The prospective parent itself was already checked for existence and permission, so its row is
++     * re-read here only to continue upward; a missing ancestor is treated as a broken chain.
+      *
+-     * @param roleId the role being moved
+-     * @param role the role's current state (its old parent edge is replaced, so it is not followed)
+-     * @param start the prospective parent id, used in the not-found message
++     * @param role the role being moved (its old parent edge is replaced, so it is not followed)
++     * @param start the prospective parent id
+      * @param current the node whose parent to follow
+      * @param visited the ids already visited on this walk
+      */
+     private Mono<Void> climbToRoot(
+-            String roleId, AccessRole role, String start, String current, Set<String> visited) {
++            AccessRole role, String start, String current, Set<String> visited) {
+         if (current == null) {
+             return Mono.empty();
+         }
+-        if (current.equals(roleId)) {
+-            return Mono.error(new CycleDenied());
++        if (current.equals(role.id())) {
++            return Mono.error(new Denial(REASON_CYCLE, HttpStatus.CONFLICT));
+         }
+         if (!visited.add(current)) {
+-            return Mono.error(new CycleDenied());
+-        }
+-        if (current.equals(start)) {
+-            // The prospective parent must exist even though its chain was not entered yet.
+-            return repository
+-                    .role(current)
+-                    .switchIfEmpty(Mono.error(notFound(REASON_PARENT_MISSING)))
+-                    .flatMap(found -> climbToRoot(roleId, role, start, found.parentId(), visited));
++            return Mono.error(new Denial(REASON_CYCLE, HttpStatus.CONFLICT));
+         }
+         if (current.equals(role.parentId())) {
+             // The role is moving here: its previous parent edge is deleted by this update.
+             return Mono.empty();
+         }
+         return repository
+                 .role(current)
+-                .switchIfEmpty(Mono.error(notFound(REASON_PARENT_MISSING)))
+-                .flatMap(found -> climbToRoot(roleId, role, start, found.parentId(), visited));
++                .switchIfEmpty(
++                        Mono.error(new Denial(REASON_PARENT_MISSING, HttpStatus.NOT_FOUND)))
++                .flatMap(found -> climbToRoot(role, start, found.parentId(), visited));
+     }
+ 
+-    /** A rejected parent link that would close an inheritance cycle (audited as DENIED). */
+-    private static final class CycleDenied extends RuntimeException {
++    /**
++     * A rejected request carrying the reason and the HTTP status to answer with. Carried through the
++     * reactive chain so the enclosing transaction can write its {@code DENIED} audit row; the
++     * controller maps it onto a response.
++     */
++    private static final class Denial extends RuntimeException {
+ 
+-        private CycleDenied() {
+-            super(REASON_CYCLE, null, false, false);
++        private final transient HttpStatus status;
++
++        private Denial(String reason, HttpStatus status) {
++            super(reason, null, false, false);
++            this.status = status;
++        }
++
++        private ResponseStatusException toException() {
++            return new ResponseStatusException(status, getMessage());
+         }
+     }
+ 
++    /**
++     * Maps a call that failed with an audited rejection onto the response status it carries.
++     *
++     * @param error the failure raised by {@link #create} or {@link #update}
++     * @return the equivalent status exception, or {@code null} when the failure is not a rejection
++     */
++    public static ResponseStatusException toResponseStatusException(Throwable error) {
++        return error instanceof Denial denial ? denial.toException() : null;
++    }
++
+     // --- audit ------------------------------------------------------------------------------
+ 
+-    /** Appends the SUCCESS row for a completed mutation and returns the resulting state. */
+-    private Mono<AccessRoleView> audit(
+-            String actorId,
+-            String action,
+-            String entityId,
+-            Map<String, Object> before,
+-            Map<String, Object> after) {
++    /**
++     * Appends the SUCCESS row for a completed mutation.
++     *
++     * <p>An audit-insert failure is <em>not</em> swallowed: it propagates so the enclosing
++     * transaction rolls the mutation back. Callers only see a failed request, never a silently
++     * unaudited change.
++     */
++    private Mono<AccessRole> audit(
++            String actorId, String action, AccessRole before, AccessRole after) {
+         return repository
+                 .record(
+                         actorId,
+                         action,
+                         ENTITY_TYPE,
+-                        entityId,
++                        after.id(),
+                         json(before),
+                         json(after),
+                         RESULT_SUCCESS,
+                         null)
+-                .onErrorResume(error -> auditFailure(action, entityId, error))
+-                .thenReturn(new AccessRoleView(
+-                        String.valueOf(after.get("id")),
+-                        String.valueOf(after.get("code")),
+-                        String.valueOf(after.get("name")),
+-                        (String) after.get("description"),
+-                        (String) after.get("parentId"),
+-                        Boolean.TRUE.equals(after.get("builtIn")),
+-                        Boolean.TRUE.equals(after.get("enabled"))));
++                .thenReturn(after);
+     }
+ 
+-    /** Appends a DENIED row for a rejected mutation, then fails with the matching HTTP status. */
+-    private Mono<AccessRoleView> deny(
++    /**
++     * Appends a DENIED row for a rejected mutation, then fails with the matching HTTP status.
++     *
++     * <p>Runs in its own nested transaction so the row survives the outer mutation transaction
++     * rolling back with the rejection.
++     */
++    private Mono<AccessRole> deny(
+             String actorId,
+             String action,
+             String entityId,
+-            Map<String, Object> before,
+-            Map<String, Object> requested,
++            AccessRole before,
++            AccessRole requested,
+             String reason) {
+-        return repository
+-                .record(
+-                        actorId,
+-                        action,
+-                        ENTITY_TYPE,
+-                        entityId,
+-                        json(before),
+-                        json(requested),
+-                        RESULT_DENIED,
+-                        truncate(reason))
+-                .onErrorResume(error -> auditFailure(action, entityId, error))
+-                .then(Mono.error(conflict(reason)));
++        Denial denial = new Denial(reason, statusFor(reason));
++        Mono<Void> record =
++                repository
++                        .record(
++                                actorId,
++                                action,
++                                ENTITY_TYPE,
++                                entityId,
++                                json(before),
++                                json(requested),
++                                RESULT_DENIED,
++                                truncate(reason))
++                        .onErrorResume(
++                                error -> {
++                                    log.error(
++                                            "Failed to append the DENIED audit row {}",
++                                            action,
++                                            error);
++                                    return Mono.empty();
++                                });
++        // The audit row is part of the rejection: it commits, then the request fails. If the row
++        // cannot be written the request still fails, so a rejection is never silently unrecorded.
++        return record.as(newTransactions::transactional).then(Mono.error(denial));
+     }
+ 
+-    private static Mono<Void> auditFailure(String action, String entityId, Throwable error) {
+-        log.error(
+-                "Failed to append the access audit row {} for role {}; the mutation is not rolled"
+-                        + " back",
+-                action,
+-                entityId,
+-                error);
+-        return Mono.empty();
++    private static HttpStatus statusFor(String reason) {
++        return REASON_PARENT_MISSING.equals(reason) || REASON_ROLE_MISSING.equals(reason)
++                ? HttpStatus.NOT_FOUND
++                : HttpStatus.CONFLICT;
+     }
+ 
+     private static String actionFor(AccessRole before, boolean enabled) {
+         return before.enabled() && !enabled ? ACTION_DISABLE : ACTION_UPDATE;
+     }
+ 
+-    private String json(Map<String, Object> value) {
+-        if (value == null) {
++    private String json(AccessRole role) {
++        if (role == null) {
+             return null;
+         }
+         try {
+-            return objectMapper.writeValueAsString(value);
++            return objectMapper.writeValueAsString(new AuditRole(role));
+         } catch (JsonProcessingException ex) {
+-            log.warn("Failed to serialize the access-audit payload", ex);
+-            return null;
++            throw new IllegalStateException("Failed to serialize the access-audit payload", ex);
+         }
+     }
+ 
+     /**
+      * The audited projection of a role: exactly the fields {@link AccessRoleView} exposes, and
+-     * nothing else (never secrets).
++     * nothing else (never secrets). Also used to describe a request that was rejected.
+      */
+-    private static Map<String, Object> roleMap(AccessRole role) {
+-        Map<String, Object> map = new HashMap<>();
+-        map.put("id", role.id());
+-        map.put("code", role.code());
+-        map.put("name", role.name());
+-        map.put("description", role.description());
+-        map.put("parentId", role.parentId());
+-        map.put("builtIn", role.builtIn());
+-        map.put("enabled", role.enabled());
+-        return map;
++    private record AuditRole(
++            String id,
++            String code,
++            String name,
++            String description,
++            String parentId,
++            boolean builtIn,
++            boolean enabled) {
++
++        private AuditRole(AccessRole role) {
++            this(
++                    role.id(),
++                    role.code(),
++                    role.name(),
++                    role.description(),
++                    role.parentId(),
++                    role.builtIn(),
++                    role.enabled());
++        }
++    }
++
++    /** Builds the in-memory role a request asked for, for the DENIED audit row. */
++    private static AccessRole roleView(
++            String id,
++            String code,
++            String name,
++            String description,
++            String parentId,
++            boolean builtIn,
++            Boolean enabled) {
++        return new AccessRole(
++                id,
++                code == null ? null : code.trim(),
++                name == null ? null : name.trim(),
++                description,
++                parentId == null ? null : blankToNull(parentId),
++                builtIn,
++                enabled == null || enabled);
+     }
+ 
+     private static String truncate(String reason) {
+         return reason == null || reason.length() <= MAX_REASON_LENGTH
+                 ? reason
+                 : reason.substring(0, MAX_REASON_LENGTH);
+     }
+ 
+     private static String blankToNull(String value) {
+         if (value == null) {
+             return null;
+         }
+         String trimmed = value.trim();
+         return trimmed.isEmpty() ? null : trimmed;
+     }
+ 
++    private static AccessRoleRequest empty() {
++        return new AccessRoleRequest(null, null, null, null, null);
++    }
++
+     private static ResponseStatusException badRequest(String message) {
+         return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
+     }
+ 
+     private static ResponseStatusException notFound(String message) {
+         return new ResponseStatusException(HttpStatus.NOT_FOUND, message);
+     }
+-
+-    private static ResponseStatusException conflict(String message) {
+-        return new ResponseStatusException(HttpStatus.CONFLICT, message);
+-    }
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+index e44a339..3f050bd 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+@@ -58,21 +58,20 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+             String code, String name, String description, String parentId, boolean enabled) {
+         String id = UUID.randomUUID().toString();
+         long now = System.currentTimeMillis();
+         DatabaseClient.GenericExecuteSpec spec =
+                 client.sql("INSERT INTO access_role"
+                                 + " (id, code, name, description, parent_id, built_in, enabled,"
+                                 + " created_at, updated_at)"
+                                 + " VALUES (:id, :code, :name, :description, :parentId, FALSE, :enabled,"
+                                 + " :createdAt, :updatedAt)")
+                         .bind("id", id)
+-                        .bind("id", id)
+                         .bind("code", code)
+                         .bind("name", name)
+                         .bind("enabled", enabled)
+                         .bind("createdAt", now)
+                         .bind("updatedAt", now);
+         spec = bindNullable(spec, "description", description);
+         spec = bindNullable(spec, "parentId", parentId);
+         return spec.then()
+                 .thenReturn(new AccessRole(id, code, name, description, parentId, false, enabled));
+     }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index 0961eca..a248e2d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -1,39 +1,47 @@
+ package com.nekocong.text2sql.access.api;
+ 
+ import com.nekocong.text2sql.access.AccessAdminService;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import java.util.List;
++import java.util.Map;
+ import java.util.Objects;
+ import org.springframework.http.HttpStatus;
++import org.springframework.http.ResponseEntity;
+ import org.springframework.security.core.Authentication;
+ import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+ import org.springframework.security.oauth2.jwt.Jwt;
++import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.PostMapping;
+ import org.springframework.web.bind.annotation.PutMapping;
+ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.ResponseStatus;
+ import org.springframework.web.bind.annotation.RestController;
+ import org.springframework.web.server.ResponseStatusException;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Admin API for the role catalog: list, create and update roles.
+  *
+  * <p>There is no delete: a role is disabled with {@code PUT {enabled:false}}. Access is enforced by
+  * {@code SecurityConfig} ({@code /api/admin/**} requires the {@code access.manage} permission
+  * resolved from the access-control tables), so an unauthorized caller never reaches these handlers.
+  *
++ * <p>Validation and conflict failures are answered here with {@code {"status": ..., "message": ...}}.
++ * The handler is deliberately local to this controller: the application-wide advice is untouched, so
++ * the error shape of the auth, conversation, model, datasource and knowledge endpoints does not
++ * change.
++ *
+  * <p>The acting user id (the token subject) is passed to the service for the audit trail; without an
+  * authenticated principal the request fails closed with {@code 401}.
+  */
+ @RestController
+ @RequestMapping("/api/admin/access-control/roles")
+ public class AccessControlController {
+ 
+     private final AccessAdminService service;
+ 
+     /**
+@@ -57,34 +65,65 @@ public class AccessControlController {
+ 
+     /**
+      * Creates a role.
+      *
+      * @param request the role
+      * @return the created role
+      */
+     @PostMapping
+     @ResponseStatus(HttpStatus.CREATED)
+     public Mono<AccessRoleView> create(@RequestBody AccessRoleRequest request) {
+-        return actorId().flatMap(actor -> service.create(actor, request));
++        return actorId()
++                .flatMap(actor -> service.create(actor, request))
++                .onErrorMap(AccessControlController::asStatusException);
+     }
+ 
+     /**
+      * Updates a role ({@code code} is immutable).
+      *
++     * <p>An omitted or {@code null} field keeps its current value; {@code "parentId": ""} clears the
++     * parent.
++     *
+      * @param id the role id
+-     * @param request the new values; {@code null} fields keep their current value
++     * @param request the new values
+      * @return the updated role
+      */
+     @PutMapping("/{id}")
+     public Mono<AccessRoleView> update(
+             @PathVariable String id, @RequestBody(required = false) AccessRoleRequest request) {
+-        return actorId().flatMap(actor -> service.update(actor, id, request));
++        return actorId()
++                .flatMap(actor -> service.update(actor, id, request))
++                .onErrorMap(AccessControlController::asStatusException);
++    }
++
++    /** Converts the service's audited rejection into the status exception the handler renders. */
++    private static Throwable asStatusException(Throwable error) {
++        ResponseStatusException mapped = AccessAdminService.toResponseStatusException(error);
++        return mapped == null ? error : mapped;
++    }
++
++    /**
++     * Renders a validation or conflict failure raised by the role API.
++     *
++     * @param exception the failure
++     * @return the mapped response
++     */
++    @ExceptionHandler(ResponseStatusException.class)
++    public ResponseEntity<Map<String, Object>> handleStatus(ResponseStatusException exception) {
++        HttpStatus resolved = HttpStatus.resolve(exception.getStatusCode().value());
++        if (resolved == null) {
++            resolved = HttpStatus.INTERNAL_SERVER_ERROR;
++        }
++        String reason = exception.getReason();
++        String message = reason == null || reason.isBlank() ? resolved.getReasonPhrase() : reason;
++        return ResponseEntity.status(resolved)
++                .body(Map.of("status", resolved.value(), "message", message));
+     }
+ 
+     /**
+      * Reads the acting user id from the authenticated JWT principal.
+      *
+      * @return the user id, or an error when the principal is missing (fail closed)
+      */
+     private static Mono<String> actorId() {
+         return ReactiveSecurityContextHolder.getContext()
+                 .map(context -> context.getAuthentication())
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRoleRequest.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRoleRequest.java
+index 17e3302..93b8b97 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRoleRequest.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRoleRequest.java
+@@ -1,18 +1,20 @@
+ package com.nekocong.text2sql.access.api.dto;
+ 
+ /**
+  * Request body for creating or updating a role.
+  *
+- * <p>On create, {@code code} is required. On update it may be omitted (or sent identical) but never
+- * changed: the code is immutable once assigned. Fields left {@code null} on update keep their
+- * current value, except {@code parentId}: {@code null} clears the parent.
++ * <p>On create, {@code code} is required and {@code parentId} may be omitted or {@code null} for a
++ * root role. On update, {@code code} may be omitted (or sent identical) but never changed, and every
++ * other field follows "omit/{@code null} = keep current value" — with one explicit exception:
++ * {@code parentId} set to the empty string {@code ""} clears the parent. A new role defaults to
++ * {@code enabled=true}.
+  *
+  * @param code the stable role code (required on create; immutable)
+- * @param name the display name
+- * @param description the description
+- * @param parentId the parent role id (optional)
++ * @param name the display name (required on create)
++ * @param description the description (at most 512 characters)
++ * @param parentId the parent role id; on update {@code ""} clears it
+  * @param enabled whether the role participates in effective access (defaults to {@code true} on
+  *     create)
+  */
+ public record AccessRoleRequest(
+         String code, String name, String description, String parentId, Boolean enabled) {}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+new file mode 100644
+index 0000000..2bff537
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+@@ -0,0 +1,175 @@
++package com.nekocong.text2sql.access;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
++import java.util.List;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.transaction.ReactiveTransactionManager;
++import reactor.core.publisher.Mono;
++import reactor.test.StepVerifier;
++
++/**
++ * The mutation and its audit row are one unit: when the audit insert fails, the role write must not
++ * survive. Uses the real R2DBC transaction manager with a spying repository, so the rollback path is
++ * exercised for real rather than mocked away.
++ */
++@SpringBootTest
++class AccessAdminServiceTransactionTest {
++
++    @Autowired
++    private AccessAdminRepository repository;
++
++    @Autowired
++    private ReactiveTransactionManager transactionManager;
++
++    @Autowired
++    private ObjectMapper objectMapper;
++
++    @Autowired
++    private DatabaseClient db;
++
++    private AccessAdminService service;
++
++    private String actorId;
++
++    @BeforeEach
++    void setUp() {
++        service = new AccessAdminService(repository, transactionManager, objectMapper);
++        actorId = "test-actor-" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
++    }
++
++    @Test
++    void aFailedAuditInsertRollsTheCreateBack() {
++        String code = code();
++        AccessAdminRepository failing = failingAudit(repository);
++
++        AccessAdminService failingService =
++                new AccessAdminService(failing, transactionManager, objectMapper);
++
++        assertThatThrownBy(
++                        () ->
++                                failingService
++                                        .create(actorId, new AccessRoleRequest(code, "回滚", null, null, true))
++                                        .block())
++                .hasMessageContaining("audit unavailable");
++
++        assertThat(roleCount(code)).as("no role may be committed without its audit row").isZero();
++    }
++
++    @Test
++    void aFailedAuditInsertRollsTheUpdateBack() {
++        String code = code();
++        String id = service.create(actorId, new AccessRoleRequest(code, "原名", null, null, true)).block().id();
++
++        AccessAdminRepository failing = failingAudit(repository);
++        AccessAdminService failingService =
++                new AccessAdminService(failing, transactionManager, objectMapper);
++
++        assertThatThrownBy(
++                        () ->
++                                failingService
++                                        .update(actorId, id, new AccessRoleRequest(null, "新名", null, null, null))
++                                        .block())
++                .isNotNull();
++
++        assertThat(roleName(id)).as("the rename must be rolled back").isEqualTo("原名");
++    }
++
++    @Test
++    void aSuccessfulCreateCommitsTheRoleAndItsAuditRowTogether() {
++        String code = code();
++
++        service.create(actorId, new AccessRoleRequest(code, "原子", null, null, true))
++                .as(StepVerifier::create)
++                .expectNextCount(1)
++                .verifyComplete();
++
++        assertThat(roleCount(code)).isEqualTo(1);
++        assertThat(auditCount(actorId)).isEqualTo(1);
++    }
++
++    /** Wraps the repository so only {@code record} fails, after any mutation statement has run. */
++    private static AccessAdminRepository failingAudit(AccessAdminRepository delegate) {
++        return new AccessAdminRepository() {
++            @Override
++            public Mono<List<AccessRole>> roles() {
++                return delegate.roles();
++            }
++
++            @Override
++            public Mono<AccessRole> role(String id) {
++                return delegate.role(id);
++            }
++
++            @Override
++            public Mono<AccessRole> roleByCode(String code) {
++                return delegate.roleByCode(code);
++            }
++
++            @Override
++            public Mono<AccessRole> insertRole(
++                    String code, String name, String description, String parentId, boolean enabled) {
++                return delegate.insertRole(code, name, description, parentId, enabled);
++            }
++
++            @Override
++            public Mono<Void> updateRole(
++                    String id, String name, String description, String parentId, boolean enabled) {
++                return delegate.updateRole(id, name, description, parentId, enabled);
++            }
++
++            @Override
++            public Mono<Void> record(
++                    String actorId,
++                    String action,
++                    String entityType,
++                    String entityId,
++                    String beforeJson,
++                    String afterJson,
++                    String result,
++                    String reason) {
++                return Mono.error(new IllegalStateException("audit unavailable"));
++            }
++        };
++    }
++
++    private long roleCount(String code) {
++        Long count =
++                db.sql("SELECT COUNT(*) AS n FROM access_role WHERE code = :code")
++                        .bind("code", code)
++                        .map((row, meta) -> row.get("n", Long.class))
++                        .one()
++                        .block();
++        return count == null ? 0L : count;
++    }
++
++    private String roleName(String id) {
++        return db.sql("SELECT name FROM access_role WHERE id = :id")
++                .bind("id", id)
++                .map((row, meta) -> row.get("name", String.class))
++                .one()
++                .block();
++    }
++
++    private long auditCount(String actor) {
++        Long count =
++                db.sql("SELECT COUNT(*) AS n FROM access_audit WHERE actor_id = :actor")
++                        .bind("actor", actor)
++                        .map((row, meta) -> row.get("n", Long.class))
++                        .one()
++                        .block();
++        return count == null ? 0L : count;
++    }
++
++    private static String code() {
++        return "tx" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlRoleTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlRoleTest.java
+index 56634d4..eb3c167 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlRoleTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlRoleTest.java
+@@ -1,18 +1,19 @@
+ package com.nekocong.text2sql.web;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ import com.nekocong.text2sql.access.AccessControlRepository;
+ import com.nekocong.text2sql.repository.UserRepository;
+ import com.nekocong.text2sql.security.Roles;
+ import com.nekocong.text2sql.user.AppUser;
++import java.util.HashMap;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.UUID;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.boot.test.context.SpringBootTest;
+ import org.springframework.boot.test.web.server.LocalServerPort;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.MediaType;
+@@ -47,21 +48,22 @@ class AccessControlRoleTest {
+     private DatabaseClient db;
+ 
+     private WebTestClient client;
+     private String adminToken;
+     private String adminId;
+ 
+     @BeforeEach
+     void setUp() {
+         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
+         String username = unique("admin");
+-        AppUser admin = users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
+         access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
+         adminId = admin.id();
+         adminToken = TestAuth.login(client, username, PASSWORD);
+     }
+ 
+     @Test
+     void createsARoleThatAppearsInTheList() {
+         String code = unique("teacher");
+ 
+         client.post()
+@@ -89,63 +91,80 @@ class AccessControlRoleTest {
+                 .jsonPath("$.name")
+                 .isEqualTo("教师")
+                 .jsonPath("$.builtIn")
+                 .isEqualTo(false)
+                 .jsonPath("$.enabled")
+                 .isEqualTo(true)
+                 .jsonPath("$.parentId")
+                 .doesNotExist();
+ 
+         String id = roleIdByCode(code);
++        assertThat(auditRows("role.create", id, "SUCCESS"))
++                .as("the role row and its audit row are committed together")
++                .isEqualTo(1);
++        assertThat(roleCountByCode(code)).isEqualTo(1);
+ 
+         client.get()
+                 .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .exchange()
+                 .expectStatus()
+                 .isOk()
+                 .expectBody()
+                 .jsonPath("$[*].id")
+-                .value(ids -> assertThat((List<Object>) ids).contains(id))
+-                .jsonPath("$[0].id")
+-                .exists();
++                .value(ids -> assertThat((List<Object>) ids).contains(id));
++    }
+ 
+-        assertThat(auditRows(adminId, "role.create", id, "SUCCESS")).isEqualTo(1);
++    @Test
++    void listsRolesOrderedByCode() {
++        List<String> codes =
++                client.get()
++                        .uri(ROLES)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBodyList(Map.class)
++                        .returnResult()
++                        .getResponseBody()
++                        .stream()
++                        .map(row -> String.valueOf(row.get("code")))
++                        .toList();
++
++        assertThat(codes).isNotEmpty().isSorted();
+     }
+ 
+     @Test
+     void rejectsADuplicateCode() {
+         String code = createRole("讲师", null);
+ 
+         client.post()
+                 .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(Map.of("code", code, "name", "重复"))
+                 .exchange()
+                 .expectStatus()
+                 .isEqualTo(409)
+                 .expectBody()
+                 .jsonPath("$.message")
+                 .isEqualTo("角色编码已存在");
+ 
+-        assertThat(auditRows(adminId, "role.create", null, "DENIED"))
++        assertThat(auditRows("role.create", roleIdByCode(code), "DENIED"))
+                 .as("one DENIED row for the rejected create")
+                 .isEqualTo(1);
+     }
+ 
+     @Test
+     void updatesNameDescriptionAndParent() {
+-        String parentCode = createRole("父角色", null);
+-        String parentId = roleIdByCode(parentCode);
+-        String childCode = createRole("子角色", null);
+-        String childId = roleIdByCode(childCode);
++        String parentId = roleIdByCode(createRole("父角色", null));
++        String childId = roleIdByCode(createRole("子角色", null));
+ 
+         client.put()
+                 .uri(ROLES + "/" + childId)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(
+                         Map.of(
+                                 "name",
+                                 "子角色（改）",
+                                 "description",
+@@ -158,117 +177,216 @@ class AccessControlRoleTest {
+                 .expectBody()
+                 .jsonPath("$.id")
+                 .isEqualTo(childId)
+                 .jsonPath("$.name")
+                 .isEqualTo("子角色（改）")
+                 .jsonPath("$.description")
+                 .isEqualTo("继承自父角色")
+                 .jsonPath("$.parentId")
+                 .isEqualTo(parentId);
+ 
+-        assertThat(auditRows(adminId, "role.update", childId, "SUCCESS")).isEqualTo(1);
++        assertThat(auditRows("role.update", childId, "SUCCESS")).isEqualTo(1);
++        assertThat(roleName(childId)).isEqualTo("子角色（改）");
++    }
++
++    @Test
++    void omittingParentOnUpdateKeepsIt() {
++        String parentId = roleIdByCode(createRole("父（保留）", null));
++        String childId = roleIdByCode(createRole("子（保留）", null));
++        put(childId, Map.of("parentId", parentId)).expectStatus().isOk();
++
++        // No parentId at all: keep the existing parent, change only the name.
++        put(childId, Map.of("name", "只改名"))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.parentId")
++                .isEqualTo(parentId)
++                .jsonPath("$.name")
++                .isEqualTo("只改名");
++
++        // An explicit null is the same as omitting it.
++        put(childId, Map.of("name", "再改名"))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.parentId")
++                .isEqualTo(parentId);
++    }
++
++    @Test
++    void emptyStringClearsTheParent() {
++        String parentId = roleIdByCode(createRole("父（清除）", null));
++        String childId = roleIdByCode(createRole("子（清除）", null));
++        put(childId, Map.of("parentId", parentId)).expectStatus().isOk();
++
++        client.put()
++                .uri(ROLES + "/" + childId)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("parentId", ""))
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.parentId")
++                .doesNotExist();
++
++        assertThat(auditRows("role.update", childId, "SUCCESS")).isEqualTo(2);
++    }
++
++    @Test
++    void allowsADisabledParent() {
++        String parentId = roleIdByCode(createRole("停用的父", null));
++        put(parentId, Map.of("enabled", false)).expectStatus().isOk();
++
++        String childId = roleIdByCode(createRole("停用父的子", null));
++        put(childId, Map.of("parentId", parentId))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.parentId")
++                .isEqualTo(parentId);
+     }
+ 
+     @Test
+     void rejectsACodeChange() {
+         String code = createRole("不可改编码", null);
+         String id = roleIdByCode(code);
+ 
+         client.put()
+                 .uri(ROLES + "/" + id)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(Map.of("code", unique("changed"), "name", "改名"))
+                 .exchange()
+                 .expectStatus()
+                 .isEqualTo(409)
+                 .expectBody()
+                 .jsonPath("$.message")
+                 .isEqualTo("角色编码不可修改");
+ 
+-        assertThat(auditRows(adminId, "role.update", id, "DENIED"))
++        assertThat(auditRows("role.update", id, "DENIED"))
+                 .as("exactly one DENIED row for the rejected code change")
+                 .isEqualTo(1);
+         assertThat(roleIdByCode(code)).isEqualTo(id);
+     }
+ 
+     @Test
+     void rejectsSelfParentAndTwoRoleCycle() {
+-        String firstCode = createRole("环一", null);
+-        String firstId = roleIdByCode(firstCode);
+-        String secondCode = createRole("环二", null);
+-        String secondId = roleIdByCode(secondCode);
++        String firstId = roleIdByCode(createRole("环一", null));
++        String secondId = roleIdByCode(createRole("环二", null));
+ 
+-        client.put()
+-                .uri(ROLES + "/" + firstId)
+-                .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("parentId", firstId))
+-                .exchange()
++        put(firstId, Map.of("parentId", firstId))
+                 .expectStatus()
+                 .isEqualTo(409)
+                 .expectBody()
+                 .jsonPath("$.message")
+                 .isEqualTo("会形成循环继承");
+ 
+-        client.put()
+-                .uri(ROLES + "/" + firstId)
+-                .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("parentId", secondId))
+-                .exchange()
++        put(firstId, Map.of("parentId", secondId)).expectStatus().isOk();
++
++        put(secondId, Map.of("parentId", firstId))
+                 .expectStatus()
+-                .isOk();
++                .isEqualTo(409)
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("会形成循环继承");
+ 
+-        client.put()
+-                .uri(ROLES + "/" + secondId)
+-                .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("parentId", firstId))
+-                .exchange()
++        assertThat(auditRows("role.update", secondId, "DENIED")).isEqualTo(1);
++    }
++
++    @Test
++    void rejectsACycleThroughADeepAncestor() {
++        String topId = roleIdByCode(createRole("深一", null));
++        String midId = roleIdByCode(createRole("深二", null));
++        String leafId = roleIdByCode(createRole("深三", null));
++
++        put(midId, Map.of("parentId", topId)).expectStatus().isOk();
++        put(leafId, Map.of("parentId", midId)).expectStatus().isOk();
++
++        // top -> mid -> leaf already exists; making top a child of leaf would loop.
++        put(topId, Map.of("parentId", leafId))
+                 .expectStatus()
+                 .isEqualTo(409)
+                 .expectBody()
+                 .jsonPath("$.message")
+                 .isEqualTo("会形成循环继承");
+ 
+-        assertThat(auditRows(adminId, "role.update", secondId, "DENIED")).isEqualTo(1);
++        assertThat(auditRows("role.update", topId, "DENIED")).isEqualTo(1);
+     }
+ 
+     @Test
+-    void rejectsAnUnknownParent() {
+-        String code = createRole("孤儿", null);
+-        String id = roleIdByCode(code);
++    void rejectsTheBuiltInAdminRoleAsAParent() {
++        String adminRoleId = roleIdByCode(Roles.ADMIN);
+ 
+-        client.put()
+-                .uri(ROLES + "/" + id)
++        client.post()
++                .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("parentId", UUID.randomUUID().toString()))
++                .bodyValue(
++                        Map.of(
++                                "code", unique("escalate"),
++                                "name", "越权",
++                                "parentId", adminRoleId))
+                 .exchange()
++                .expectStatus()
++                .isEqualTo(409)
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("内置管理员角色不能作为父角色");
++
++        String ownId = roleIdByCode(createRole("自建角色", null));
++        put(ownId, Map.of("parentId", adminRoleId))
++                .expectStatus()
++                .isEqualTo(409)
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("内置管理员角色不能作为父角色");
++
++        assertThat(auditRows("role.create", adminRoleId, "DENIED")).isEqualTo(1);
++        assertThat(auditRows("role.update", ownId, "DENIED")).isEqualTo(1);
++    }
++
++    @Test
++    void rejectsAnUnknownParent() {
++        String id = roleIdByCode(createRole("孤儿", null));
++
++        put(id, Map.of("parentId", UUID.randomUUID().toString()))
+                 .expectStatus()
+                 .isNotFound()
+                 .expectBody()
+                 .jsonPath("$.message")
+                 .isEqualTo("父角色不存在");
++
++        assertThat(auditRows("role.update", id, "DENIED")).isEqualTo(1);
+     }
+ 
+     @Test
+-    void rejectsAnUnknownRoleId() {
++    void rejectsAnUnknownRoleIdAndAuditsIt() {
++        String unknown = UUID.randomUUID().toString();
++
+         client.put()
+-                .uri(ROLES + "/" + UUID.randomUUID())
++                .uri(ROLES + "/" + unknown)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(Map.of("name", "不存在"))
+                 .exchange()
+                 .expectStatus()
+-                .isNotFound();
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("角色不存在");
++
++        assertThat(auditRows("role.update", unknown, "DENIED"))
++                .as("the rejected request is filed against the requested id")
++                .isEqualTo(1);
+     }
+ 
+     @Test
+     void validatesTheCodeAndName() {
+         client.post()
+                 .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(Map.of("code", "Bad Code!", "name", "非法"))
+                 .exchange()
+@@ -276,81 +394,98 @@ class AccessControlRoleTest {
+                 .isBadRequest();
+ 
+         client.post()
+                 .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(Map.of("code", unique("noname")))
+                 .exchange()
+                 .expectStatus()
+                 .isBadRequest();
++
++        client.post()
++                .uri(ROLES)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("code", unique("long"), "name", "名".repeat(101)))
++                .exchange()
++                .expectStatus()
++                .isBadRequest();
+     }
+ 
+     @Test
+-    void disablesACustomRoleButNotTheBuiltInAdmin() {
+-        String code = createRole("可停用", null);
+-        String id = roleIdByCode(code);
+-
+-        client.put()
+-                .uri(ROLES + "/" + id)
++    void rejectsAnOversizedDescription() {
++        client.post()
++                .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("enabled", false))
++                .bodyValue(
++                        Map.of(
++                                "code", unique("descr"),
++                                "name", "描述过长",
++                                "description", "描".repeat(513)))
+                 .exchange()
++                .expectStatus()
++                .isBadRequest();
++    }
++
++    @Test
++    void disablesACustomRoleButNotTheBuiltInAdmin() {
++        String id = roleIdByCode(createRole("可停用", null));
++
++        put(id, Map.of("enabled", false))
+                 .expectStatus()
+                 .isOk()
+                 .expectBody()
+                 .jsonPath("$.enabled")
+                 .isEqualTo(false);
+ 
+-        assertThat(auditRows(adminId, "role.disable", id, "SUCCESS")).isEqualTo(1);
++        assertThat(auditRows("role.disable", id, "SUCCESS")).isEqualTo(1);
+ 
+         String adminRoleId = roleIdByCode(Roles.ADMIN);
+-        client.put()
+-                .uri(ROLES + "/" + adminRoleId)
+-                .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("enabled", false))
+-                .exchange()
++        put(adminRoleId, Map.of("enabled", false))
+                 .expectStatus()
+                 .isEqualTo(409)
+                 .expectBody()
+                 .jsonPath("$.message")
+                 .isEqualTo("内置管理员角色不能停用");
+ 
+-        assertThat(auditRows(adminId, "role.disable", adminRoleId, "DENIED")).isEqualTo(1);
++        assertThat(auditRows("role.disable", adminRoleId, "DENIED")).isEqualTo(1);
+         assertThat(roleEnabled(adminRoleId)).isTrue();
+     }
+ 
+     @Test
+-    void renamingTheBuiltInAdminIsAllowed() {
++    void renamingTheBuiltInAdminIsAllowedAndRestored() {
+         String adminRoleId = roleIdByCode(Roles.ADMIN);
+-        client.put()
+-                .uri(ROLES + "/" + adminRoleId)
+-                .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .contentType(MediaType.APPLICATION_JSON)
+-                .bodyValue(Map.of("name", "超级管理员"))
+-                .exchange()
+-                .expectStatus()
+-                .isOk()
+-                .expectBody()
+-                .jsonPath("$.builtIn")
+-                .isEqualTo(true)
+-                .jsonPath("$.name")
+-                .isEqualTo("超级管理员");
++        String originalName = roleName(adminRoleId);
++        try {
++            put(adminRoleId, Map.of("name", "超级管理员"))
++                    .expectStatus()
++                    .isOk()
++                    .expectBody()
++                    .jsonPath("$.builtIn")
++                    .isEqualTo(true)
++                    .jsonPath("$.name")
++                    .isEqualTo("超级管理员");
++        } finally {
++            // The H2 database is shared across test contexts: restore the seeded name.
++            put(adminRoleId, Map.of("name", originalName)).expectStatus().isOk();
++        }
++        assertThat(roleName(adminRoleId)).isEqualTo(originalName);
+     }
+ 
+     @Test
+     void aStudentCannotManageRoles() {
+         String username = unique("student");
+         AppUser student =
+-                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT).block();
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT)
++                        .block();
+         access.assignRoleByCode(student.id(), Roles.STUDENT).block();
+         String token = TestAuth.login(client, username, PASSWORD);
+ 
+         client.get()
+                 .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                 .exchange()
+                 .expectStatus()
+                 .isForbidden();
+ 
+@@ -363,24 +498,33 @@ class AccessControlRoleTest {
+                 .expectStatus()
+                 .isForbidden();
+     }
+ 
+     // --- helpers ----------------------------------------------------------------------------
+ 
+     private String bearer() {
+         return "Bearer " + adminToken;
+     }
+ 
++    private WebTestClient.ResponseSpec put(String roleId, Map<String, Object> body) {
++        return client.put()
++                .uri(ROLES + "/" + roleId)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(body)
++                .exchange();
++    }
++
+     /** Creates a role through the API and returns its code. */
+     private String createRole(String name, String parentId) {
+         String code = unique("role");
+-        Map<String, Object> body = new java.util.HashMap<>();
++        Map<String, Object> body = new HashMap<>();
+         body.put("code", code);
+         body.put("name", name);
+         if (parentId != null) {
+             body.put("parentId", parentId);
+         }
+         client.post()
+                 .uri(ROLES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(body)
+@@ -394,52 +538,69 @@ class AccessControlRoleTest {
+         String id =
+                 db.sql("SELECT id FROM access_role WHERE code = :code")
+                         .bind("code", code)
+                         .map((row, meta) -> row.get("id", String.class))
+                         .one()
+                         .block();
+         assertThat(id).as("role " + code).isNotNull();
+         return id;
+     }
+ 
++    private long roleCountByCode(String code) {
++        Long count =
++                db.sql("SELECT COUNT(*) AS n FROM access_role WHERE code = :code")
++                        .bind("code", code)
++                        .map((row, meta) -> row.get("n", Long.class))
++                        .one()
++                        .block();
++        return count == null ? 0L : count;
++    }
++
++    private String roleName(String roleId) {
++        return db.sql("SELECT name FROM access_role WHERE id = :id")
++                .bind("id", roleId)
++                .map((row, meta) -> row.get("name", String.class))
++                .one()
++                .block();
++    }
++
+     private boolean roleEnabled(String roleId) {
+         Boolean enabled =
+                 db.sql("SELECT enabled FROM access_role WHERE id = :id")
+                         .bind("id", roleId)
+                         .map((row, meta) -> Boolean.TRUE.equals(row.get("enabled", Boolean.class)))
+                         .one()
+                         .block();
+         return Boolean.TRUE.equals(enabled);
+     }
+ 
+-    /** Counts audit rows matching the actor/action/result, with an optional entity id. */
+-    private long auditRows(String actorId, String action, String entityId, String result) {
+-        String sql =
+-                "SELECT COUNT(*) AS n FROM access_audit"
+-                        + " WHERE actor_id = :actorId AND action = :action AND result = :result"
+-                        + (entityId == null ? "" : " AND entity_id = :entityId");
++    /**
++     * Counts audit rows for this test's admin actor and the given action/result.
++     *
++     * @param entityId the entity id to filter by, or {@code null} to apply <em>no</em> id filter
++     *     (never {@code IS NULL})
++     */
++    private long auditRows(String action, String entityId, String result) {
++        StringBuilder sql =
++                new StringBuilder(
++                        "SELECT COUNT(*) AS n FROM access_audit"
++                                + " WHERE actor_id = :actorId AND action = :action AND result = :result");
++        if (entityId != null) {
++            sql.append(" AND entity_id = :entityId");
++        }
+         DatabaseClient.GenericExecuteSpec spec =
+-                db.sql(sql)
+-                        .bind("actorId", actorId)
++                db.sql(sql.toString())
++                        .bind("actorId", adminId)
+                         .bind("action", action)
+                         .bind("result", result);
+         if (entityId != null) {
+             spec = spec.bind("entityId", entityId);
+         }
+-        Long count =
+-                spec.map((row, meta) -> row.get("n", Long.class)).one().block();
++        Long count = spec.map((row, meta) -> row.get("n", Long.class)).one().block();
+         return count == null ? 0L : count;
+     }
+ 
+-    private static String readId(String json) {
+-        try {
+-            return new com.fasterxml.jackson.databind.ObjectMapper().readTree(json).get("id").asText();
+-        } catch (Exception ex) {
+-            throw new IllegalStateException("Failed to parse role id", ex);
+-        }
+-    }
+-
+     /** A unique, pattern-valid code (lowercase start, then alphanumerics). */
+     private static String unique(String prefix) {
+         return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+     }
+ }

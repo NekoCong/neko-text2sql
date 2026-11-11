@@ -1,0 +1,1360 @@
+﻿## Commits
+a4b3a1c feat(auth): enforce account status and session version
+
+## Stat
+ .../text2sql/access/AccessControlRepository.java   |   9 ++
+ .../access/R2dbcAccessControlRepository.java       |  15 ++
+ .../text2sql/config/AccessStatusWebFilter.java     | 143 +++++++++++++++++
+ .../nekocong/text2sql/config/SecurityConfig.java   |  29 +++-
+ .../text2sql/repository/UserRepository.java        |  11 +-
+ .../com/nekocong/text2sql/security/JwtService.java |  12 +-
+ .../com/nekocong/text2sql/service/AuthService.java |  46 ++++--
+ .../java/com/nekocong/text2sql/user/AppUser.java   |  12 +-
+ .../text2sql/access/AccessContextResolverTest.java |   5 +
+ .../nekocong/text2sql/service/AuthServiceTest.java | 177 +++++++++++++++++++++
+ .../text2sql/web/AccessStatusIntegrationTest.java  | 104 ++++++++++++
+ .../nekocong/text2sql/web/AuthControllerTest.java  |   9 +-
+ .../text2sql/web/ConversationRoleAccessTest.java   |   8 +-
+ .../web/DatasourceAccessControllerTest.java        |  16 +-
+ .../src/test/resources/application-test.yaml       |   1 +
+ .../src/test/resources/db/test-access-data.sql     |  96 +++++++++++
+ 16 files changed, 664 insertions(+), 29 deletions(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
+index df040fd..9a58dcb 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
+@@ -61,11 +61,20 @@ public interface AccessControlRepository {
+     Mono<List<DataScopeRule>> dataScopes(Collection<String> roleIds);
+ 
+     /**
+      * Loads the principal attributes of a user.
+      *
+      * @param userId the user id
+      * @param username the login name
+      * @return the attributes
+      */
+     Mono<PrincipalAttributes> principal(String userId, String username);
++
++    /**
++     * Assigns the enabled role with the given code to a user, if not already assigned.
++     *
++     * @param userId the user id
++     * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
++     * @return completion, or an error when no enabled role carries that code
++     */
++    Mono<Void> assignRoleByCode(String userId, String roleCode);
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
+index 195dfb5..e6edf02 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
+@@ -127,20 +127,35 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
+         return client.sql("SELECT scope_type, scope_value FROM user_scope WHERE user_id = :userId")
+                 .bind("userId", userId)
+                 .map((row, meta) -> new String[] {
+                     row.get("scope_type", String.class), row.get("scope_value", String.class)
+                 })
+                 .all()
+                 .collectList()
+                 .map(rows -> buildPrincipal(userId, username, rows));
+     }
+ 
++    @Override
++    public Mono<Void> assignRoleByCode(String userId, String roleCode) {
++        return client.sql("INSERT INTO access_user_role (user_id, role_id, created_at)"
++                        + " SELECT :userId, id, :createdAt FROM access_role"
++                        + " WHERE code = :code AND enabled = TRUE")
++                .bind("userId", userId)
++                .bind("createdAt", System.currentTimeMillis())
++                .bind("code", roleCode)
++                .fetch()
++                .rowsUpdated()
++                .flatMap(rows -> rows == null || rows == 0L
++                        ? Mono.error(new IllegalStateException("角色不存在：" + roleCode))
++                        : Mono.empty());
++    }
++
+     private static PrincipalAttributes buildPrincipal(
+             String userId, String username, List<String[]> rows) {
+         Set<Long> classIds = new LinkedHashSet<>();
+         Long studentId = null;
+         String studentNo = null;
+         for (String[] row : rows) {
+             String type = row[0] == null ? "" : row[0];
+             String value = row[1];
+             switch (type) {
+                 case "class_id" -> classIds.add(parseLong(value, "class_id"));
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java
+new file mode 100644
+index 0000000..3d38f56
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java
+@@ -0,0 +1,143 @@
++package com.nekocong.text2sql.config;
++
++import com.nekocong.text2sql.access.AccessContextResolver;
++import com.nekocong.text2sql.access.EffectiveAccess;
++import java.nio.charset.StandardCharsets;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.HttpStatus;
++import org.springframework.http.MediaType;
++import org.springframework.http.server.reactive.ServerHttpResponse;
++import org.springframework.security.oauth2.jwt.Jwt;
++import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
++import org.springframework.web.server.ResponseStatusException;
++import org.springframework.web.server.ServerWebExchange;
++import org.springframework.web.server.WebFilter;
++import org.springframework.web.server.WebFilterChain;
++import reactor.core.publisher.Mono;
++
++/**
++ * Validates the account behind every authenticated request and publishes the resolved access.
++ *
++ * <p>A valid JWT only proves identity; the account may have been disabled or its session version
++ * bumped since the token was issued. This filter re-checks the account through {@link
++ * AccessContextResolver} and stores the {@link EffectiveAccess} on the exchange attributes, where
++ * enforcement code looks it up with {@code EffectiveAccess.class.getName()}.
++ *
++ * <p>The bearer token is read straight from the request (the {@code Authorization} header, or the
++ * {@code access_token} query parameter used by the browser {@code EventSource}) and verified with
++ * the same decoder as the resource server. The exchange principal is deliberately not touched: in
++ * WebFlux it is backed by a single shared security-context publisher, and consuming it here would
++ * starve the downstream filters and controller argument resolution.
++ *
++ * <p>The filter only validates before the chain runs: it never reads or buffers the response body,
++ * so server-sent events stream through unchanged. Requests without a bearer token (public
++ * endpoints) pass through untouched.
++ *
++ * <p>It is registered explicitly by {@link SecurityConfig} rather than as a component bean: Spring
++ * Boot also installs every {@code WebFilter} bean on the web handler chain, which would run it a
++ * second time, before authentication.
++ */
++public class AccessStatusWebFilter implements WebFilter {
++
++    /** Exchange attribute under which the resolved access is published. */
++    private static final String ACCESS = EffectiveAccess.class.getName();
++
++    /** Query parameter accepted as a bearer token for the browser {@code EventSource}. */
++    private static final String TOKEN_PARAM = "access_token";
++
++    /** The message used when validation fails for a reason other than an account rule. */
++    private static final String DEFAULT_MESSAGE = "登录状态已失效，请重新登录";
++
++    private static final String BEARER_PREFIX = "Bearer ";
++
++    private final AccessContextResolver resolver;
++    private final ReactiveJwtDecoder decoder;
++
++    /**
++     * Creates the filter.
++     *
++     * @param resolver the access-context resolver
++     * @param decoder the JWT decoder, shared with the resource server
++     */
++    public AccessStatusWebFilter(AccessContextResolver resolver, ReactiveJwtDecoder decoder) {
++        this.resolver = resolver;
++        this.decoder = decoder;
++    }
++
++    @Override
++    public Mono<Void> filter(ServerWebExchange exchange, WebFilterChain chain) {
++        String token = token(exchange);
++        if (token == null) {
++            return chain.filter(exchange);
++        }
++        return decoder.decode(token)
++                .flatMap(jwt -> resolve(exchange, jwt).then(Mono.defer(() -> chain.filter(exchange))))
++                // An invalid or expired token is left to the resource server so the normal
++                // authentication entry point answers; only account-level failures are handled here.
++                .onErrorResume(org.springframework.security.oauth2.jwt.JwtException.class,
++                        ex -> chain.filter(exchange));
++    }
++
++    /** Reads the bearer token from the request, or {@code null} when absent. */
++    private static String token(ServerWebExchange exchange) {
++        String header = exchange.getRequest().getHeaders().getFirst(HttpHeaders.AUTHORIZATION);
++        if (header != null && header.regionMatches(true, 0, BEARER_PREFIX, 0, BEARER_PREFIX.length())) {
++            String value = header.substring(BEARER_PREFIX.length()).trim();
++            return value.isEmpty() ? null : value;
++        }
++        String parameter = exchange.getRequest().getQueryParams().getFirst(TOKEN_PARAM);
++        return parameter == null || parameter.isBlank() ? null : parameter.trim();
++    }
++
++    /**
++     * Resolves the account and publishes the access.
++     *
++     * <p>The error handling only wraps the resolution: anything raised further down the chain (an
++     * authorization {@code 403}, a controller error, a broken SSE stream) propagates untouched.
++     */
++    private Mono<Void> resolve(ServerWebExchange exchange, Jwt jwt) {
++        return resolver.resolve(jwt.getSubject(), tokenVersion(jwt))
++                .doOnNext(access -> exchange.getAttributes().put(ACCESS, access))
++                .then()
++                .onErrorResume(error -> exchange.getResponse().isCommitted()
++                        ? Mono.error(error)
++                        : reject(exchange, error));
++    }
++
++    /** Reads the {@code ver} claim, tolerating the numeric types a JSON decoder may produce. */
++    private static Integer tokenVersion(Jwt jwt) {
++        Object value = jwt.getClaim("ver");
++        if (value instanceof Number number) {
++            return number.intValue();
++        }
++        if (value instanceof String text) {
++            try {
++                return Integer.valueOf(text.trim());
++            } catch (NumberFormatException ex) {
++                return null;
++            }
++        }
++        return null;
++    }
++
++    /** Writes the failure status with a short plain-text body and completes the response. */
++    private static Mono<Void> reject(ServerWebExchange exchange, Throwable error) {
++        HttpStatus status = HttpStatus.UNAUTHORIZED;
++        String message = DEFAULT_MESSAGE;
++        if (error instanceof ResponseStatusException failure) {
++            HttpStatus resolved = HttpStatus.resolve(failure.getStatusCode().value());
++            if (resolved != null) {
++                status = resolved;
++            }
++            String reason = failure.getReason();
++            if (reason != null && !reason.isBlank()) {
++                message = reason;
++            }
++        }
++        ServerHttpResponse response = exchange.getResponse();
++        response.setStatusCode(status);
++        response.getHeaders().setContentType(new MediaType(MediaType.TEXT_PLAIN, StandardCharsets.UTF_8));
++        byte[] body = message.getBytes(StandardCharsets.UTF_8);
++        return response.writeWith(Mono.just(response.bufferFactory().wrap(body)));
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+index 786bc99..bfdec85 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+@@ -1,25 +1,27 @@
+ package com.nekocong.text2sql.config;
+ 
+ import com.nimbusds.jose.jwk.source.ImmutableSecret;
++import com.nekocong.text2sql.access.AccessContextResolver;
+ import com.nekocong.text2sql.security.Roles;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Locale;
+ import javax.crypto.SecretKey;
+ import javax.crypto.spec.SecretKeySpec;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.core.convert.converter.Converter;
+ import org.springframework.http.HttpMethod;
+ import org.springframework.security.authentication.AbstractAuthenticationToken;
+ import org.springframework.security.config.Customizer;
+ import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
++import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
+ import org.springframework.security.config.web.server.ServerHttpSecurity;
+ import org.springframework.security.core.authority.SimpleGrantedAuthority;
+ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.security.oauth2.jwt.JwtEncoder;
+ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
+ import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
+ import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
+@@ -38,28 +40,48 @@ import reactor.core.publisher.Mono;
+  * {@code EventSource} used for SSE cannot set headers).
+  *
+  * <p>The {@code role} claim is mapped to a {@code ROLE_ADMIN} / {@code ROLE_USER} authority so the
+  * role is available on the {@code Authentication}. Row-level data scoping (who may read which
+  * conversation) is enforced in the service layer, which receives the role explicitly.
+  */
+ @Configuration
+ @EnableWebFluxSecurity
+ public class SecurityConfig {
+ 
++    /**
++     * The account-status filter.
++     *
++     * <p>Deliberately declared here rather than as a {@code @Component}: Spring Boot installs every
++     * {@code WebFilter} bean on the web handler chain as well as the security chain, so a component
++     * would run twice (once before authentication). It is placed explicitly in the security chain
++     * below instead.
++     *
++     * @param resolver the access-context resolver
++     * @param jwtDecoder the JWT decoder used to read the bearer token
++     * @return the filter
++     */
++    @Bean
++    AccessStatusWebFilter accessStatusWebFilter(
++            AccessContextResolver resolver, ReactiveJwtDecoder jwtDecoder) {
++        return new AccessStatusWebFilter(resolver, jwtDecoder);
++    }
++
+     /**
+      * The security filter chain.
+      *
+      * @param http the server HTTP security builder
++     * @param accessStatus the account-status filter, run after bearer authentication
+      * @return the filter chain
+      */
+     @Bean
+-    SecurityWebFilterChain springSecurityFilterChain(ServerHttpSecurity http) {
++    SecurityWebFilterChain springSecurityFilterChain(
++            ServerHttpSecurity http, AccessStatusWebFilter accessStatus) {
+         ServerBearerTokenAuthenticationConverter bearerTokenConverter =
+                 new ServerBearerTokenAuthenticationConverter();
+         // Allow `?access_token=...` so the SSE endpoint works from the browser's EventSource.
+         bearerTokenConverter.setAllowUriQueryParameter(true);
+ 
+         http.csrf(ServerHttpSecurity.CsrfSpec::disable)
+                 .httpBasic(ServerHttpSecurity.HttpBasicSpec::disable)
+                 .formLogin(ServerHttpSecurity.FormLoginSpec::disable)
+                 .cors(Customizer.withDefaults())
+                 .authorizeExchange(
+@@ -90,21 +112,24 @@ public class SecurityConfig {
+                                         .hasRole("ADMIN")
+                                         .pathMatchers(HttpMethod.PUT, "/api/text2sql/datasources/**")
+                                         .hasRole("ADMIN")
+                                         .pathMatchers(HttpMethod.DELETE, "/api/text2sql/datasources/**")
+                                         .hasRole("ADMIN")
+                                         .anyExchange()
+                                         .authenticated())
+                 .oauth2ResourceServer(
+                         oauth2 ->
+                                 oauth2.bearerTokenConverter(bearerTokenConverter)
+-                                        .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())));
++                                        .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())))
++                // Re-checks the account (enabled, token version) and publishes the resolved
++                // EffectiveAccess on the exchange before the controller runs.
++                .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHORIZATION);
+         return http.build();
+     }
+ 
+     /**
+      * Maps the JWT {@code role} claim to a single granted authority.
+      *
+      * <p>An unknown or missing role maps to {@code ROLE_NONE}: the caller stays authenticated but
+      * carries no role authority. The data-permission layer validates the resolved scope on every
+      * query, and {@code /api/admin/**} plus datasource mutation endpoints require {@code ROLE_ADMIN}.
+      *
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/UserRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/UserRepository.java
+index be9f2e8..8b90370 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/UserRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/UserRepository.java
+@@ -6,21 +6,22 @@ import org.springframework.r2dbc.core.DatabaseClient;
+ import org.springframework.r2dbc.core.DatabaseClient.GenericExecuteSpec;
+ import org.springframework.stereotype.Repository;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Data-access layer for {@code app_user}, on Spring Data R2DBC's {@link DatabaseClient} (non-blocking).
+  */
+ @Repository
+ public class UserRepository {
+ 
+-    private static final String COLUMNS = "id, username, password_hash, display_name, role";
++    private static final String COLUMNS =
++            "id, username, password_hash, display_name, role, enabled, token_version";
+ 
+     private final DatabaseClient client;
+ 
+     /**
+      * Creates the repository.
+      *
+      * @param client the R2DBC database client
+      */
+     public UserRepository(DatabaseClient client) {
+         this.client = client;
+@@ -66,22 +67,26 @@ public class UserRepository {
+         GenericExecuteSpec spec =
+                 client.sql(
+                                 "INSERT INTO app_user (id, username, password_hash, display_name, role, created_at) "
+                                         + "VALUES (:id, :username, :passwordHash, :displayName, :role, :createdAt)")
+                         .bind("id", id)
+                         .bind("username", username)
+                         .bind("passwordHash", passwordHash)
+                         .bind("role", role)
+                         .bind("createdAt", System.currentTimeMillis());
+         spec = displayName == null ? spec.bindNull("displayName", String.class) : spec.bind("displayName", displayName);
+-        return spec.then().thenReturn(new AppUser(id, username, passwordHash, displayName, role));
++        // enabled and token_version are left to the column defaults (TRUE / 0).
++        return spec.then().thenReturn(new AppUser(id, username, passwordHash, displayName, role, true, 0));
+     }
+ 
+     private static AppUser map(io.r2dbc.spi.Row row) {
++        Integer tokenVersion = row.get("token_version", Integer.class);
+         return new AppUser(
+                 row.get("id", String.class),
+                 row.get("username", String.class),
+                 row.get("password_hash", String.class),
+                 row.get("display_name", String.class),
+-                row.get("role", String.class));
++                row.get("role", String.class),
++                Boolean.TRUE.equals(row.get("enabled", Boolean.class)),
++                tokenVersion == null ? 0 : tokenVersion);
+     }
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/JwtService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/JwtService.java
+index aebfcc3..d53db93 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/JwtService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/JwtService.java
+@@ -6,23 +6,25 @@ import java.time.temporal.ChronoUnit;
+ import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+ import org.springframework.security.oauth2.jwt.JwsHeader;
+ import org.springframework.security.oauth2.jwt.JwtClaimsSet;
+ import org.springframework.security.oauth2.jwt.JwtEncoder;
+ import org.springframework.security.oauth2.jwt.JwtEncoderParameters;
+ import org.springframework.stereotype.Component;
+ 
+ /**
+  * Issues signed JWTs for authenticated users.
+  *
+- * <p>The token subject is the user id; {@code username} and {@code role} claims are included for
+- * convenience. The role is a snapshot taken at sign-in time, so a role change only takes effect
+- * after the user signs in again.
++ * <p>The token subject is the user id. The {@code role} claim is display-only: authorization is
++ * resolved from the access-control tables on every request, so a role change applies to the next
++ * request. The {@code ver} claim is the session version of the account; a token whose version does
++ * not match {@code app_user.token_version} is rejected, which invalidates every token issued before
++ * an account is disabled, re-enabled or has its password changed.
+  */
+ @Component
+ public class JwtService {
+ 
+     private final JwtEncoder encoder;
+     private final SecurityProperties properties;
+ 
+     /**
+      * Creates the service.
+      *
+@@ -33,34 +35,36 @@ public class JwtService {
+         this.encoder = encoder;
+         this.properties = properties;
+     }
+ 
+     /**
+      * Issues an access token for a user.
+      *
+      * @param userId the user id (token subject)
+      * @param username the username claim
+      * @param role the role claim ({@code admin}, {@code student} or {@code counselor})
++     * @param tokenVersion the session version of the account ({@code ver} claim)
+      * @return the compact JWT
+      */
+-    public String issue(String userId, String username, String role) {
++    public String issue(String userId, String username, String role, int tokenVersion) {
+         Instant now = Instant.now();
+         String canonical = Roles.normalize(role);
+         // Legacy or unrecognized roles are preserved verbatim so the token stays issuable; the
+         // permission layer rejects them because normalize() no longer recognizes them.
+         String claimRole = canonical != null ? canonical : (role == null ? "" : role);
+         JwtClaimsSet claims =
+                 JwtClaimsSet.builder()
+                         .issuer(properties.getIssuer())
+                         .subject(userId)
+                         .claim("username", username)
+                         .claim(Roles.CLAIM, claimRole)
++                        .claim("ver", tokenVersion)
+                         .issuedAt(now)
+                         .expiresAt(now.plus(properties.getTokenTtlMinutes(), ChronoUnit.MINUTES))
+                         .build();
+         JwsHeader header = JwsHeader.with(MacAlgorithm.HS256).build();
+         return encoder.encode(JwtEncoderParameters.from(header, claims)).getTokenValue();
+     }
+ 
+     /**
+      * Returns the access-token lifetime in seconds.
+      *
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java
+index 443713f..4661255 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java
+@@ -1,53 +1,62 @@
+ package com.nekocong.text2sql.service;
+ 
++import com.nekocong.text2sql.access.AccessControlRepository;
+ import com.nekocong.text2sql.repository.UserRepository;
+ import com.nekocong.text2sql.security.JwtService;
+ import com.nekocong.text2sql.security.Roles;
+ import com.nekocong.text2sql.user.AppUser;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.stereotype.Service;
+ import org.springframework.web.server.ResponseStatusException;
+ import reactor.core.publisher.Mono;
+ import reactor.core.scheduler.Schedulers;
+ 
+ /**
+  * Service layer for authentication and user accounts (reactive).
+  *
+  * <p>Owns the business rules (uniqueness, password policy, credential verification); persistence is
+  * delegated to {@link UserRepository} and token issuance to {@link JwtService}. CPU-bound password
+  * hashing runs on a bounded-elastic scheduler so it never blocks the event loop.
+  *
+- * <p>Self-service registration always creates a {@link Roles#STUDENT}; elevated roles are assigned
+- * out of band (seed SQL or a direct database update), so the registration endpoint cannot be used
+- * for privilege escalation. A freshly registered student has no data scope yet and is therefore
+- * rejected by the data-permission layer until one is configured.
++ * <p>Self-service registration always creates a {@link Roles#STUDENT} and assigns the built-in
++ * {@code student} role in the access-control tables; elevated roles are assigned out of band, so the
++ * registration endpoint cannot be used for privilege escalation. A freshly registered student has
++ * no data scope configured until one exists, so the data-permission layer rejects its queries in the
++ * meantime.
+  */
+ @Service
+ public class AuthService {
+ 
+     private static final int MIN_PASSWORD_LENGTH = 6;
+ 
+     private final UserRepository users;
++    private final AccessControlRepository access;
+     private final PasswordEncoder passwordEncoder;
+     private final JwtService jwtService;
+ 
+     /**
+      * Creates the service.
+      *
+      * @param users the user repository
++     * @param access the access-control repository used to assign the built-in role
+      * @param passwordEncoder the password encoder
+      * @param jwtService the token issuer
+      */
+-    public AuthService(UserRepository users, PasswordEncoder passwordEncoder, JwtService jwtService) {
++    public AuthService(
++            UserRepository users,
++            AccessControlRepository access,
++            PasswordEncoder passwordEncoder,
++            JwtService jwtService) {
+         this.users = users;
++        this.access = access;
+         this.passwordEncoder = passwordEncoder;
+         this.jwtService = jwtService;
+     }
+ 
+     /**
+      * Registers a new user.
+      *
+      * @param username the desired username
+      * @param password the raw password
+      * @param displayName the optional display name
+@@ -67,40 +76,55 @@ public class AuthService {
+                     return users.findByUsername(name)
+                             .flatMap(
+                                     existing ->
+                                             Mono.<AuthResult>error(
+                                                     new ResponseStatusException(HttpStatus.CONFLICT, "用户名已存在")))
+                             .switchIfEmpty(
+                                     Mono.defer(
+                                             () ->
+                                                     encode(secret)
+                                                             .flatMap(hash -> users.insert(name, hash, display, Roles.STUDENT))
++                                                            .flatMap(
++                                                                    user ->
++                                                                            access.assignRoleByCode(user.id(), Roles.STUDENT)
++                                                                                    .onErrorMap(
++                                                                                            error ->
++                                                                                                    new ResponseStatusException(
++                                                                                                            HttpStatus.INTERNAL_SERVER_ERROR,
++                                                                                                            "内置 student 角色缺失"))
++                                                                                    .thenReturn(user))
+                                                             .map(this::issue)));
+                 });
+     }
+ 
+     /**
+      * Authenticates a user.
+      *
+      * @param username the username
+      * @param password the raw password
+      * @return the authentication result
+      */
+     public Mono<AuthResult> login(String username, String password) {
+         return users.findByUsername(username == null ? "" : username)
+                 .switchIfEmpty(Mono.error(invalidCredentials()))
+                 .flatMap(
+-                        user ->
+-                                verify(password, user)
+-                                        .filter(Boolean::booleanValue)
+-                                        .map(ok -> issue(user))
+-                                        .switchIfEmpty(Mono.error(invalidCredentials())));
++                        user -> {
++                            if (!user.enabled()) {
++                                return Mono.error(
++                                        new ResponseStatusException(
++                                                HttpStatus.UNAUTHORIZED, "账号已停用，请联系管理员"));
++                            }
++                            return verify(password, user)
++                                    .filter(Boolean::booleanValue)
++                                    .map(ok -> issue(user))
++                                    .switchIfEmpty(Mono.error(invalidCredentials()));
++                        });
+     }
+ 
+     /**
+      * Loads a user by id, failing with 401 when absent.
+      *
+      * @param userId the user id
+      * @return the user
+      */
+     public Mono<AppUser> requireUser(String userId) {
+         return users
+@@ -114,21 +138,21 @@ public class AuthService {
+     }
+ 
+     private Mono<Boolean> verify(String raw, AppUser user) {
+         return Mono.fromCallable(() -> raw != null && passwordEncoder.matches(raw, user.passwordHash()))
+                 .subscribeOn(Schedulers.boundedElastic());
+     }
+ 
+     private AuthResult issue(AppUser user) {
+         String canonical = Roles.normalize(user.role());
+         return new AuthResult(
+-                jwtService.issue(user.id(), user.username(), user.role()),
++                jwtService.issue(user.id(), user.username(), user.role(), user.tokenVersion()),
+                 jwtService.ttlSeconds(),
+                 user.id(),
+                 user.username(),
+                 user.displayName(),
+                 canonical == null ? user.role() : canonical);
+     }
+ 
+     private static String require(String value, String message) {
+         if (value == null || value.isBlank()) {
+             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/user/AppUser.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/user/AppUser.java
+index 6a0f779..30a81a3 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/user/AppUser.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/user/AppUser.java
+@@ -2,24 +2,32 @@ package com.nekocong.text2sql.user;
+ 
+ import com.nekocong.text2sql.security.Roles;
+ 
+ /**
+  * An application user.
+  *
+  * @param id the user id (UUID)
+  * @param username the unique username
+  * @param passwordHash the BCrypt password hash
+  * @param displayName the display name
+- * @param role the role name ({@code admin} or {@code user})
++ * @param role the role name ({@code admin}, {@code student} or {@code counselor})
++ * @param enabled whether the account may sign in
++ * @param tokenVersion the current token version; tokens issued at an older version are rejected
+  */
+ public record AppUser(
+-        String id, String username, String passwordHash, String displayName, String role) {
++        String id,
++        String username,
++        String passwordHash,
++        String displayName,
++        String role,
++        boolean enabled,
++        int tokenVersion) {
+ 
+     /**
+      * Reports whether this user has the admin role.
+      *
+      * @return {@code true} for admins
+      */
+     public boolean isAdmin() {
+         return Roles.ADMIN.equalsIgnoreCase(role);
+     }
+ }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessContextResolverTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessContextResolverTest.java
+index bf654fc..33d2922 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessContextResolverTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessContextResolverTest.java
+@@ -135,12 +135,17 @@ class AccessContextResolverTest {
+ 
+         @Override
+         public Mono<List<DataScopeRule>> dataScopes(Collection<String> roleIds) {
+             return Mono.just(scopes);
+         }
+ 
+         @Override
+         public Mono<PrincipalAttributes> principal(String userId, String username) {
+             return Mono.just(PRINCIPAL);
+         }
++
++        @Override
++        public Mono<Void> assignRoleByCode(String userId, String roleCode) {
++            return Mono.empty();
++        }
+     }
+ }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/service/AuthServiceTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/service/AuthServiceTest.java
+new file mode 100644
+index 0000000..632da7b
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/service/AuthServiceTest.java
+@@ -0,0 +1,177 @@
++package com.nekocong.text2sql.service;
++
++import static org.assertj.core.api.Assertions.assertThat;
++import static org.assertj.core.api.Assertions.assertThatThrownBy;
++
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.access.AccountStatus;
++import com.nekocong.text2sql.access.AccessRole;
++import com.nekocong.text2sql.access.DataScopeRule;
++import com.nekocong.text2sql.access.PrincipalAttributes;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.JwtService;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.Collection;
++import java.util.List;
++import java.util.Set;
++import org.junit.jupiter.api.Test;
++import org.springframework.http.HttpStatus;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.web.server.ResponseStatusException;
++import reactor.core.publisher.Mono;
++
++/**
++ * Unit tests for the sign-in and registration rules of {@link AuthService}, with the persistence
++ * layer stubbed so no database is needed.
++ */
++class AuthServiceTest {
++
++    private static final AppUser DISABLED =
++            new AppUser("u-disabled", "blocked", "hash", "Blocked", "student", false, 0);
++    private static final AppUser ENABLED =
++            new AppUser("u-enabled", "student01", "hash", "Student", "student", true, 3);
++
++    @Test
++    void rejectsADisabledAccountEvenWithTheCorrectPassword() {
++        AuthService service = new AuthService(new FakeUsers(DISABLED), new FakeAccess(), encoder(true), jwt("tok"));
++
++        assertThatThrownBy(() -> service.login("blocked", "secret123").block())
++                .isInstanceOf(ResponseStatusException.class)
++                .satisfies(error -> {
++                    ResponseStatusException failure = (ResponseStatusException) error;
++                    assertThat(failure.getStatusCode().value()).isEqualTo(HttpStatus.UNAUTHORIZED.value());
++                    assertThat(failure.getReason()).isEqualTo("账号已停用，请联系管理员");
++                });
++    }
++
++    @Test
++    void issuesATokenCarryingTheAccountTokenVersion() {
++        AuthService service = new AuthService(new FakeUsers(ENABLED), new FakeAccess(), encoder(true), jwt("tok"));
++
++        AuthResult result = service.login("student01", "secret123").block();
++
++        assertThat(result).isNotNull();
++        assertThat(result.token()).isEqualTo("tok");
++    }
++
++    @Test
++    void registersAStudentAndAssignsTheBuiltInRole() {
++        FakeAccess access = new FakeAccess();
++        AuthService service = new AuthService(new FakeUsers(null), access, encoder(false), jwt("tok"));
++
++        AuthResult result = service.register("newbie", "secret123", null).block();
++
++        assertThat(result).isNotNull();
++        assertThat(access.assignedRole).isEqualTo("student");
++    }
++
++    @Test
++    void failsRegistrationWhenTheBuiltInRoleIsMissing() {
++        FakeAccess access = new FakeAccess();
++        access.failAssignment = true;
++        AuthService service = new AuthService(new FakeUsers(null), access, encoder(false), jwt("tok"));
++
++        assertThatThrownBy(() -> service.register("newbie", "secret123", null).block())
++                .isInstanceOf(ResponseStatusException.class)
++                .satisfies(error -> assertThat(((ResponseStatusException) error).getStatusCode().value())
++                        .isEqualTo(HttpStatus.INTERNAL_SERVER_ERROR.value()));
++    }
++
++    private static PasswordEncoder encoder(boolean matches) {
++        return new PasswordEncoder() {
++            @Override
++            public String encode(CharSequence rawPassword) {
++                return "hash";
++            }
++
++            @Override
++            public boolean matches(CharSequence rawPassword, String encodedPassword) {
++                return matches;
++            }
++        };
++    }
++
++    private static JwtService jwt(String token) {
++        return new JwtService(null, null) {
++            @Override
++            public String issue(String userId, String username, String role, int tokenVersion) {
++                return token;
++            }
++
++            @Override
++            public long ttlSeconds() {
++                return 3600;
++            }
++        };
++    }
++
++    private static final class FakeUsers extends UserRepository {
++
++        private final AppUser user;
++
++        FakeUsers(AppUser user) {
++            super(null);
++            this.user = user;
++        }
++
++        @Override
++        public Mono<AppUser> findByUsername(String username) {
++            return Mono.justOrEmpty(user);
++        }
++
++        @Override
++        public Mono<AppUser> insert(String username, String passwordHash, String displayName, String role) {
++            return Mono.just(new AppUser("u-new", username, passwordHash, displayName, role, true, 0));
++        }
++    }
++
++    private static final class FakeAccess implements AccessControlRepository {
++
++        private String assignedRole;
++        private boolean failAssignment;
++
++        @Override
++        public Mono<Void> assignRoleByCode(String userId, String roleCode) {
++            if (failAssignment) {
++                return Mono.error(new IllegalStateException("角色不存在：" + roleCode));
++            }
++            assignedRole = roleCode;
++            return Mono.empty();
++        }
++
++        @Override
++        public Mono<AccountStatus> account(String userId) {
++            return Mono.empty();
++        }
++
++        @Override
++        public Mono<List<AccessRole>> rolesOf(String userId) {
++            return Mono.just(List.of());
++        }
++
++        @Override
++        public Mono<List<AccessRole>> allRoles() {
++            return Mono.just(List.of());
++        }
++
++        @Override
++        public Mono<Set<String>> permissionKeys(Collection<String> roleIds) {
++            return Mono.just(Set.of());
++        }
++
++        @Override
++        public Mono<Set<String>> datasourceIds(Collection<String> roleIds) {
++            return Mono.just(Set.of());
++        }
++
++        @Override
++        public Mono<List<DataScopeRule>> dataScopes(Collection<String> roleIds) {
++            return Mono.just(List.of());
++        }
++
++        @Override
++        public Mono<PrincipalAttributes> principal(String userId, String username) {
++            return Mono.just(new PrincipalAttributes(userId, username, null, null, Set.of()));
++        }
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessStatusIntegrationTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessStatusIntegrationTest.java
+new file mode 100644
+index 0000000..0f8aa68
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessStatusIntegrationTest.java
+@@ -0,0 +1,104 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/**
++ * Verifies that the account status and session version are re-checked on every request.
++ *
++ * <p>Registration assigns the built-in {@code student} role; disabling the account or bumping
++ * {@code token_version} invalidates every token issued before the change, while a fresh login keeps
++ * working.
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class AccessStatusIntegrationTest {
++
++    private static final ObjectMapper MAPPER = new ObjectMapper();
++    private static final String PASSWORD = "secret123";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private DatabaseClient client;
++
++    private WebTestClient web;
++
++    @BeforeEach
++    void setUp() {
++        web = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++    }
++
++    @Test
++    void disabledAccountAndStaleTokenVersionAreRejected() {
++        String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String body =
++                web.post()
++                        .uri("/api/auth/register")
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .bodyValue(Map.of("username", username, "password", PASSWORD))
++                        .exchange()
++                        .expectStatus()
++                        .isCreated()
++                        .expectBody(String.class)
++                        .returnResult()
++                        .getResponseBody();
++        String token = jsonField(body, "token");
++        String userId = jsonField(body, "user", "id");
++
++        me(token).expectStatus().isOk();
++
++        Long roles =
++                client.sql("SELECT COUNT(*) AS n FROM access_user_role WHERE user_id = :id"
++                                + " AND role_id = 'test-role-student'")
++                        .bind("id", userId)
++                        .map((row, meta) -> ((Number) row.get("n")).longValue())
++                        .one()
++                        .block();
++        assertThat(roles).isEqualTo(1L);
++
++        exec("UPDATE app_user SET enabled = FALSE WHERE id = :id", userId);
++        me(token).expectStatus().isUnauthorized();
++
++        exec("UPDATE app_user SET enabled = TRUE, token_version = token_version + 1 WHERE id = :id", userId);
++        me(token).expectStatus().isUnauthorized();
++
++        String fresh = TestAuth.login(web, username, PASSWORD);
++        me(fresh).expectStatus().isOk().expectBody().jsonPath("$.username").isEqualTo(username);
++    }
++
++    private WebTestClient.ResponseSpec me(String token) {
++        return web.get()
++                .uri("/api/auth/me")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange();
++    }
++
++    private void exec(String sql, String userId) {
++        client.sql(sql).bind("id", userId).fetch().rowsUpdated().block();
++    }
++
++    private static String jsonField(String body, String... path) {
++        try {
++            var node = MAPPER.readTree(body);
++            for (String part : path) {
++                node = node.get(part);
++            }
++            return node.asText();
++        } catch (Exception ex) {
++            throw new IllegalStateException("Failed to parse JSON field", ex);
++        }
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
+index f4e0a23..bd98b99 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
+@@ -1,16 +1,18 @@
+ package com.nekocong.text2sql.web;
+ 
+ import java.util.Map;
+ import java.util.UUID;
++import com.nekocong.text2sql.access.AccessControlRepository;
+ import com.nekocong.text2sql.repository.UserRepository;
+ import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.boot.test.context.SpringBootTest;
+ import org.springframework.boot.test.web.server.LocalServerPort;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.MediaType;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.test.web.reactive.server.WebTestClient;
+ 
+@@ -23,20 +25,23 @@ class AuthControllerTest {
+ 
+     @LocalServerPort
+     private int port;
+ 
+     @Autowired
+     private UserRepository users;
+ 
+     @Autowired
+     private PasswordEncoder passwordEncoder;
+ 
++    @Autowired
++    private AccessControlRepository access;
++
+     private WebTestClient client;
+ 
+     @BeforeEach
+     void setUp() {
+         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
+     }
+ 
+     @Test
+     void registerLoginAndMe() {
+         String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+@@ -64,21 +69,23 @@ class AuthControllerTest {
+                 .expectBody()
+                 .jsonPath("$.username")
+                 .isEqualTo(username);
+     }
+ 
+     @Test
+     void legacyRoleAccountCanStillLogInAndKeepsItsRole() {
+         // Accounts created before the campus dataset carry the legacy "user" role. Signing in must
+         // not blow up on an unrecognized role claim; the permission layer rejects the scope later.
+         String username = "legacy" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+-        users.insert(username, passwordEncoder.encode("secret123"), "Legacy", Roles.USER).block();
++        AppUser user = users.insert(username, passwordEncoder.encode("secret123"), "Legacy", Roles.USER).block();
++        // The account-status filter requires at least one enabled role, so assign one here.
++        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
+ 
+         String token = TestAuth.login(client, username, "secret123");
+ 
+         client.get()
+                 .uri("/api/auth/me")
+                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                 .exchange()
+                 .expectStatus()
+                 .isOk()
+                 .expectBody()
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java
+index 74b5bd4..8ddb2e0 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java
+@@ -1,17 +1,19 @@
+ package com.nekocong.text2sql.web;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import com.nekocong.text2sql.access.AccessControlRepository;
+ import com.nekocong.text2sql.repository.UserRepository;
+ import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
+ import java.util.Map;
+ import java.util.UUID;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+ import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.boot.test.context.SpringBootTest;
+ import org.springframework.boot.test.web.server.LocalServerPort;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.MediaType;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+@@ -31,32 +33,36 @@ class ConversationRoleAccessTest {
+ 
+     @LocalServerPort
+     private int port;
+ 
+     @Autowired
+     private UserRepository users;
+ 
+     @Autowired
+     private PasswordEncoder passwordEncoder;
+ 
++    @Autowired
++    private AccessControlRepository access;
++
+     private WebTestClient client;
+     private String ownerToken;
+     private String otherToken;
+     private String adminToken;
+ 
+     @BeforeEach
+     void setUp() {
+         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
+         ownerToken = TestAuth.registerAndLogin(client);
+         otherToken = TestAuth.registerAndLogin(client);
+         String adminName = "admin" + UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+-        users.insert(adminName, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        AppUser admin = users.insert(adminName, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
+         adminToken = TestAuth.login(client, adminName, PASSWORD);
+     }
+ 
+     private String createConversation(String token) {
+         String body =
+                 client.post()
+                         .uri("/api/conversations")
+                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                         .contentType(MediaType.APPLICATION_JSON)
+                         .bodyValue(Map.of("title", "Scoped", "datasourceId", "campus"))
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/DatasourceAccessControllerTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/DatasourceAccessControllerTest.java
+index 2c017c6..e214fe1 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/DatasourceAccessControllerTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/DatasourceAccessControllerTest.java
+@@ -1,15 +1,16 @@
+ package com.nekocong.text2sql.web;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ import static org.assertj.core.api.Assertions.assertThatThrownBy;
+ 
++import com.nekocong.text2sql.access.AccessControlRepository;
+ import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
+ import com.nekocong.text2sql.repository.UserRepository;
+ import com.nekocong.text2sql.security.DataScope;
+ import com.nekocong.text2sql.security.DataScopeResolver;
+ import com.nekocong.text2sql.security.Roles;
+ import com.nekocong.text2sql.user.AppUser;
+ import java.util.UUID;
+ import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
+@@ -30,20 +31,23 @@ class DatasourceAccessControllerTest {
+ 
+     @LocalServerPort
+     private int port;
+ 
+     @Autowired
+     private UserRepository users;
+ 
+     @Autowired
+     private PasswordEncoder passwordEncoder;
+ 
++    @Autowired
++    private AccessControlRepository access;
++
+     @Autowired
+     private DataScopeResolver resolver;
+ 
+     @Autowired
+     private DatasourceAccessGuard guard;
+ 
+     @Autowired
+     private DatabaseClient db;
+ 
+     private WebTestClient client;
+@@ -109,22 +113,22 @@ class DatasourceAccessControllerTest {
+         grant("student", "campus", adminToken);
+ 
+         DataScope restored = resolver.resolve(user.id(), "student").block();
+         assertThat(restored).isNotNull();
+         assertThat(guard.resolve(restored, null)).isEqualTo("campus");
+     }
+ 
+     @Test
+     void revokedDatasourceMakesTheSyncQueryReturn403() {
+         String username = "student" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+-        AppUser user =
+-                users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
++        AppUser user = users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
++        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
+         insertScope(user.id(), "class_id", "1");
+         insertScope(user.id(), "student_id", "1");
+         insertScope(user.id(), "student_no", "2023001");
+         String token = TestAuth.login(client, username, "secret123");
+ 
+         revoke("student", "campus", adminToken);
+ 
+         client.post()
+                 .uri("/api/text2sql/query")
+                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+@@ -149,28 +153,29 @@ class DatasourceAccessControllerTest {
+         client.put()
+                 .uri("/api/admin/datasource-access/student/missing")
+                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + adminToken)
+                 .exchange()
+                 .expectStatus()
+                 .isNotFound();
+     }
+ 
+     private String adminToken() {
+         String username = "admin" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+-        users.insert(username, passwordEncoder.encode("secret123"), "Admin", Roles.ADMIN).block();
++        AppUser admin = users.insert(username, passwordEncoder.encode("secret123"), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
+         return TestAuth.login(client, username, "secret123");
+     }
+ 
+     private AppUser studentUser() {
+         String username = "student" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
+-        AppUser user =
+-                users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
++        AppUser user = users.insert(username, passwordEncoder.encode("secret123"), "Student", Roles.STUDENT).block();
++        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
+         insertScope(user.id(), "class_id", "1");
+         insertScope(user.id(), "student_id", "1");
+         insertScope(user.id(), "student_no", "2023001");
+         return user;
+     }
+ 
+     private void insertScope(String userId, String type, String value) {
+         db.sql(
+                         "INSERT INTO user_scope (user_id, scope_type, scope_value) "
+                                 + "VALUES (:userId, :type, :value)")
+@@ -192,10 +197,11 @@ class DatasourceAccessControllerTest {
+ 
+     private void revoke(String role, String datasourceId, String token) {
+         client.delete()
+                 .uri("/api/admin/datasource-access/" + role + "/" + datasourceId)
+                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                 .exchange()
+                 .expectStatus()
+                 .isOk();
+     }
+ }
++
+diff --git a/text2sql-backend/src/test/resources/application-test.yaml b/text2sql-backend/src/test/resources/application-test.yaml
+index f7ed121..2772810 100644
+--- a/text2sql-backend/src/test/resources/application-test.yaml
++++ b/text2sql-backend/src/test/resources/application-test.yaml
+@@ -3,20 +3,21 @@
+ # profile.
+ spring:
+   r2dbc:
+     url: "r2dbc:h2:mem:///appdb;DB_CLOSE_DELAY=-1;MODE=MySQL;DATABASE_TO_LOWER=TRUE;CASE_INSENSITIVE_IDENTIFIERS=TRUE"
+     username: sa
+     password: ""
+   sql:
+     init:
+       mode: always
+       schema-locations: classpath:db/app-schema.sql
++      data-locations: classpath:db/test-access-data.sql
+ 
+ # The demo *target* datasource stays on in-memory H2 here. application.yml points it at MySQL, but
+ # the suite must run without an external server, and a later `text2sql.datasources.items` list
+ # replaces the earlier one wholesale.
+ text2sql:
+   datasources:
+     default-id: campus
+     items:
+       - id: campus
+         name: 智慧校园（H2）
+diff --git a/text2sql-backend/src/test/resources/db/test-access-data.sql b/text2sql-backend/src/test/resources/db/test-access-data.sql
+new file mode 100644
+index 0000000..48cf191
+--- /dev/null
++++ b/text2sql-backend/src/test/resources/db/test-access-data.sql
+@@ -0,0 +1,96 @@
++-- Minimal configurable-access-control seed for the H2 test database.
++--
++-- The production seed (db/app-data.sql) is MySQL-only (INSERT IGNORE), so the test suite gets its own
++-- H2-friendly rows: the three built-in roles, the nine built-in permission keys, role-permission
++-- grants (admin: all; student/counselor: chat.use + datasource.read) and role-datasource grants
++-- (student/counselor: campus). Ids are deterministic so tests can reason about them.
++--
++-- The named H2 database is shared across Spring contexts within one Maven run, so every statement is
++-- written idempotently (INSERT ... SELECT ... WHERE NOT EXISTS) and only adds rows that are missing.
++--
++-- No app users and no conversations are inserted here: tests create their own accounts.
++
++INSERT INTO access_role (id, code, name, description, parent_id, built_in, enabled, created_at, updated_at)
++SELECT 'test-role-admin', 'admin', '管理员', '内置角色：全部权限，跳过数据范围过滤', NULL, TRUE, TRUE, 1792454400000, 1792454400000
++WHERE NOT EXISTS (SELECT 1 FROM access_role WHERE code = 'admin');
++INSERT INTO access_role (id, code, name, description, parent_id, built_in, enabled, created_at, updated_at)
++SELECT 'test-role-student', 'student', '学生', '内置角色：只能查询本人数据', NULL, TRUE, TRUE, 1792454400000, 1792454400000
++WHERE NOT EXISTS (SELECT 1 FROM access_role WHERE code = 'student');
++INSERT INTO access_role (id, code, name, description, parent_id, built_in, enabled, created_at, updated_at)
++SELECT 'test-role-counselor', 'counselor', '辅导员', '内置角色：可查询所带班级的数据', NULL, TRUE, TRUE, 1792454400000, 1792454400000
++WHERE NOT EXISTS (SELECT 1 FROM access_role WHERE code = 'counselor');
++
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-chat-use', 'chat.use', 'chat', 'use', '使用对话与问数', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'chat.use');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-datasource-read', 'datasource.read', 'datasource', 'read', '查看数据源', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'datasource.read');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-datasource-write', 'datasource.write', 'datasource', 'write', '维护数据源', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'datasource.write');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-model-manage', 'model.manage', 'model', 'manage', '维护模型配置', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'model.manage');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-access-manage', 'access.manage', 'access', 'manage', '维护角色与访问控制', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'access.manage');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-user-read', 'user.read', 'user', 'read', '查看用户', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'user.read');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-user-manage', 'user.manage', 'user', 'manage', '维护用户', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'user.manage');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-audit-read', 'audit.read', 'audit', 'read', '查看审计日志', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'audit.read');
++INSERT INTO access_permission (id, permission_key, module, action, description, built_in)
++SELECT 'test-perm-access-bypass-data-scope', 'access.bypass_data_scope', 'access', 'bypass_data_scope', '跳过数据范围过滤（管理员）', TRUE
++WHERE NOT EXISTS (SELECT 1 FROM access_permission WHERE permission_key = 'access.bypass_data_scope');
++
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-chat-use'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-chat-use');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-datasource-read'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-datasource-read');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-datasource-write'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-datasource-write');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-model-manage'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-model-manage');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-access-manage'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-access-manage');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-user-read'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-user-read');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-user-manage'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-user-manage');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-audit-read'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-audit-read');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-admin', 'test-perm-access-bypass-data-scope'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-admin' AND permission_id = 'test-perm-access-bypass-data-scope');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-student', 'test-perm-chat-use'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-student' AND permission_id = 'test-perm-chat-use');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-student', 'test-perm-datasource-read'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-student' AND permission_id = 'test-perm-datasource-read');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-counselor', 'test-perm-chat-use'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-counselor' AND permission_id = 'test-perm-chat-use');
++INSERT INTO access_role_permission (role_id, permission_id)
++SELECT 'test-role-counselor', 'test-perm-datasource-read'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_permission WHERE role_id = 'test-role-counselor' AND permission_id = 'test-perm-datasource-read');
++
++INSERT INTO access_role_datasource (role_id, datasource_id)
++SELECT 'test-role-student', 'campus'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_datasource WHERE role_id = 'test-role-student' AND datasource_id = 'campus');
++INSERT INTO access_role_datasource (role_id, datasource_id)
++SELECT 'test-role-counselor', 'campus'
++WHERE NOT EXISTS (SELECT 1 FROM access_role_datasource WHERE role_id = 'test-role-counselor' AND datasource_id = 'campus');

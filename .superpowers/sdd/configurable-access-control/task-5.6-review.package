@@ -1,0 +1,1389 @@
+﻿## Commits
+0d8be55 Add read-only audit API (task 5.6)
+
+## Stat
+ .../text2sql/access/AccessAdminRepository.java     |  22 +
+ .../com/nekocong/text2sql/access/AccessAudit.java  |  31 ++
+ .../com/nekocong/text2sql/access/AuditQuery.java   |  23 +
+ .../text2sql/access/AuditQueryService.java         | 204 +++++++
+ .../access/R2dbcAccessAdminRepository.java         | 103 ++++
+ .../access/api/AccessControlController.java        |  41 +-
+ .../access/api/dto/AccessAuditPageView.java        |  20 +
+ .../text2sql/access/api/dto/AccessAuditView.java   |  35 ++
+ .../nekocong/text2sql/config/SecurityConfig.java   |  17 +
+ .../access/AccessAdminServiceTransactionTest.java  |  10 +
+ .../RolePermissionServiceTransactionTest.java      |  10 +
+ .../text2sql/web/AccessControlAuditTest.java       | 585 +++++++++++++++++++++
+ 12 files changed, 1100 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+index 9e371d0..a7082db 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+@@ -317,11 +317,33 @@ public interface AccessAdminRepository {
+      */
+     Mono<Void> record(
+             String actorId,
+             String action,
+             String entityType,
+             String entityId,
+             String beforeJson,
+             String afterJson,
+             String result,
+             String reason);
++
++    /**
++     * Lists the audit trail, newest first, matching the given (all-optional) filters.
++     *
++     * <p>Every filter in {@code query} is bound as a parameter; only static fragments are
++     * concatenated. The page is applied in SQL ({@code LIMIT}/{@code OFFSET}), never in memory. Rows
++     * are ordered by {@code created_at DESC, id DESC} so same-millisecond ties are deterministic.
++     *
++     * @param query the validated, normalized filters (a {@code null} field means "any")
++     * @param size the page size (already validated, at least 1)
++     * @param offset the zero-based offset of the page (already validated, at least 0)
++     * @return the matching audit rows, newest first
++     */
++    Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset);
++
++    /**
++     * Counts the audit rows matching the given filters (the {@code total} of a page query).
++     *
++     * @param query the validated, normalized filters (a {@code null} field means "any")
++     * @return the matching row count
++     */
++    Mono<Long> countAudit(AuditQuery query);
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAudit.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAudit.java
+new file mode 100644
+index 0000000..b4be634
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAudit.java
+@@ -0,0 +1,31 @@
++package com.nekocong.text2sql.access;
++
++/**
++ * One access-control audit row as read back from {@code access_audit}.
++ *
++ * <p>The JSON payloads stay as raw text here; parsing into structured JSON (for the API view) is the
++ * service's job, so a malformed stored row can be tolerated on read instead of failing the whole
++ * page.
++ *
++ * @param id the row id
++ * @param actorId the acting user id
++ * @param action the action key (e.g. {@code role.update})
++ * @param entityType the entity type ({@code ROLE}, {@code USER}, {@code DATA_SCOPE})
++ * @param entityId the affected id, or {@code null}
++ * @param beforeJson the serialized before state, or {@code null}
++ * @param afterJson the serialized after state, or {@code null}
++ * @param result {@code SUCCESS} or {@code DENIED}
++ * @param reason the human-readable reason, or {@code null}
++ * @param createdAt the record time (epoch millis)
++ */
++public record AccessAudit(
++        String id,
++        String actorId,
++        String action,
++        String entityType,
++        String entityId,
++        String beforeJson,
++        String afterJson,
++        String result,
++        String reason,
++        long createdAt) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQuery.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQuery.java
+new file mode 100644
+index 0000000..6d47057
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQuery.java
+@@ -0,0 +1,23 @@
++package com.nekocong.text2sql.access;
++
++/**
++ * The validated filter for an audit listing. Every field is optional; a {@code null} field means
++ * "any". Values are pre-validated and normalized by {@link AuditQueryService}; the repository only
++ * binds them, never interpolates them into SQL.
++ *
++ * @param actorId exact {@code actor_id} match, or {@code null}
++ * @param action exact {@code action} match, or {@code null}
++ * @param entityType exact {@code entity_type} match, or {@code null}
++ * @param entityId exact {@code entity_id} match, or {@code null}
++ * @param result {@code SUCCESS} or {@code DENIED}, or {@code null}
++ * @param from inclusive lower bound on {@code created_at} (epoch millis), or {@code null}
++ * @param to exclusive upper bound on {@code created_at} (epoch millis), or {@code null}
++ */
++public record AuditQuery(
++        String actorId,
++        String action,
++        String entityType,
++        String entityId,
++        String result,
++        Long from,
++        Long to) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQueryService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQueryService.java
+new file mode 100644
+index 0000000..49505f1
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQueryService.java
+@@ -0,0 +1,204 @@
++package com.nekocong.text2sql.access;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.nekocong.text2sql.access.api.dto.AccessAuditPageView;
++import com.nekocong.text2sql.access.api.dto.AccessAuditView;
++import java.util.List;
++import org.springframework.http.HttpStatus;
++import org.springframework.stereotype.Service;
++import org.springframework.web.server.ResponseStatusException;
++import reactor.core.publisher.Mono;
++
++/**
++ * The read-only audit API: paginated access to the {@code access_audit} trail.
++ *
++ * <p>Reads are never audited. Every filter is optional and bound as a parameter — the query is built
++ * from static fragments only, never from client input, so a hostile filter cannot change the SQL.
++ *
++ * <ul>
++ *   <li>{@code actorId}, {@code entityId}, {@code action}, {@code entityType}: exact match; an unknown
++ *       value simply matches nothing.
++ *   <li>{@code result}: {@code SUCCESS} or {@code DENIED}; anything else is a {@code 400}.
++ *   <li>{@code from}/{@code to}: epoch millis, {@code from} inclusive, {@code to} exclusive; {@code
++ *       from} after {@code to} is a {@code 400}.
++ *   <li>Pagination: {@code page} defaults to {@code 0}, {@code size} to {@code 50} (capped at {@value
++ *       #MAX_PAGE_SIZE}); a negative page or a non-positive size is a {@code 400}. Ordered by {@code
++ *       created_at DESC, id DESC}, so ties in the same millisecond still have a deterministic order.
++ * </ul>
++ *
++ * <p>The stored {@code before_json}/{@code after_json} text is parsed with Jackson back into JSON for
++ * the client; a malformed stored payload (the writers never produce one) is echoed as its raw string
++ * rather than failing the read.
++ */
++@Service
++public class AuditQueryService {
++
++    private static final String RESULT_SUCCESS = "SUCCESS";
++    private static final String RESULT_DENIED = "DENIED";
++
++    /** Upper bound on the audit page size; larger requests are capped, not rejected. */
++    private static final int MAX_PAGE_SIZE = 200;
++
++    private static final String REASON_RESULT_INVALID = "结果过滤值无效";
++    private static final String REASON_TIME_RANGE_INVALID = "时间范围无效";
++    private static final String REASON_PAGE_INVALID = "分页参数无效";
++
++    private final AccessAdminRepository repository;
++    private final ObjectMapper objectMapper;
++
++    /**
++     * Creates the service.
++     *
++     * @param repository the admin repository
++     * @param objectMapper the shared Jackson mapper, used to parse the stored audit JSON
++     */
++    public AuditQueryService(AccessAdminRepository repository, ObjectMapper objectMapper) {
++        this.repository = repository;
++        this.objectMapper = objectMapper;
++    }
++
++    /**
++     * Lists the audit trail, newest first, paginated.
++     *
++     * @param actorId the exact actor filter, or {@code null}
++     * @param action the exact action filter, or {@code null}
++     * @param entityType the exact entity-type filter, or {@code null}
++     * @param entityId the exact entity-id filter, or {@code null}
++     * @param result {@code SUCCESS}/{@code DENIED}, or {@code null}
++     * @param from the inclusive lower time bound (epoch millis) as text, or {@code null}
++     * @param to the exclusive upper time bound (epoch millis) as text, or {@code null}
++     * @param page the zero-based page number (must be at least 0)
++     * @param size the requested page size (must be at least 1)
++     * @return the page of entries with the total count
++     */
++    public Mono<AccessAuditPageView> list(
++            String actorId,
++            String action,
++            String entityType,
++            String entityId,
++            String result,
++            String from,
++            String to,
++            int page,
++            int size) {
++        return Mono.defer(
++                () -> {
++                    int limit = validatePage(page, size);
++                    long offset = (long) page * limit;
++                    AuditQuery query =
++                            validateQuery(actorId, action, entityType, entityId, result, from, to);
++                    return Mono.zip(
++                                    repository.audit(query, limit, offset),
++                                    repository.countAudit(query))
++                            .map(
++                                    tuple -> {
++                                        List<AccessAuditView> items =
++                                                tuple.getT1().stream().map(this::toView).toList();
++                                        return new AccessAuditPageView(
++                                                items, tuple.getT2(), page, limit);
++                                    });
++                });
++    }
++
++    /** Maps one raw row to its view, parsing the stored JSON payloads. */
++    private AccessAuditView toView(AccessAudit audit) {
++        return new AccessAuditView(
++                audit.id(),
++                audit.actorId(),
++                audit.action(),
++                audit.entityType(),
++                audit.entityId(),
++                parseJson(audit.beforeJson()),
++                parseJson(audit.afterJson()),
++                audit.result(),
++                audit.reason(),
++                audit.createdAt());
++    }
++
++    /**
++     * Parses a stored payload back to a JSON value (an object, array, scalar, or {@code null}). A
++     * malformed payload (never produced by the writers) is returned as its raw string so one bad row
++     * cannot fail the whole read.
++     */
++    private Object parseJson(String text) {
++        if (text == null) {
++            return null;
++        }
++        try {
++            return objectMapper.readValue(text, Object.class);
++        } catch (JsonProcessingException ex) {
++            return text;
++        }
++    }
++
++    /** Validates the filters and returns the normalized query; unknown filters are dropped. */
++    private static AuditQuery validateQuery(
++            String actorId,
++            String action,
++            String entityType,
++            String entityId,
++            String result,
++            String from,
++            String to) {
++        String resultValue = normalizeResult(result);
++        Long fromValue = parseEpoch(from);
++        Long toValue = parseEpoch(to);
++        if (fromValue != null && toValue != null && fromValue > toValue) {
++            throw badRequest(REASON_TIME_RANGE_INVALID);
++        }
++        return new AuditQuery(
++                blankToNull(actorId),
++                blankToNull(action),
++                blankToNull(entityType),
++                blankToNull(entityId),
++                resultValue,
++                fromValue,
++                toValue);
++    }
++
++    private static String normalizeResult(String result) {
++        if (result == null || result.isBlank()) {
++            return null;
++        }
++        String value = result.trim();
++        if (!RESULT_SUCCESS.equals(value) && !RESULT_DENIED.equals(value)) {
++            throw badRequest(REASON_RESULT_INVALID);
++        }
++        return value;
++    }
++
++    private static Long parseEpoch(String value) {
++        if (value == null || value.isBlank()) {
++            return null;
++        }
++        try {
++            return Long.parseLong(value.trim());
++        } catch (NumberFormatException ex) {
++            throw badRequest(REASON_TIME_RANGE_INVALID);
++        }
++    }
++
++    /**
++     * Validates the page number and size, returning the (capped) effective size. A negative page or a
++     * non-positive size is a {@code 400}; a size larger than {@link #MAX_PAGE_SIZE} is capped.
++     */
++    private static int validatePage(int page, int size) {
++        if (page < 0 || size <= 0) {
++            throw badRequest(REASON_PAGE_INVALID);
++        }
++        return Math.min(size, MAX_PAGE_SIZE);
++    }
++
++    private static String blankToNull(String value) {
++        if (value == null) {
++            return null;
++        }
++        String trimmed = value.trim();
++        return trimmed.isEmpty() ? null : trimmed;
++    }
++
++    private static ResponseStatusException badRequest(String message) {
++        return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+index c8c386f..25ed618 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+@@ -24,20 +24,24 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+ 
+     private static final String USER_ROLE_COLUMNS =
+             "r.id, r.code, r.name, r.description, r.parent_id, r.built_in, r.enabled";
+ 
+     private static final String USER_COLUMNS =
+             "u.id, u.username, u.display_name, u.enabled, u.created_at";
+ 
+     private static final String DATA_SCOPE_COLUMNS =
+             "id, role_id, datasource_id, table_name, policy, column_name, principal_attribute";
+ 
++    private static final String AUDIT_COLUMNS =
++            "id, actor_id, action, entity_type, entity_id, before_json, after_json, result, reason,"
++                    + " created_at";
++
+     private final DatabaseClient client;
+ 
+     /**
+      * Creates the repository.
+      *
+      * @param client the R2DBC database client
+      */
+     public R2dbcAccessAdminRepository(DatabaseClient client) {
+         this.client = client;
+     }
+@@ -442,20 +446,119 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+                         .bind("entityType", entityType)
+                         .bind("result", result)
+                         .bind("createdAt", System.currentTimeMillis());
+         spec = bindNullable(spec, "entityId", entityId);
+         spec = bindNullable(spec, "beforeJson", beforeJson);
+         spec = bindNullable(spec, "afterJson", afterJson);
+         spec = bindNullable(spec, "reason", reason);
+         return spec.then();
+     }
+ 
++    @Override
++    public Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset) {
++        AuditWhere where = auditWhere(query);
++        String sql = "SELECT " + AUDIT_COLUMNS + " FROM access_audit" + where.sql
++                + " ORDER BY created_at DESC, id DESC"
++                + " LIMIT :size OFFSET :offset";
++        DatabaseClient.GenericExecuteSpec spec = bindAuditWhere(client.sql(sql), where);
++        spec = spec.bind("size", size).bind("offset", offset);
++        return spec.map((row, meta) -> audit(row)).all().collectList();
++    }
++
++    @Override
++    public Mono<Long> countAudit(AuditQuery query) {
++        AuditWhere where = auditWhere(query);
++        String sql = "SELECT COUNT(*) AS n FROM access_audit" + where.sql;
++        return bindAuditWhere(client.sql(sql), where)
++                .map(
++                        (row, meta) -> {
++                            Long count = row.get("n", Long.class);
++                            return count == null ? 0L : count;
++                        })
++                .one();
++    }
++
++    /** Builds the shared audit-list/count {@code WHERE} fragment from the validated filters. */
++    private static AuditWhere auditWhere(AuditQuery query) {
++        List<String> conditions = new ArrayList<>();
++        if (query.actorId() != null) {
++            conditions.add("actor_id = :actorId");
++        }
++        if (query.action() != null) {
++            conditions.add("action = :action");
++        }
++        if (query.entityType() != null) {
++            conditions.add("entity_type = :entityType");
++        }
++        if (query.entityId() != null) {
++            conditions.add("entity_id = :entityId");
++        }
++        if (query.result() != null) {
++            conditions.add("result = :result");
++        }
++        if (query.from() != null) {
++            conditions.add("created_at >= :from");
++        }
++        if (query.to() != null) {
++            conditions.add("created_at < :to");
++        }
++        String sql = conditions.isEmpty() ? "" : " WHERE " + String.join(" AND ", conditions);
++        return new AuditWhere(sql, query);
++    }
++
++    /** Binds the {@link AuditQuery} values to a statement (skipping the absent filters). */
++    private static DatabaseClient.GenericExecuteSpec bindAuditWhere(
++            DatabaseClient.GenericExecuteSpec spec, AuditWhere where) {
++        DatabaseClient.GenericExecuteSpec bound = spec;
++        AuditQuery query = where.query;
++        if (query.actorId() != null) {
++            bound = bound.bind("actorId", query.actorId());
++        }
++        if (query.action() != null) {
++            bound = bound.bind("action", query.action());
++        }
++        if (query.entityType() != null) {
++            bound = bound.bind("entityType", query.entityType());
++        }
++        if (query.entityId() != null) {
++            bound = bound.bind("entityId", query.entityId());
++        }
++        if (query.result() != null) {
++            bound = bound.bind("result", query.result());
++        }
++        if (query.from() != null) {
++            bound = bound.bind("from", query.from());
++        }
++        if (query.to() != null) {
++            bound = bound.bind("to", query.to());
++        }
++        return bound;
++    }
++
++    /** The audit-list/count filter state: the SQL fragment plus the values to bind. */
++    private record AuditWhere(String sql, AuditQuery query) {}
++
++    private static AccessAudit audit(io.r2dbc.spi.Row row) {
++        Long createdAt = row.get("created_at", Long.class);
++        return new AccessAudit(
++                row.get("id", String.class),
++                row.get("actor_id", String.class),
++                row.get("action", String.class),
++                row.get("entity_type", String.class),
++                row.get("entity_id", String.class),
++                row.get("before_json", String.class),
++                row.get("after_json", String.class),
++                row.get("result", String.class),
++                row.get("reason", String.class),
++                createdAt == null ? 0L : createdAt);
++    }
++
+     private static DatabaseClient.GenericExecuteSpec bindNullable(
+             DatabaseClient.GenericExecuteSpec spec, String name, String value) {
+         return value == null ? spec.bindNull(name, String.class) : spec.bind(name, value);
+     }
+ 
+     /** Builds the shared user-list/count {@code WHERE} fragment and its bound values. */
+     private static Where where(String query, Boolean enabled, String roleId) {
+         boolean hasQuery = query != null && !query.isBlank();
+         boolean hasEnabled = enabled != null;
+         boolean hasRole = roleId != null && !roleId.isBlank();
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index 87e58e6..1896bc6 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -1,17 +1,19 @@
+ package com.nekocong.text2sql.access.api;
+ 
+ import com.nekocong.text2sql.access.AccessAdminService;
++import com.nekocong.text2sql.access.AuditQueryService;
+ import com.nekocong.text2sql.access.DataScopeService;
+ import com.nekocong.text2sql.access.RoleDatasourceService;
+ import com.nekocong.text2sql.access.RolePermissionService;
+ import com.nekocong.text2sql.access.UserAdminService;
++import com.nekocong.text2sql.access.api.dto.AccessAuditPageView;
+ import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPage;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
+@@ -72,53 +74,90 @@ public class AccessControlController {
+ 
+     private static final String USERS = "/api/admin/access-control/users";
+ 
+     private static final String DATASOURCE_ACCESS = "/api/admin/access-control/datasource-access";
+ 
+     private final AccessAdminService service;
+     private final RolePermissionService permissions;
+     private final DataScopeService dataScopes;
+     private final UserAdminService users;
+     private final RoleDatasourceService roleDatasources;
++    private final AuditQueryService auditService;
+ 
+     /**
+      * Creates the controller.
+      *
+      * @param service the role administration service
+      * @param permissions the permission catalog and role-permission matrix service
+      * @param dataScopes the data-scope policy service
+      * @param users the user lifecycle service
+      * @param roleDatasources the role → datasource matrix service
++     * @param auditService the read-only audit-trail service
+      */
+     public AccessControlController(
+             AccessAdminService service,
+             RolePermissionService permissions,
+             DataScopeService dataScopes,
+             UserAdminService users,
+-            RoleDatasourceService roleDatasources) {
++            RoleDatasourceService roleDatasources,
++            AuditQueryService auditService) {
+         this.service = service;
+         this.permissions = permissions;
+         this.dataScopes = dataScopes;
+         this.users = users;
+         this.roleDatasources = roleDatasources;
++        this.auditService = auditService;
+     }
+ 
+     /**
+      * Lists every role, ordered by code.
+      *
+      * @return the roles
+      */
+     @GetMapping(path = ROLES)
+     public Mono<List<AccessRoleView>> list() {
+         return service.list();
+     }
+ 
++    /**
++     * Lists the access-control audit trail, newest first, paginated and filtered.
++     *
++     * <p>Read-only: there are no write/delete audit endpoints. An unknown filter value (for the
++     * exact-match filters) simply matches nothing; only an invalid {@code result}, an inverted {@code
++     * from}/{@code to} range, or bad pagination is a {@code 400} (rendered in the controller's {@code
++     * {status,message}} shape).
++     *
++     * @param actorId the exact actor filter, or omitted for all
++     * @param action the exact action filter, or omitted for all
++     * @param entityType the exact entity-type filter, or omitted for all
++     * @param entityId the exact entity-id filter, or omitted for all
++     * @param result {@code SUCCESS}/{@code DENIED}, or omitted for both
++     * @param from the inclusive lower time bound (epoch millis), or omitted
++     * @param to the exclusive upper time bound (epoch millis), or omitted
++     * @param page the zero-based page number (default 0)
++     * @param size the page size (default 50; capped at the service maximum)
++     * @return the page of entries with the total count
++     */
++    @GetMapping(path = "/api/admin/access-control/audit")
++    public Mono<AccessAuditPageView> audit(
++            @RequestParam(required = false) String actorId,
++            @RequestParam(required = false) String action,
++            @RequestParam(required = false) String entityType,
++            @RequestParam(required = false) String entityId,
++            @RequestParam(required = false) String result,
++            @RequestParam(required = false) String from,
++            @RequestParam(required = false) String to,
++            @RequestParam(defaultValue = "0") int page,
++            @RequestParam(defaultValue = "50") int size) {
++        return auditService.list(actorId, action, entityType, entityId, result, from, to, page, size);
++    }
++
+     /**
+      * Creates a role.
+      *
+      * @param request the role
+      * @return the created role
+      */
+     @PostMapping(path = ROLES)
+     @ResponseStatus(HttpStatus.CREATED)
+     public Mono<AccessRoleView> create(@RequestBody AccessRoleRequest request) {
+         return actorId()
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditPageView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditPageView.java
+new file mode 100644
+index 0000000..1495d5b
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditPageView.java
+@@ -0,0 +1,20 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * A page of the access-control audit trail: the entries for one page plus the total count matching
++ * the filters.
++ *
++ * @param items the entries on this page, ordered newest first
++ * @param total the total number of entries matching the filters (across all pages)
++ * @param page the zero-based page number
++ * @param size the effective page size (the requested size capped at the service maximum)
++ */
++public record AccessAuditPageView(List<AccessAuditView> items, long total, int page, int size) {
++
++    /** Normalizes the item list so the page is structurally immutable. */
++    public AccessAuditPageView {
++        items = items == null ? List.of() : List.copyOf(items);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditView.java
+new file mode 100644
+index 0000000..a729498
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditView.java
+@@ -0,0 +1,35 @@
++package com.nekocong.text2sql.access.api.dto;
++
++/**
++ * One access-control audit entry as returned to admin clients.
++ *
++ * <p>{@code before}/{@code after} are the stored JSON payloads parsed back to JSON values (an object,
++ * an array, a scalar, or {@code null}). A malformed stored payload — which the writers never produce,
++ * but a manual edit or migration could — is returned as its raw string rather than failing the read;
++ * this is deliberate, so a single bad row cannot break the whole page.
++ *
++ * <p>Deliberately free of password material: the writers store only projections of the affected
++ * entity, never hashes or tokens.
++ *
++ * @param id the row id
++ * @param actorId the acting user id
++ * @param action the action key
++ * @param entityType the entity type
++ * @param entityId the affected id, or {@code null}
++ * @param before the parsed before state, or {@code null}
++ * @param after the parsed after state, or {@code null}
++ * @param result {@code SUCCESS} or {@code DENIED}
++ * @param reason the human-readable reason, or {@code null}
++ * @param createdAt the record time (epoch millis)
++ */
++public record AccessAuditView(
++        String id,
++        String actorId,
++        String action,
++        String entityType,
++        String entityId,
++        Object before,
++        Object after,
++        String result,
++        String reason,
++        long createdAt) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+index 01e9b5c..7722c6d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+@@ -102,20 +102,28 @@ public class SecurityConfig {
+                                         // access.manage rule below.
+                                         .pathMatchers(
+                                                 HttpMethod.GET,
+                                                 "/api/admin/access-control/users",
+                                                 "/api/admin/access-control/users/*")
+                                         .access(userRead())
+                                         .pathMatchers(
+                                                 "/api/admin/access-control/users",
+                                                 "/api/admin/access-control/users/**")
+                                         .access(userManage())
++                                        // The audit trail is read-only and gated by audit.read, not
++                                        // access.manage, so an auditor can review changes without
++                                        // being able to make them. Must precede the generic
++                                        // /api/admin/** access.manage rule below.
++                                        .pathMatchers(
++                                                HttpMethod.GET,
++                                                "/api/admin/access-control/audit")
++                                        .access(auditRead())
+                                         .pathMatchers("/api/admin/**")
+                                         .access(accessManage())
+                                         // The three knowledge collections, their documents and the
+                                         // retrieval debug endpoints require the access-management
+                                         // permission.
+                                         // The legacy in-memory API stays open to any authenticated
+                                         // caller for backwards compatibility.
+                                         .pathMatchers("/api/text2sql/knowledge/legacy/**")
+                                         .authenticated()
+                                         .pathMatchers("/api/text2sql/knowledge/**")
+@@ -171,20 +179,29 @@ public class SecurityConfig {
+ 
+     /**
+      * Requires the {@code user.manage} permission (user create/status/reset/roles/display-name).
+      *
+      * @return the authorization manager
+      */
+     static ReactiveAuthorizationManager<AuthorizationContext> userManage() {
+         return PermissionAuthorizationManager.permission(Permissions.USER_MANAGE);
+     }
+ 
++    /**
++     * Requires the {@code audit.read} permission (read-only audit-trail access).
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> auditRead() {
++        return PermissionAuthorizationManager.permission(Permissions.AUDIT_READ);
++    }
++
+     /**
+      * Maps the JWT {@code role} claim to a single granted authority.
+      *
+      * <p>An unknown or missing role maps to {@code ROLE_NONE}: the caller stays authenticated but
+      * carries no role authority. The data-permission layer validates the resolved scope on every
+      * query, and the management routes are gated by permissions resolved from the access-control
+      * tables, so this authority is informational only.
+      *
+      * @return the converter
+      */
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+index d83a0e7..57d24dd 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+@@ -309,20 +309,30 @@ class AccessAdminServiceTransactionTest {
+                     String actorId,
+                     String action,
+                     String entityType,
+                     String entityId,
+                     String beforeJson,
+                     String afterJson,
+                     String result,
+                     String reason) {
+                 return Mono.error(new IllegalStateException("audit unavailable"));
+             }
++
++            @Override
++            public Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset) {
++                return delegate.audit(query, size, offset);
++            }
++
++            @Override
++            public Mono<Long> countAudit(AuditQuery query) {
++                return delegate.countAudit(query);
++            }
+         };
+     }
+ 
+     private long roleCount(String code) {
+         Long count =
+                 db.sql("SELECT COUNT(*) AS n FROM access_role WHERE code = :code")
+                         .bind("code", code)
+                         .map((row, meta) -> row.get("n", Long.class))
+                         .one()
+                         .block();
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+index dfa7d4c..8c14cd7 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+@@ -278,20 +278,30 @@ class RolePermissionServiceTransactionTest {
+                     String actorId,
+                     String action,
+                     String entityType,
+                     String entityId,
+                     String beforeJson,
+                     String afterJson,
+                     String result,
+                     String reason) {
+                 return Mono.error(new IllegalStateException("audit unavailable"));
+             }
++
++            @Override
++            public Mono<List<AccessAudit>> audit(AuditQuery query, int size, long offset) {
++                return delegate.audit(query, size, offset);
++            }
++
++            @Override
++            public Mono<Long> countAudit(AuditQuery query) {
++                return delegate.countAudit(query);
++            }
+         };
+     }
+ 
+     private static HttpStatus denialStatus(Throwable error) {
+         assertThat(error).isInstanceOf(ResponseStatusException.class);
+         return HttpStatus.valueOf(((ResponseStatusException) error).getStatusCode().value());
+     }
+ 
+     private String createRole() {
+         String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlAuditTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlAuditTest.java
+new file mode 100644
+index 0000000..d5e3986
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlAuditTest.java
+@@ -0,0 +1,585 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.access.Permissions;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/**
++ * The read-only access-control audit API: paginated, filtered listing of the {@code access_audit}
++ * trail, gated by {@code audit.read}.
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class AccessControlAuditTest {
++
++    private static final String PASSWORD = "secret123";
++
++    private static final String BASE = "/api/admin/access-control";
++
++    private static final String AUDIT = BASE + "/audit";
++
++    private static final String ROLES = BASE + "/roles";
++
++    private static final String USERS = BASE + "/users";
++
++    private static final String DATA_SCOPES = BASE + "/data-scopes";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
++    @Autowired
++    private DatabaseClient db;
++
++    private WebTestClient client;
++    private String adminToken;
++    private String adminId;
++
++    @BeforeEach
++    void setUp() {
++        client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++        String username = unique("admin");
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++        adminId = admin.id();
++        adminToken = TestAuth.login(client, username, PASSWORD);
++    }
++
++    @Test
++    void listsMutationsWithActorActionEntityResultParsedBeforeAfterAndTimestamp() {
++        String studentRoleId = roleIdByCode(Roles.STUDENT);
++
++        String roleId = createRoleViaApi(unique("audr"), "审计角色");
++        String userId = createUserViaApi(unique("audu"), List.of(studentRoleId));
++
++        // A role permission replace (role.permissions), a user role replace (user.roles) and a
++        // data-scope upsert (data_scope.upsert) each write one SUCCESS row.
++        setPermissions(roleId, List.of(Permissions.CHAT_USE)).expectStatus().isOk();
++        setRoles(userId, List.of(studentRoleId)).expectStatus().isOk();
++        upsertDataScope(roleId, "score", "ALL").expectStatus().isOk();
++
++        // role.create.
++        Map<String, Object> create = auditItems(Map.of("actorId", adminId, "action", "role.create")).get(0);
++        assertThat(create.get("actorId")).isEqualTo(adminId);
++        assertThat(create.get("entityType")).isEqualTo("ROLE");
++        assertThat(create.get("entityId")).isEqualTo(roleId);
++        assertThat(create.get("result")).isEqualTo("SUCCESS");
++        assertThat(((Number) create.get("createdAt")).longValue()).isPositive();
++        assertThat(create.get("before")).isNull();
++        assertThat(create.get("after")).isInstanceOf(Map.class);
++        @SuppressWarnings("unchecked")
++        Map<String, Object> createAfter = (Map<String, Object>) create.get("after");
++        assertThat(createAfter).containsKey("code");
++
++        // user.create.
++        Map<String, Object> userCreate = auditItems(Map.of("actorId", adminId, "action", "user.create")).get(0);
++        assertThat(userCreate.get("entityType")).isEqualTo("USER");
++        assertThat(userCreate.get("entityId")).isEqualTo(userId);
++        assertThat(userCreate.get("result")).isEqualTo("SUCCESS");
++        assertThat(userCreate.get("after")).isInstanceOf(Map.class);
++        assertThat(((Map<?, ?>) userCreate.get("after")).get("username")).isNotNull();
++
++        // user.roles.
++        Map<String, Object> userRoles = auditItems(Map.of("actorId", adminId, "action", "user.roles")).get(0);
++        assertThat(userRoles.get("entityType")).isEqualTo("USER");
++        assertThat(userRoles.get("entityId")).isEqualTo(userId);
++        assertThat(userRoles.get("result")).isEqualTo("SUCCESS");
++        assertThat(userRoles.get("after")).isInstanceOf(Map.class);
++
++        // data_scope.upsert (after is the parsed rule object, not a string).
++        Map<String, Object> scope = auditItems(Map.of("actorId", adminId, "action", "data_scope.upsert")).get(0);
++        assertThat(scope.get("entityType")).isEqualTo("DATA_SCOPE");
++        assertThat(scope.get("result")).isEqualTo("SUCCESS");
++        assertThat(scope.get("after")).isInstanceOf(Map.class);
++        assertThat(((Map<?, ?>) scope.get("after")).get("tableName")).isEqualTo("score");
++
++        // role.permissions (after is the parsed key array, not a string).
++        Map<String, Object> perms = auditItems(Map.of("actorId", adminId, "action", "role.permissions")).get(0);
++        assertThat(perms.get("entityType")).isEqualTo("ROLE");
++        assertThat(perms.get("entityId")).isEqualTo(roleId);
++        assertThat(perms.get("after")).isInstanceOf(List.class);
++        @SuppressWarnings("unchecked")
++        List<String> afterKeys = (List<String>) perms.get("after");
++        assertThat(afterKeys).contains(Permissions.CHAT_USE);
++    }
++
++    @Test
++    void deniedRowsAreVisibleWithTheirReason() {
++        String code = unique("audd");
++        String roleId = createRoleViaApi(code, "拒绝审计");
++
++        // Duplicate code -> role.create DENIED.
++        client.post()
++                .uri(ROLES)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("code", code, "name", "重复"))
++                .exchange()
++                .expectStatus()
++                .isEqualTo(409);
++
++        // Unknown role -> role.update DENIED.
++        put(ROLES + "/" + UUID.randomUUID(), Map.of("name", "不存在")).expectStatus().isNotFound();
++
++        // Unknown permission key -> role.permissions DENIED.
++        setPermissions(roleId, List.of("no.such.key")).expectStatus().isBadRequest();
++
++        // Unknown user -> user.disable DENIED.
++        client.put()
++                .uri(USERS + "/" + UUID.randomUUID() + "/status")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("enabled", false))
++                .exchange()
++                .expectStatus()
++                .isNotFound();
++
++        // Unknown data scope -> data_scope.delete DENIED.
++        client.delete()
++                .uri(DATA_SCOPES + "/" + UUID.randomUUID())
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isNotFound();
++
++        List<Map<String, Object>> denied = auditItems(Map.of("actorId", adminId, "result", "DENIED"));
++        assertThat(denied).isNotEmpty();
++        assertThat(denied)
++                .extracting(row -> String.valueOf(row.get("action")))
++                .contains("role.create", "role.update", "role.permissions", "user.disable",
++                        "data_scope.delete");
++        assertThat(denied)
++                .allSatisfy(
++                        row -> {
++                            assertThat(row.get("result")).isEqualTo("DENIED");
++                            assertThat(String.valueOf(row.get("reason"))).isNotBlank();
++                        });
++    }
++
++    @Test
++    void eachFilterNarrowsCorrectly() {
++        String otherActor = UUID.randomUUID().toString();
++        insertAudit("f1", adminId, "role.create", "ROLE", "role-1", null, "{}", "SUCCESS", null, 1000L);
++        insertAudit("f2", adminId, "user.create", "USER", "user-1", null, "{}", "SUCCESS", null, 2000L);
++        insertAudit("f3", otherActor, "user.create", "USER", "user-2", null, "{}", "DENIED", "原因", 3000L);
++        insertAudit("f4", adminId, "role.update", "ROLE", "role-2", "{}", "{}", "SUCCESS", null, 4000L);
++
++        assertThat(auditItems(Map.of("actorId", adminId))).hasSize(3);
++        assertThat(auditItems(Map.of("actorId", otherActor))).hasSize(1);
++
++        assertThat(auditItems(Map.of("actorId", adminId, "action", "user.create"))).hasSize(1);
++        assertThat(auditItems(Map.of("actorId", adminId, "entityType", "USER"))).hasSize(1);
++        assertThat(auditItems(Map.of("actorId", adminId, "entityId", "role-1"))).hasSize(1);
++        assertThat(auditItems(Map.of("actorId", adminId, "result", "DENIED"))).isEmpty();
++
++        // from inclusive, to exclusive.
++        assertThat(auditItems(Map.of("actorId", adminId, "from", "2000", "to", "4000")))
++                .extracting(row -> row.get("id"))
++                .containsExactly("f2");
++        assertThat(auditItems(Map.of("actorId", adminId, "from", "4000")))
++                .extracting(row -> row.get("id"))
++                .containsExactly("f4");
++        assertThat(auditItems(Map.of("actorId", adminId, "to", "2000")))
++                .extracting(row -> row.get("id"))
++                .containsExactly("f1");
++
++        // An unknown action/entityType simply matches nothing (exact match), never an error.
++        assertThat(auditItems(Map.of("actorId", adminId, "action", "role.nope"))).isEmpty();
++        assertThat(auditItems(Map.of("actorId", adminId, "entityType", "NOPE"))).isEmpty();
++    }
++
++    @Test
++    void invalidResultTimeRangeAndPaginationAreRejected() {
++        expectBadRequest(Map.of("result", "MAYBE"), "结果过滤值无效");
++        expectBadRequest(Map.of("from", "2000", "to", "1000"), "时间范围无效");
++        expectBadRequest(Map.of("from", "not-a-number"), "时间范围无效");
++        expectBadRequest(Map.of("page", "-1"), "分页参数无效");
++        expectBadRequest(Map.of("size", "0"), "分页参数无效");
++    }
++
++    @Test
++    void paginationIsStableNewestFirstWithNoOverlap() {
++        String actor = UUID.randomUUID().toString();
++        for (int i = 1; i <= 10; i++) {
++            insertAudit(
++                    "pg-" + String.format("%02d", i),
++                    actor,
++                    "role.create",
++                    "ROLE",
++                    "role-" + i,
++                    null,
++                    "{}",
++                    "SUCCESS",
++                    null,
++                    i * 1000L);
++        }
++
++        Map<String, Object> page0 = auditPage(Map.of("actorId", actor, "page", "0", "size", "3"));
++        assertThat(((Number) page0.get("total")).intValue()).isEqualTo(10);
++        assertThat(((Number) page0.get("page")).intValue()).isZero();
++        assertThat(((Number) page0.get("size")).intValue()).isEqualTo(3);
++        List<String> first = itemIds(page0);
++        assertThat(first).containsExactly("pg-10", "pg-09", "pg-08");
++
++        List<String> second = itemIds(auditPage(Map.of("actorId", actor, "page", "1", "size", "3")));
++        assertThat(second).containsExactly("pg-07", "pg-06", "pg-05");
++        assertThat(first).doesNotContainAnyElementsOf(second);
++
++        List<String> last = itemIds(auditPage(Map.of("actorId", actor, "page", "3", "size", "3")));
++        assertThat(last).containsExactly("pg-01");
++
++        // Same-millisecond ties are broken deterministically by id DESC.
++        insertAudit("tie-1", actor, "role.create", "ROLE", "role-tie", null, "{}", "SUCCESS", null, 9999L);
++        insertAudit("tie-2", actor, "role.create", "ROLE", "role-tie", null, "{}", "SUCCESS", null, 9999L);
++        assertThat(itemIds(auditPage(Map.of("actorId", actor, "entityId", "role-tie", "size", "2"))))
++                .containsExactly("tie-2", "tie-1");
++
++        // The size is capped at 200, not rejected.
++        Map<String, Object> capped = auditPage(Map.of("actorId", actor, "size", "500"));
++        assertThat(((Number) capped.get("size")).intValue()).isEqualTo(200);
++    }
++
++    @Test
++    void auditReadIsRequiredAndNoOtherPermissionSuffices() {
++        expectForbidden(newAccount(Permissions.ACCESS_MANAGE));
++        expectForbidden(newAccount(Permissions.USER_READ));
++        expectForbidden(newAccount(Permissions.USER_MANAGE));
++
++        Account auditor = newAccount(Permissions.AUDIT_READ);
++        client.get()
++                .uri(AUDIT)
++                .header(HttpHeaders.AUTHORIZATION, bearerFor(auditor))
++                .exchange()
++                .expectStatus()
++                .isOk();
++    }
++
++    @Test
++    void readOutputContainsNoSecretMaterial() {
++        String username = unique("secret");
++        String userId = createUserViaApi(username, List.of(roleIdByCode(Roles.STUDENT)));
++        // A password reset exercises the one audit payload that mentions a password field (the
++        // constant "changed" sentinel, never the actual password).
++        client.post()
++                .uri(USERS + "/" + userId + "/reset-password")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("password", "newsecret9"))
++                .exchange()
++                .expectStatus()
++                .isNoContent();
++
++        String body = auditBody(Map.of("actorId", adminId));
++        assertThat(body)
++                .doesNotContain(PASSWORD)
++                .doesNotContain("newsecret9")
++                .doesNotContain("password_hash")
++                .doesNotContain("passwordHash")
++                .doesNotContain(adminToken);
++    }
++
++    // --- helpers ----------------------------------------------------------------------------
++
++    private String bearer() {
++        return "Bearer " + adminToken;
++    }
++
++    private String bearerFor(Account account) {
++        return "Bearer " + TestAuth.login(client, account.username(), PASSWORD);
++    }
++
++    private void expectForbidden(Account account) {
++        client.get()
++                .uri(AUDIT)
++                .header(HttpHeaders.AUTHORIZATION, bearerFor(account))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    private Account newAccount(String... keys) {
++        String roleId = createRoleGranting(keys);
++        String username = unique("op");
++        String id = createUser(username, roleId);
++        return new Account(id, username);
++    }
++
++    private WebTestClient.ResponseSpec put(String uri, Map<String, Object> body) {
++        return client.put()
++                .uri(uri)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(body)
++                .exchange();
++    }
++
++    private WebTestClient.ResponseSpec setPermissions(String roleId, List<String> keys) {
++        return client.put()
++                .uri(ROLES + "/" + roleId + "/permissions")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("permissions", keys))
++                .exchange();
++    }
++
++    private WebTestClient.ResponseSpec setRoles(String userId, List<String> roleIds) {
++        return client.put()
++                .uri(USERS + "/" + userId + "/roles")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("roleIds", roleIds))
++                .exchange();
++    }
++
++    private WebTestClient.ResponseSpec upsertDataScope(String roleId, String table, String policy) {
++        return client.put()
++                .uri(DATA_SCOPES)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(
++                        Map.of(
++                                "roleId", roleId,
++                                "datasourceId", "campus",
++                                "tableName", table,
++                                "policy", policy))
++                .exchange();
++    }
++
++    /** Creates a role through the API and returns its id. */
++    private String createRoleViaApi(String code, String name) {
++        Map<String, Object> created =
++                client.post()
++                        .uri(ROLES)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .bodyValue(Map.of("code", code, "name", name))
++                        .exchange()
++                        .expectStatus()
++                        .isCreated()
++                        .expectBody(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(created).isNotNull();
++        return String.valueOf(created.get("id"));
++    }
++
++    /** Creates a user through the API and returns its id. */
++    private String createUserViaApi(String username, List<String> roleIds) {
++        Map<String, Object> body = new HashMap<>();
++        body.put("username", username);
++        body.put("password", PASSWORD);
++        body.put("roleIds", roleIds);
++        Map<String, Object> created =
++                client.post()
++                        .uri(USERS)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .bodyValue(body)
++                        .exchange()
++                        .expectStatus()
++                        .isCreated()
++                        .expectBody(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(created).isNotNull();
++        return String.valueOf(created.get("id"));
++    }
++
++    private String roleIdByCode(String code) {
++        String id =
++                db.sql("SELECT id FROM access_role WHERE code = :code")
++                        .bind("code", code)
++                        .map((row, meta) -> row.get("id", String.class))
++                        .one()
++                        .block();
++        assertThat(id).as("role " + code).isNotNull();
++        return id;
++    }
++
++    /** Creates a fresh, non built-in role granting the given permission keys, and returns its id. */
++    private String createRoleGranting(String... keys) {
++        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String roleId = "test-role-audit-" + suffix;
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_role (id, code, name, description, parent_id, built_in,"
++                                + " enabled, created_at, updated_at)"
++                                + " VALUES (:id, :code, :name, NULL, NULL, FALSE, TRUE, :now, :now)")
++                .bind("id", roleId)
++                .bind("code", "audit" + suffix)
++                .bind("name", "Audit " + suffix)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        for (String key : keys) {
++            grantPermission(roleId, key);
++        }
++        return roleId;
++    }
++
++    private void grantPermission(String roleId, String key) {
++        String permissionId =
++                db.sql("SELECT id FROM access_permission WHERE permission_key = :key")
++                        .bind("key", key)
++                        .map((row, meta) -> row.get("id", String.class))
++                        .one()
++                        .block();
++        assertThat(permissionId).as("permission " + key).isNotNull();
++        db.sql("INSERT INTO access_role_permission (role_id, permission_id) VALUES (:roleId, :permissionId)")
++                .bind("roleId", roleId)
++                .bind("permissionId", permissionId)
++                .fetch()
++                .rowsUpdated()
++                .block();
++    }
++
++    /** Creates a user (under the access-control tables) with the given role and returns its id. */
++    private String createUser(String username, String roleId) {
++        AppUser user = users.insert(username, passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT).block();
++        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:u, :r, :now)")
++                .bind("u", user.id())
++                .bind("r", roleId)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++        return user.id();
++    }
++
++    private void insertAudit(
++            String id,
++            String actorId,
++            String action,
++            String entityType,
++            String entityId,
++            String beforeJson,
++            String afterJson,
++            String result,
++            String reason,
++            long createdAt) {
++        DatabaseClient.GenericExecuteSpec spec =
++                db.sql(
++                                "INSERT INTO access_audit"
++                                        + " (id, actor_id, action, entity_type, entity_id, before_json,"
++                                        + " after_json, result, reason, created_at)"
++                                        + " VALUES (:id, :actorId, :action, :entityType, :entityId,"
++                                        + " :beforeJson, :afterJson, :result, :reason, :createdAt)")
++                        .bind("id", id)
++                        .bind("actorId", actorId)
++                        .bind("action", action)
++                        .bind("entityType", entityType)
++                        .bind("result", result)
++                        .bind("createdAt", createdAt);
++        spec = bindNullable(spec, "entityId", entityId);
++        spec = bindNullable(spec, "beforeJson", beforeJson);
++        spec = bindNullable(spec, "afterJson", afterJson);
++        spec = bindNullable(spec, "reason", reason);
++        spec.fetch().rowsUpdated().block();
++    }
++
++    private static DatabaseClient.GenericExecuteSpec bindNullable(
++            DatabaseClient.GenericExecuteSpec spec, String name, String value) {
++        return value == null ? spec.bindNull(name, String.class) : spec.bind(name, value);
++    }
++
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    private Map<String, Object> auditPage(Map<String, Object> params) {
++        Map<String, Object> body =
++                (Map) client.get()
++                        .uri(
++                                uriBuilder -> {
++                                    uriBuilder.path(AUDIT);
++                                    params.forEach(uriBuilder::queryParam);
++                                    return uriBuilder.build();
++                                })
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBody(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(body).isNotNull();
++        return body;
++    }
++
++    private List<Map<String, Object>> auditItems(Map<String, Object> params) {
++        return itemList(auditPage(params));
++    }
++
++    private String auditBody(Map<String, Object> params) {
++        return client.get()
++                .uri(
++                        uriBuilder -> {
++                            uriBuilder.path(AUDIT);
++                            params.forEach(uriBuilder::queryParam);
++                            return uriBuilder.build();
++                        })
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody(String.class)
++                .returnResult()
++                .getResponseBody();
++    }
++
++    @SuppressWarnings("unchecked")
++    private static List<Map<String, Object>> itemList(Map<String, Object> page) {
++        return (List<Map<String, Object>>) page.get("items");
++    }
++
++    private static List<String> itemIds(Map<String, Object> page) {
++        return itemList(page).stream().map(row -> String.valueOf(row.get("id"))).toList();
++    }
++
++    private void expectBadRequest(Map<String, Object> params, String message) {
++        client.get()
++                .uri(
++                        uriBuilder -> {
++                            uriBuilder.path(AUDIT);
++                            params.forEach(uriBuilder::queryParam);
++                            return uriBuilder.build();
++                        })
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo(message);
++    }
++
++    private static String unique(String prefix) {
++        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++    }
++
++    private record Account(String id, String username) {}
++}

@@ -1,5 +1,5 @@
 {
-  "name": "text2sql-frontend",
+  "name": "neko-text2sql-frontend",
   "private": true,
   "version": "0.0.0",
   "type": "module",

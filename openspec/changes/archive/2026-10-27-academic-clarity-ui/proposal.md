@@ -29,6 +29,6 @@ The project already uses Vue 3 and Element Plus; the gap is a deliberate visual 
 
 ## Impact
 
-- Frontend only: `text2sql-frontend/src/style.css`, `src/App.vue`, `src/router/index.ts`, `src/views/*.vue`, `src/components/ConversationSidebar.vue`, and `src/components/ResultChart.vue`; delete `src/views/AboutView.vue`.
+- Frontend only: `neko-text2sql-frontend/src/style.css`, `src/App.vue`, `src/router/index.ts`, `src/views/*.vue`, `src/components/ConversationSidebar.vue`, and `src/components/ResultChart.vue`; delete `src/views/AboutView.vue`.
 - No backend, database, API, dependency, or build-pipeline changes.
 - Verification is visual plus the existing build and clipboard tests; no new runtime feature flags.

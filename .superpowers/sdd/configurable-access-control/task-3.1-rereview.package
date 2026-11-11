@@ -1,0 +1,1860 @@
+﻿## Commits
+6c671ac fix(security): pass token version everywhere and thread the resolved datasource into enforcement
+
+## Stat
+ .../task-3.1-fix-report.md                         | 110 ++++++++++++++++++++
+ .../text2sql/access/AccessControlRepository.java   |   1 +
+ .../text2sql/access/DataScopePolicyEngine.java     |   6 +-
+ .../access/R2dbcAccessControlRepository.java       |  20 +++-
+ .../text2sql/config/AccessStatusWebFilter.java     |  26 ++---
+ .../knowledge/api/KnowledgeCitationController.java |  16 ++-
+ .../api/KnowledgeRetrievalController.java          |   6 +-
+ .../text2sql/repository/AccessRepository.java      |  11 ++
+ .../com/nekocong/text2sql/security/DataScope.java  |  10 --
+ .../text2sql/security/DataScopeResolver.java       |  20 +---
+ .../nekocong/text2sql/security/TablePolicy.java    |  16 ++-
+ .../text2sql/service/DatasourceAccessService.java  |  11 +-
+ .../text2sql/service/Text2SqlPipelineService.java  |  52 ++++++++--
+ .../nekocong/text2sql/sql/DataScopeRewriter.java   |  92 ++++++++++-------
+ .../service/KnowledgeSearchServiceTest.java        |   1 -
+ .../text2sql/security/DataScopeResolverTest.java   |   3 +-
+ .../service/Text2SqlPipelineServiceTest.java       |   3 +-
+ .../service/Text2SqlPolicyEnforcementTest.java     |  15 +++
+ .../sql/DataPermissionIntegrationTest.java         |   2 +-
+ .../text2sql/sql/DataScopeRewriterTest.java        | 114 ++++++++++++++++-----
+ .../java/com/nekocong/text2sql/web/TestAuth.java   |  12 +--
+ 21 files changed, 404 insertions(+), 143 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/configurable-access-control/task-3.1-fix-report.md b/.superpowers/sdd/configurable-access-control/task-3.1-fix-report.md
+index 44d940d..23ee6bc 100644
+--- a/.superpowers/sdd/configurable-access-control/task-3.1-fix-report.md
++++ b/.superpowers/sdd/configurable-access-control/task-3.1-fix-report.md
+@@ -76,10 +76,120 @@ itself.)
+ ## Notes / concerns
+ 
+ - `DatasourceAccessService` now performs two independent statements per call (legacy table, then the
+   access-control table). They are chained with `.then()` rather than zipped because both are
+   idempotent; a failure in the second leaves the first applied. Task 5.5 replaces the legacy matrix,
+   at which point the legacy write can be dropped.
+ - `DataScopeResolver` denies when a non-bypass account has **no** policy at all. Any future role must
+   therefore be seeded with at least one `access_data_scope` row to be usable — intentional fail-closed.
+ - The H2 database is shared across Spring contexts in one Maven run, so the new seed rows and the new
+   test rows stay idempotent / prefix-scoped.
++
++---
++
++# Task 3.1 — Review Round 1 Fixes (Needs fixes → green)
++
++Addressed one Critical, three Important and the selected minors from the task-3.1 review.
++
++Protected set untouched: `SecurityConfig` route permissions, CTE handling, `app-schema.sql`.
++
++## C1 — Four endpoints 401'd unconditionally (missed 2-arg caller migration)
++
++`KnowledgeCitationController` (`preview-url`, `file`, `content`) and `KnowledgeRetrievalController`
++(`search`, `search/debug`) called `scopes.resolve(subject, role)`; the 2-arg overload delegated with
++`null` and `AccessContextResolver` rejects a null `ver` with 401, so all four were dead.
++
++- All four sites now pass `TokenClaims.tokenVersion(jwt)`.
++- The 2-arg `DataScopeResolver.resolve` overload is **deleted**, so the compiler forces every current
++  and future caller to pass the version. `DataScopeResolverTest` now calls `resolve(..., null)`
++  explicitly, with a comment recording why.
++
++## I1 — Rewriter guessed the datasource and failed closed for multi-grant roles
++
++- `Text2SqlPipelineService.enforce(sql, datasourceId, scope)`; both call sites (`toEvents`,
++  `execute`) pass the already-resolved `id`.
++- `DataScopeRewriter.rewrite(sql, scope, datasourceId)` — no 2-arg overload was kept; the id is
++  threaded through every recursive helper down to `policy.predicates(scope, datasourceId, name)`.
++- `DataScopePolicyEngine.decide` checks `access.bypassesDataScope()` **before** the null-datasource
++  check, so a bypassing caller stays unrestricted on an unknown datasource.
++- `TablePolicy.datasourceId` remains only as the single-grant compatibility fallback; `decide`
++  treats an explicitly supplied id as authoritative.
++- New tests: `usesTheExplicitDatasourceIdForACallerWithSeveralGrants`,
++  `theExplicitDatasourceIdSelectsThatDatasourcesPolicies`, `anAdminIsUnrestrictedEvenOnAnUnknownDatasource`.
++
++## I2 — Revoke dual-write could fail open
++
++- `revoke`: enforcement row deleted **first**, then the legacy row — a mid-way failure can only leave
++  enforcement narrower than the matrix. `grant` keeps the legacy-first order (failure leaves
++  enforcement narrower too). Both orders are documented on the methods.
++- `grantDatasourceByCode` zero-row behaviour made consistent with its javadoc: a repeat grant
++  legitimately updates 0 rows, so role existence is checked separately by a new `requireRole`
++  helper that raises "角色不存在：" for an unknown/disabled code (mirrors `assignRoleByCode`).
++
++## I3 — `scopedExplanation` branched on the role name
++
++Now labelled from the effective `FILTER` attributes: `STUDENT_NO`/`STUDENT_ID` → "仅本人";
++`CLASS_IDS` → "所管班级"; otherwise "当前数据范围". Seeded-role strings are unchanged.
++
++`scopedExplanation` is package-private for the new unit test
++`theScopeNoteIsLabelledByTheEffectiveFilterNotTheRoleName` (student / counselor / username-only).
++
++## Minors
++
++- `AccessStatusWebFilter` reuses `TokenClaims.tokenVersion`; the private duplicate parser is gone.
++- `DataScope.admin(userId)` removed (unused; its scope asserted `isAdmin()` which it did not grant).
++  `isStudent()` is kept — two tests still assert it.
++- `TestAuth.currentUserId` restored `expectStatus().isOk()` and no longer fabricates a user id.
++- `DataScopeRewriter.quote` escapes backslashes before quotes; `quote(...)` made package-private and
++  covered directly (`escapesBackslashesAsWellAsQuotes`), because JSQLParser rejects the escaped
++  sequence when re-parsing a derived-table predicate.
++- Formatting: joined line in `Text2SqlPipelineServiceTest:267`, double blank line in
++  `KnowledgeSearchServiceTest`, long lines in `Text2SqlPipelineService.callerContext` and
++  `DataScopeResolver.resolve`, unused `table` parameter dropped from `renderPredicates`.
++- `AccessRepository.scopes/datasourcesForRole` marked transitional with `TODO(task 5.5)` — not removed.
++
++## Commands and output
++
++From `E:\workspace-java\text2sql-demo\text2sql-backend`.
++
++```powershell
++$env:DASHSCOPE_API_KEY=$null; mvn -o test-compile
++```
++```
++[INFO] BUILD SUCCESS
++```
++
++```powershell
++$env:DASHSCOPE_API_KEY=$null; mvn -o test -Dtest='DataScopeResolverTest,DataScopeRewriterTest,Text2SqlPolicyEnforcementTest,Text2SqlPipelineServiceTest,KnowledgeSearchServiceTest,TablePolicyTest,DataPermissionIntegrationTest,DatasourceAccessControllerTest,Text2SqlControllerTest,Text2SqlControllerPersistenceTest'
++```
++```
++[INFO] Tests run:  5, Failures: 0, Errors: 0, Skipped: 0 -- KnowledgeSearchServiceTest
++[INFO] Tests run: 16, Failures: 0, Errors: 0, Skipped: 0 -- DataScopeResolverTest
++[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0 -- TablePolicyTest
++[INFO] Tests run:  7, Failures: 0, Errors: 0, Skipped: 0 -- Text2SqlPipelineServiceTest
++[INFO] Tests run:  7, Failures: 0, Errors: 0, Skipped: 0 -- Text2SqlPolicyEnforcementTest
++[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0 -- DataPermissionIntegrationTest
++[INFO] Tests run: 29, Failures: 0, Errors: 0, Skipped: 0 -- DataScopeRewriterTest
++[INFO] Tests run:  5, Failures: 0, Errors: 0, Skipped: 0 -- DatasourceAccessControllerTest
++[INFO] Tests run:  1, Failures: 0, Errors: 0, Skipped: 0 -- Text2SqlControllerPersistenceTest
++[INFO] Tests run:  5, Failures: 0, Errors: 0, Skipped: 0 -- Text2SqlControllerTest
++[INFO] Tests run: 97, Failures: 0, Errors: 0, Skipped: 0
++[INFO] BUILD SUCCESS
++```
++
++```powershell
++$env:DASHSCOPE_API_KEY=$null; mvn -o test
++```
++```
++[INFO] Tests run: 232, Failures: 0, Errors: 0, Skipped: 0
++[INFO] BUILD SUCCESS
++```
++
++## Concerns
++
++- **No automated test covers the four knowledge endpoints end-to-end.** They are compile-verified
++  only: there is no `WebTestClient` test hitting `/api/text2sql/citations/**` or
++  `/api/text2sql/knowledge/search`, and the knowledge module is `@ConditionalOnProperty`-gated.
++  C1 is fixed and the compiler now prevents the 2-arg form from returning, but a regression test
++  would need a knowledge-enabled test context.
++- The `grant`/`revoke` two-statement sequences are still not transactional; ordering makes the
++  failure modes safe-by-direction rather than atomic. Task 5.5 removes the legacy write entirely.
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
+index 8b92735..33984cb 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
+@@ -73,20 +73,21 @@ public interface AccessControlRepository {
+      * Assigns the enabled role with the given code to a user, if not already assigned.
+      *
+      * @param userId the user id
+      * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
+      * @return completion, or an error when no enabled role carries that code
+      */
+     Mono<Void> assignRoleByCode(String userId, String roleCode);
+ 
+     /**
+      * Grants the enabled role with the given code access to a datasource, if not already granted.
++     * Idempotent.
+      *
+      * @param roleCode the role code ({@code admin}, {@code student} or {@code counselor})
+      * @param datasourceId the datasource id
+      * @return completion, or an error when no enabled role carries that code
+      */
+     Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId);
+ 
+     /**
+      * Revokes the role with the given code's access to a datasource.
+      *
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopePolicyEngine.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopePolicyEngine.java
+index 8e1e6c4..67b7924 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopePolicyEngine.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopePolicyEngine.java
+@@ -20,26 +20,30 @@ public final class DataScopePolicyEngine {
+ 
+     /**
+      * Resolves the policy for one table.
+      *
+      * @param access the caller's effective access, or {@code null}
+      * @param datasourceId the datasource id
+      * @param tableName the table name (unqualified)
+      * @return the decision
+      */
+     public PolicyDecision decide(EffectiveAccess access, String datasourceId, String tableName) {
+-        if (access == null || datasourceId == null || tableName == null) {
++        if (access == null) {
+             return PolicyDecision.deny();
+         }
++        // Checked first: a bypassing caller is unrestricted even when the datasource is unknown.
+         if (access.bypassesDataScope()) {
+             return PolicyDecision.all();
+         }
++        if (datasourceId == null || tableName == null) {
++            return PolicyDecision.deny();
++        }
+         List<DataScopeRule> rules = access.dataScopes().stream()
+                 .filter(rule -> datasourceId.equals(rule.datasourceId()))
+                 .filter(rule -> tableName.equalsIgnoreCase(rule.tableName()))
+                 .toList();
+         if (rules.isEmpty() || rules.stream().anyMatch(rule -> rule.policy() == DataScopePolicy.DENY)) {
+             return PolicyDecision.deny();
+         }
+         if (rules.stream().anyMatch(rule -> rule.policy() == DataScopePolicy.ALL)) {
+             return PolicyDecision.all();
+         }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
+index 46606f0..5c5ae29 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
+@@ -148,41 +148,57 @@ public class R2dbcAccessControlRepository implements AccessControlRepository {
+                 .bind("code", roleCode)
+                 .fetch()
+                 .rowsUpdated()
+                 .flatMap(rows -> rows == null || rows == 0L
+                         ? exists(userId, roleCode)
+                         : Mono.empty());
+     }
+ 
+     @Override
+     public Mono<Void> grantDatasourceByCode(String roleCode, String datasourceId) {
+-        // Idempotent: an existing grant keeps its row and the statement still completes.
++        // Idempotent: a pre-existing grant keeps its row, so zero affected rows is expected on a
++        // repeat call. "No enabled role carries the code" is detected separately, mirroring
++        // assignRoleByCode.
+         return client.sql("INSERT INTO access_role_datasource (role_id, datasource_id)"
+                         + " SELECT r.id, :ds FROM access_role r"
+                         + " WHERE r.code = :code AND r.enabled = TRUE"
+                         + " AND NOT EXISTS (SELECT 1 FROM access_role_datasource d"
+                         + " WHERE d.role_id = r.id AND d.datasource_id = :ds)")
+                 .bind("ds", datasourceId)
+                 .bind("code", roleCode)
+-                .then();
++                .then()
++                .then(requireRole(roleCode));
+     }
+ 
+     @Override
+     public Mono<Void> revokeDatasourceByCode(String roleCode, String datasourceId) {
+         return client.sql("DELETE FROM access_role_datasource"
+                         + " WHERE datasource_id = :ds"
+                         + " AND role_id IN (SELECT id FROM access_role WHERE code = :code)")
+                 .bind("ds", datasourceId)
+                 .bind("code", roleCode)
+                 .then();
+     }
+ 
++    /**
++     * Confirms an enabled role with the code exists, so a grant against a typo fails instead of
++     * silently doing nothing.
++     */
++    private Mono<Void> requireRole(String roleCode) {
++        return client.sql("SELECT 1 AS present FROM access_role WHERE code = :code AND enabled = TRUE")
++                .bind("code", roleCode)
++                .map((row, meta) -> Boolean.TRUE)
++                .one()
++                .switchIfEmpty(Mono.error(new IllegalStateException("角色不存在：" + roleCode)))
++                .then();
++    }
++
+     /** Confirms an already-assigned role exists, so a repeat assignment is a no-op. */
+     private Mono<Void> exists(String userId, String roleCode) {
+         return client.sql("SELECT 1 AS present FROM access_user_role ur"
+                         + " JOIN access_role r ON r.id = ur.role_id"
+                         + " WHERE ur.user_id = :userId AND r.code = :code")
+                 .bind("userId", userId)
+                 .bind("code", roleCode)
+                 .map((row, meta) -> Boolean.TRUE)
+                 .one()
+                 .switchIfEmpty(Mono.error(new IllegalStateException("角色不存在：" + roleCode)))
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java
+index 59d3394..6670f42 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java
+@@ -1,16 +1,17 @@
+ package com.nekocong.text2sql.config;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.nekocong.text2sql.access.AccessContextResolver;
+ import com.nekocong.text2sql.access.EffectiveAccess;
++import com.nekocong.text2sql.security.TokenClaims;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Map;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.MediaType;
+ import org.springframework.http.server.reactive.ServerHttpResponse;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.security.oauth2.jwt.JwtException;
+@@ -24,23 +25,24 @@ import reactor.core.publisher.Mono;
+ /**
+  * Validates the account behind every authenticated request and publishes the resolved access.
+  *
+  * <p>A valid JWT only proves identity; the account may have been disabled or its session version
+  * bumped since the token was issued. This filter re-checks the account through {@link
+  * AccessContextResolver} and stores the {@link EffectiveAccess} on the exchange attributes, where
+  * enforcement code looks it up with {@code EffectiveAccess.class.getName()}.
+  *
+  * <p>The bearer token is read straight from the request (the {@code Authorization} header, or the
+  * {@code access_token} query parameter used by the browser {@code EventSource}) and verified with
+- * the same decoder as the resource server. The exchange principal is deliberately not touched: in
+- * WebFlux it is backed by a single shared security-context publisher, and consuming it here would
+- * starve the downstream filters and controller argument resolution.
++ * the same decoder as the resource server. The {@code ver} claim is read with {@link TokenClaims}.
++ * The exchange principal is deliberately not touched: in WebFlux it is backed by a single shared
++ * security-context publisher, and consuming it here would starve the downstream filters and
++ * controller argument resolution.
+  *
+  * <p>The filter only validates before the chain runs: it never reads or buffers the response body,
+  * so server-sent events stream through unchanged. Requests without a bearer token (public
+  * endpoints) pass through untouched.
+  *
+  * <p>It is constructed by {@link SecurityConfig} and registered only in the security chain. It must
+  * not be exposed as a bean: Spring Boot adds every {@code WebFilter} bean to the top-level handler
+  * chain as well, which would validate every request a second time.
+  */
+ public class AccessStatusWebFilter implements WebFilter {
+@@ -103,47 +105,31 @@ public class AccessStatusWebFilter implements WebFilter {
+         return parameter == null || parameter.isBlank() ? null : parameter.trim();
+     }
+ 
+     /**
+      * Resolves the account and publishes the access.
+      *
+      * <p>The error handling only wraps the resolution: anything raised further down the chain (an
+      * authorization {@code 403}, a controller error, a broken SSE stream) propagates untouched.
+      */
+     private Mono<Void> resolve(ServerWebExchange exchange, Jwt jwt) {
+-        return resolver.resolve(jwt.getSubject(), tokenVersion(jwt))
++        return resolver.resolve(jwt.getSubject(), TokenClaims.tokenVersion(jwt))
+                 .doOnNext(access -> exchange.getAttributes().put(ACCESS, access))
+                 .then()
+                 .onErrorResume(error -> {
+                     if (exchange.getResponse().isCommitted()) {
+                         return Mono.error(error);
+                     }
+                     return reject(exchange, jwt.getSubject(), error);
+                 });
+     }
+ 
+-    /** Reads the {@code ver} claim, tolerating the numeric types a JSON decoder may produce. */
+-    private static Integer tokenVersion(Jwt jwt) {
+-        Object value = jwt.getClaim("ver");
+-        if (value instanceof Number number) {
+-            return number.intValue();
+-        }
+-        if (value instanceof String text) {
+-            try {
+-                return Integer.valueOf(text.trim());
+-            } catch (NumberFormatException ex) {
+-                return null;
+-            }
+-        }
+-        return null;
+-    }
+-
+     /**
+      * Writes the failure status with a compact JSON body and completes the response.
+      *
+      * <p>Only a deliberate {@link ResponseStatusException} reaches the caller verbatim (its status
+      * and reason are safe to expose). Any other failure is an infrastructure problem: it is logged
+      * with its cause and answered with a generic {@code 500}, never as a misleading "session expired"
+      * {@code 401}.
+      */
+     private Mono<Void> reject(ServerWebExchange exchange, String userId, Throwable error) {
+         HttpStatus status;
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeCitationController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeCitationController.java
+index 5e960ae..6bb22c9 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeCitationController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeCitationController.java
+@@ -1,19 +1,20 @@
+ package com.nekocong.text2sql.knowledge.api;
+ 
+ import com.nekocong.text2sql.config.BlockingSchedulerConfig;
+ import com.nekocong.text2sql.knowledge.api.dto.DocumentContentView;
+ import com.nekocong.text2sql.knowledge.api.dto.PreviewUrlView;
+ import com.nekocong.text2sql.knowledge.service.KnowledgePreviewService;
+ import com.nekocong.text2sql.knowledge.store.ObjectStoreException;
+ import com.nekocong.text2sql.security.DataScopeResolver;
+ import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.security.TokenClaims;
+ import java.util.NoSuchElementException;
+ import org.springframework.beans.factory.annotation.Qualifier;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.security.core.annotation.AuthenticationPrincipal;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RestController;
+@@ -57,21 +58,24 @@ public class KnowledgeCitationController {
+      * Signs a short-lived preview URL for a cited document.
+      *
+      * @param documentId the document id
+      * @param jwt the bearer token
+      * @return the URL and its expiry
+      */
+     @GetMapping("/{documentId}/preview-url")
+     public Mono<PreviewUrlView> previewUrl(
+             @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
+         return scopes
+-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
++                .resolve(
++                        jwt.getSubject(),
++                        jwt.getClaimAsString(Roles.CLAIM),
++                        TokenClaims.tokenVersion(jwt))
+                 .flatMap(scope -> Mono.fromCallable(() -> preview.previewUrl(documentId, scope))
+                         .subscribeOn(blockingScheduler)
+                         .onErrorMap(
+                                 NoSuchElementException.class,
+                                 ex -> new ResponseStatusException(
+                                         HttpStatus.NOT_FOUND, ex.getMessage()))
+                         .onErrorMap(
+                                 ObjectStoreException.class,
+                                 ex -> new ResponseStatusException(
+                                         HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage())));
+@@ -84,21 +88,24 @@ public class KnowledgeCitationController {
+      * short-lived link to expire while a page is open.
+      *
+      * @param documentId the document id
+      * @param jwt the bearer token
+      * @return the bytes with their media type
+      */
+     @GetMapping("/{documentId}/file")
+     public Mono<org.springframework.http.ResponseEntity<byte[]>> file(
+             @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
+         return scopes
+-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
++                .resolve(
++                        jwt.getSubject(),
++                        jwt.getClaimAsString(Roles.CLAIM),
++                        TokenClaims.tokenVersion(jwt))
+                 .flatMap(scope -> Mono.fromCallable(() -> preview.file(documentId, scope))
+                         .subscribeOn(blockingScheduler)
+                         .onErrorMap(
+                                 NoSuchElementException.class,
+                                 ex -> new ResponseStatusException(
+                                         HttpStatus.NOT_FOUND, ex.getMessage()))
+                         .onErrorMap(
+                                 ObjectStoreException.class,
+                                 ex -> new ResponseStatusException(
+                                         HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage()))
+@@ -123,21 +130,24 @@ public class KnowledgeCitationController {
+      * Returns the normalized text snapshot of a cited document.
+      *
+      * @param documentId the document id
+      * @param jwt the bearer token
+      * @return the snapshot
+      */
+     @GetMapping("/{documentId}/content")
+     public Mono<DocumentContentView> content(
+             @PathVariable String documentId, @AuthenticationPrincipal Jwt jwt) {
+         return scopes
+-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
++                .resolve(
++                        jwt.getSubject(),
++                        jwt.getClaimAsString(Roles.CLAIM),
++                        TokenClaims.tokenVersion(jwt))
+                 .flatMap(scope -> Mono.fromCallable(() -> preview.content(documentId, scope))
+                         .subscribeOn(blockingScheduler)
+                         .onErrorMap(
+                                 NoSuchElementException.class,
+                                 ex -> new ResponseStatusException(
+                                         HttpStatus.NOT_FOUND, ex.getMessage()))
+                         .onErrorMap(
+                                 ObjectStoreException.class,
+                                 ex -> new ResponseStatusException(
+                                         HttpStatus.SERVICE_UNAVAILABLE, ex.getMessage())));
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeRetrievalController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeRetrievalController.java
+index 7c80946..0420265 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeRetrievalController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeRetrievalController.java
+@@ -1,18 +1,19 @@
+ package com.nekocong.text2sql.knowledge.api;
+ 
+ import com.nekocong.text2sql.config.BlockingSchedulerConfig;
+ import com.nekocong.text2sql.knowledge.SearchResult;
+ import com.nekocong.text2sql.knowledge.api.dto.KnowledgeQueryRequest;
+ import com.nekocong.text2sql.knowledge.service.KnowledgeSearchService;
+ import com.nekocong.text2sql.security.DataScopeResolver;
+ import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.security.TokenClaims;
+ import org.springframework.beans.factory.annotation.Qualifier;
+ import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+ import org.springframework.security.core.annotation.AuthenticationPrincipal;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.web.bind.annotation.PostMapping;
+ import org.springframework.web.bind.annotation.RequestBody;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RestController;
+ import reactor.core.publisher.Mono;
+ import reactor.core.scheduler.Scheduler;
+@@ -70,20 +71,23 @@ public class KnowledgeRetrievalController {
+      * @return the hits, citations and trace
+      */
+     @PostMapping("/search/debug")
+     public Mono<SearchResult> debug(
+             @RequestBody KnowledgeQueryRequest request, @AuthenticationPrincipal Jwt jwt) {
+         return execute(request, jwt);
+     }
+ 
+     private Mono<SearchResult> execute(KnowledgeQueryRequest request, Jwt jwt) {
+         return scopes
+-                .resolve(jwt.getSubject(), jwt.getClaimAsString(Roles.CLAIM))
++                .resolve(
++                        jwt.getSubject(),
++                        jwt.getClaimAsString(Roles.CLAIM),
++                        TokenClaims.tokenVersion(jwt))
+                 .flatMap(scope -> Mono.fromCallable(() -> search.search(
+                                 scope,
+                                 request.datasourceId(),
+                                 request.agentId(),
+                                 request.query(),
+                                 request.topK()))
+                         .subscribeOn(blockingScheduler));
+     }
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java
+index f425b67..037ed61 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java
+@@ -6,20 +6,25 @@ import java.util.Set;
+ import org.springframework.r2dbc.core.DatabaseClient;
+ import org.springframework.stereotype.Repository;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Data-access layer for the two access-control tables: {@code user_scope} (principal attributes)
+  * and {@code datasource_access} (role -> datasource whitelist).
+  *
+  * <p>These live in the application database on purpose: resolving who the caller is must never
+  * require reading the protected business database.
++ *
++ * <p>Transitional: {@link #scopes} and {@link #datasourcesForRole} read the legacy tables.
++ * Principal attributes are now resolved by {@code R2dbcAccessControlRepository} and datasource
++ * grants by {@code access_role_datasource}; these two methods remain only until the legacy admin
++ * matrix is replaced (task 5.5), and must not gain new callers.
+  */
+ @Repository
+ public class AccessRepository {
+ 
+     private final DatabaseClient client;
+ 
+     /**
+      * Creates the repository.
+      *
+      * @param client the R2DBC database client
+@@ -27,38 +32,44 @@ public class AccessRepository {
+     public AccessRepository(DatabaseClient client) {
+         this.client = client;
+     }
+ 
+     /** One {@code user_scope} row. */
+     public record ScopeRow(String scopeType, String scopeValue) {}
+ 
+     /**
+      * Reads every scope attribute of a user.
+      *
++     * <p>TODO(task 5.5): legacy {@code user_scope} read; enforcement uses {@code
++     * R2dbcAccessControlRepository.principal} instead.
++     *
+      * @param userId the user id
+      * @return the scope rows, in insertion order
+      */
+     public Mono<List<ScopeRow>> scopes(String userId) {
+         return client.sql("SELECT scope_type, scope_value FROM user_scope WHERE user_id = :userId")
+                 .bind("userId", userId)
+                 .map(
+                         (row, meta) ->
+                                 new ScopeRow(
+                                         row.get("scope_type", String.class),
+                                         row.get("scope_value", String.class)))
+                 .all()
+                 .collectList();
+     }
+ 
+     /**
+      * Reads the datasources a role is allowed to query.
+      *
++     * <p>TODO(task 5.5): legacy {@code datasource_access} read; enforcement uses {@code
++     * access_role_datasource} via {@code R2dbcAccessControlRepository.datasourceIds}.
++     *
+      * @param role the canonical role
+      * @return the allowed datasource ids
+      */
+     public Mono<Set<String>> datasourcesForRole(String role) {
+         return client.sql("SELECT datasource_id FROM datasource_access WHERE role = :role")
+                 .bind("role", role)
+                 .map((row, meta) -> row.get("datasource_id", String.class))
+                 .all()
+                 .collectList()
+                 .map(LinkedHashSet::new);
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java
+index 16a7ae3..880843d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java
+@@ -77,30 +77,20 @@ public record DataScope(
+         return new DataScope(
+                 access.userId(),
+                 role,
+                 principal == null ? Set.of() : principal.classIds(),
+                 principal == null ? null : principal.studentId(),
+                 principal == null ? null : principal.studentNo(),
+                 access.datasourceIds(),
+                 access);
+     }
+ 
+-    /**
+-     * Creates an unrestricted scope for an administrator.
+-     *
+-     * @param userId the admin user id
+-     * @return the admin scope, without a resolved access (fails closed at the enforcement points)
+-     */
+-    public static DataScope admin(String userId) {
+-        return new DataScope(userId, Roles.ADMIN, Set.of(), null, null, Set.of());
+-    }
+-
+     /**
+      * Reports whether this scope bypasses table, row and datasource restrictions.
+      *
+      * @return {@code true} when the resolved access holds the bypass permission
+      */
+     public boolean bypassesDataScope() {
+         return access != null && access.bypassesDataScope();
+     }
+ 
+     /** @return {@code true} when the caller bypasses data-scope filtering */
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java
+index 271466b..639ca15 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java
+@@ -11,22 +11,22 @@ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Resolves the data scope for a request from the caller's id and token version.
+  *
+  * <p>The scope is a projection of the database-configured effective access ({@link
+  * AccessContextResolver}). Authorization therefore follows the account's roles and policies, not the
+  * token's role claim: an account whose roles were changed after the token was issued is scoped by
+  * its current roles, while an unrecognized claim still fails closed early.
+  *
+  * <p>Fails closed: an unrecognized role claim, a disabled or unknown account, a stale or missing
+- * token version, or an account without usable roles is rejected instead of being handed an empty or
+- * unrestricted scope.
++ * token version, an account without usable roles, or a scope whose policies cannot be evaluated is
++ * rejected instead of being handed an empty or unrestricted scope.
+  */
+ @Service
+ public class DataScopeResolver {
+ 
+     private static final String MISSING_SCOPE = "未配置数据范围，请联系管理员";
+ 
+     private final AccessContextResolver access;
+ 
+     /**
+      * Creates the resolver.
+@@ -42,33 +42,23 @@ public class DataScopeResolver {
+      *
+      * @param userId the authenticated user id
+      * @param role the raw role claim; an unrecognized non-null claim is rejected early
+      * @param tokenVersion the token's {@code ver} claim; {@code null} fails closed
+      * @return the resolved scope, or an error when the account has no usable access
+      */
+     public Mono<DataScope> resolve(String userId, String role, Integer tokenVersion) {
+         if (role != null && Roles.normalize(role) == null) {
+             return Mono.error(denied("当前账号没有可识别的角色，无法确定数据范围"));
+         }
+-        return access.resolve(userId, tokenVersion).map(DataScope::from).map(DataScopeResolver::requireUsable);
+-    }
+-
+-    /**
+-     * Resolves the caller's scope without a token version. Kept for sources that have not migrated;
+-     * it fails closed because the access resolver rejects a {@code null} token version.
+-     *
+-     * @param userId the authenticated user id
+-     * @param role the raw role claim
+-     * @return the resolved scope, or an error
+-     */
+-    public Mono<DataScope> resolve(String userId, String role) {
+-        return resolve(userId, role, null);
++        return access.resolve(userId, tokenVersion)
++                .map(DataScope::from)
++                .map(DataScopeResolver::requireUsable);
+     }
+ 
+     /**
+      * Rejects a scope that carries no usable data policy, or whose {@code FILTER} rules reference a
+      * principal value the caller does not have. Such a configuration cannot be evaluated, so the
+      * request is denied instead of being run against a wider (or empty) result set.
+      *
+      * @param scope the projected scope
+      * @return the unchanged scope when usable
+      */
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java
+index 5ec0c9d..4896481 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java
+@@ -113,22 +113,26 @@ public class TablePolicy {
+         if (decision.denied()) {
+             throw new SqlPermissionException("表 " + table + " 不在当前数据范围内");
+         }
+         if (decision.filtered()) {
+             return decision.predicates();
+         }
+         return List.of();
+     }
+ 
+     /**
+-     * Resolves the datasource a request targets. A {@code null} id means "the default": the single
+-     * effective grant, if there is exactly one. Anything else denies.
++     * Compatibility fallback for callers that do not know the resolved datasource. A {@code null} or
++     * blank id means "the default": the single effective grant, if there is exactly one. Anything
++     * else denies.
++     *
++     * <p>Enforcement call sites (the pipeline and the agent tools) pass the datasource they resolved
++     * themselves, so a caller granted several datasources is not mistaken for an unscoped one.
+      *
+      * @param scope the caller's scope
+      * @param datasourceId the requested datasource id, or {@code null}
+      * @return the datasource id, or {@code null} when it cannot be determined
+      */
+     public String datasourceId(DataScope scope, String datasourceId) {
+         if (scope == null || scope.access() == null) {
+             return null;
+         }
+         if (datasourceId != null && !datasourceId.isBlank()) {
+@@ -141,13 +145,19 @@ public class TablePolicy {
+     }
+ 
+     private PolicyDecision decide(DataScope scope, String datasourceId, String table) {
+         if (scope == null || scope.access() == null) {
+             return PolicyDecision.deny();
+         }
+         String name = table == null ? null : table.toLowerCase(Locale.ROOT);
+         if (!DataScopePolicyEngine.isSafeTable(name)) {
+             return PolicyDecision.deny();
+         }
+-        return engine.decide(scope.access(), datasourceId(scope, datasourceId), name);
++        // An explicitly supplied id is authoritative: it is the datasource the statement runs
++        // against. Only fall back to the single-grant guess when the caller supplied none.
++        String effective =
++                datasourceId != null && !datasourceId.isBlank()
++                        ? datasourceId
++                        : datasourceId(scope, null);
++        return engine.decide(scope.access(), effective, name);
+     }
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/service/DatasourceAccessService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/service/DatasourceAccessService.java
+index ce4c91d..abbfaa0 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/service/DatasourceAccessService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/service/DatasourceAccessService.java
+@@ -50,44 +50,51 @@ public class DatasourceAccessService {
+      *
+      * @return the matrix
+      */
+     public Mono<DatasourceAccessMatrix> matrix() {
+         return access.grants().map(this::build);
+     }
+ 
+     /**
+      * Grants a role access to a datasource, then returns the new matrix.
+      *
++     * <p>Ordered so a mid-way failure can only ever leave enforcement <em>narrower</em> than the
++     * matrix: the legacy row is written first, then the enforcement row.
++     *
+      * @param role the role
+      * @param datasourceId the datasource id
+      * @return the matrix
+      */
+     public Mono<DatasourceAccessMatrix> grant(String role, String datasourceId) {
+         String canonical = requireRole(role);
+         requireDatasource(datasourceId);
+         return access.grant(canonical, datasourceId)
+                 .then(accessControl.grantDatasourceByCode(canonical, datasourceId))
+                 .then(matrix());
+     }
+ 
+     /**
+      * Revokes a role's access to a datasource, then returns the new matrix.
+      *
++     * <p>Ordered the opposite way from {@link #grant}: the enforcement row is deleted <em>first</em>,
++     * so a mid-way failure can only leave enforcement narrower than the matrix, never wider.
++     *
+      * @param role the role
+      * @param datasourceId the datasource id
+      * @return the matrix
+      */
+     public Mono<DatasourceAccessMatrix> revoke(String role, String datasourceId) {
+         String canonical = requireRole(role);
+         requireDatasource(datasourceId);
+-        return access.revoke(canonical, datasourceId)
+-                .then(accessControl.revokeDatasourceByCode(canonical, datasourceId))
++        return accessControl
++                .revokeDatasourceByCode(canonical, datasourceId)
++                .then(access.revoke(canonical, datasourceId))
+                 .then(matrix());
+     }
+ 
+     private DatasourceAccessMatrix build(List<RoleGrant> grants) {
+         String defaultId = registry.defaultId();
+         List<DatasourceAccessView> datasources =
+                 registry.definitions().stream()
+                         .map(
+                                 definition ->
+                                         new DatasourceAccessView(
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java
+index 8486cd3..589ffac 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java
+@@ -1,12 +1,14 @@
+ package com.nekocong.text2sql.service;
+ 
++import com.nekocong.text2sql.access.DataScopePolicy;
++import com.nekocong.text2sql.access.PrincipalAttribute;
+ import com.nekocong.text2sql.config.BlockingSchedulerConfig;
+ import com.nekocong.text2sql.datasource.DataSourceRegistry;
+ import com.nekocong.text2sql.datasource.DatasourceAccessGuard;
+ import com.nekocong.text2sql.gbi.ChartInference;
+ import com.nekocong.text2sql.knowledge.schema.CitationAwareSchemaProvider;
+ import com.nekocong.text2sql.knowledge.schema.SchemaRetrieval;
+ import com.nekocong.text2sql.modelconfig.ModelResolver;
+ import com.nekocong.text2sql.nl2sql.ChartEvent;
+ import com.nekocong.text2sql.nl2sql.CitationEvent;
+ import com.nekocong.text2sql.nl2sql.ExecutionListener;
+@@ -15,21 +17,25 @@ import com.nekocong.text2sql.nl2sql.SqlEvent;
+ import com.nekocong.text2sql.nl2sql.SqlGeneration;
+ import com.nekocong.text2sql.nl2sql.SqlGenerationService;
+ import com.nekocong.text2sql.nl2sql.StepEvent;
+ import com.nekocong.text2sql.nl2sql.Text2SqlEvent;
+ import com.nekocong.text2sql.nl2sql.Text2SqlResult;
+ import com.nekocong.text2sql.schema.SchemaProvider;
+ import com.nekocong.text2sql.security.DataScope;
+ import com.nekocong.text2sql.sql.DataScopeRewriter;
+ import com.nekocong.text2sql.sql.SqlExecutor;
+ import com.nekocong.text2sql.sql.SqlSafetyValidator;
++import java.util.LinkedHashSet;
+ import java.util.List;
++import java.util.Optional;
++import java.util.Set;
++import java.util.stream.Collectors;
+ import org.springframework.beans.factory.ObjectProvider;
+ import org.springframework.stereotype.Service;
+ import reactor.core.publisher.Flux;
+ import reactor.core.publisher.Mono;
+ import reactor.core.scheduler.Scheduler;
+ import reactor.core.scheduler.Schedulers;
+ 
+ /**
+  * The deterministic NL2SQL pipeline: schema grounding → SQL generation → safety validation → data
+  * permission rewrite → read-only execution → chart inference.
+@@ -230,40 +236,40 @@ public class Text2SqlPipelineService {
+                 })
+                 .doOnError(error -> listener.onFailure(null, errorMessage(error)));
+     }
+ 
+     private Flux<Text2SqlEvent> toEvents(
+             String id,
+             String dialect,
+             SqlGeneration generation,
+             DataScope scope,
+             ExecutionListener listener) {
+-        String safeSql = enforce(generation.sql(), scope);
++        String safeSql = enforce(generation.sql(), id, scope);
+         return Flux.concat(
+                 Flux.just(new SqlEvent(id, dialect, safeSql, scopedExplanation(generation.explanation(), scope))),
+                 Flux.just(new StepEvent("execute", "执行只读查询")),
+                 sqlExecutor
+                         .execute(id, safeSql)
+                         .doOnNext(rows -> listener.onSuccess(id, safeSql, rows.rowCount()))
+                         .flatMapMany(
+                                 rows ->
+                                         Flux.just(
+                                                 new RowsEvent(rows), new ChartEvent(chartInference.infer(rows)))));
+     }
+ 
+     private Mono<Text2SqlResult> execute(
+             String id,
+             String dialect,
+             SqlGeneration generation,
+             DataScope scope,
+             ExecutionListener listener) {
+-        String safeSql = enforce(generation.sql(), scope);
++        String safeSql = enforce(generation.sql(), id, scope);
+         return sqlExecutor
+                 .execute(id, safeSql)
+                 .doOnNext(rows -> listener.onSuccess(id, safeSql, rows.rowCount()))
+                 .map(
+                         result ->
+                                 new Text2SqlResult(
+                                         id,
+                                         dialect,
+                                         safeSql,
+                                         scopedExplanation(generation.explanation(), scope),
+@@ -272,57 +278,87 @@ public class Text2SqlPipelineService {
+     }
+ 
+     private static String errorMessage(Throwable error) {
+         String message = error.getMessage();
+         return (message == null || message.isBlank()) ? error.getClass().getSimpleName() : message;
+     }
+ 
+     /**
+      * Validates then rewrites: the statement that is shown to the user and executed is the enforced
+      * one, never the raw model output.
++     *
++     * @param sql the generated SQL
++     * @param datasourceId the already-resolved datasource the SQL will run against
++     * @param scope the caller's data scope
++     * @return the enforced SQL
+      */
+-    private String enforce(String sql, DataScope scope) {
++    private String enforce(String sql, String datasourceId, DataScope scope) {
+         String safeSql = safetyValidator.validateAndNormalize(sql);
+-        String rewritten = rewriter.rewrite(safeSql, scope);
++        String rewritten = rewriter.rewrite(safeSql, scope, datasourceId);
+         // Defense in depth: the serialized rewrite must still be a single read-only statement.
+         return safetyValidator.validateAndNormalize(rewritten);
+     }
+ 
+     /**
+      * Appends a data-scope note so the answer states the restriction instead of silently returning a
+      * narrower result (see the "越界问题的回答语义" requirement).
++     *
++     * <p>The label comes from the effective {@code FILTER} attributes, never the role name, so a
++     * custom role is described by what its policies actually do.
+      */
+-    private static String scopedExplanation(String explanation, DataScope scope) {
++    static String scopedExplanation(String explanation, DataScope scope) {
+         if (scope == null || scope.bypassesDataScope()) {
+             return explanation;
+         }
+-        String scopeText = scope.isStudent() ? "仅本人" : "所管班级";
+-        String note = "结果已按当前账号的数据范围（" + scopeText + "）过滤";
++        String note = "结果已按当前账号的数据范围（" + scopeLabel(scope) + "）过滤";
+         return (explanation == null || explanation.isBlank()) ? note : explanation + "（" + note + "）";
+     }
+ 
++    /** Labels the effective filter: personal rows, managed classes, or the generic policy wording. */
++    private static String scopeLabel(DataScope scope) {
++        Set<PrincipalAttribute> attributes =
++                scope.access() == null
++                        ? Set.of()
++                        : scope.access().dataScopes().stream()
++                                .filter(rule -> rule.policy() == DataScopePolicy.FILTER)
++                                .map(rule -> PrincipalAttribute.fromCode(rule.principalAttribute()))
++                                .flatMap(Optional::stream)
++                                .collect(Collectors.toCollection(LinkedHashSet::new));
++        if (attributes.contains(PrincipalAttribute.STUDENT_NO)
++                || attributes.contains(PrincipalAttribute.STUDENT_ID)) {
++            return "仅本人";
++        }
++        if (attributes.contains(PrincipalAttribute.CLASS_IDS)) {
++            return "所管班级";
++        }
++        return "当前数据范围";
++    }
++
+     /**
+      * Describes the caller to the generation model, so first-person questions resolve to the
+      * caller's own identifiers instead of being guessed from the question text.
+      *
+      * <p>The wording is derived from the resolved access: a bypass (administrator) is unrestricted;
+      * otherwise the effective role display names are used with the caller's principal identifiers.
+      */
+     private static String callerContext(DataScope scope) {
+         if (scope == null || scope.access() == null) {
+             return "当前账号未解析出数据范围，只能看到空结果。";
+         }
+         if (scope.bypassesDataScope()) {
+             return "管理员：可见全部数据，不需要按调用者过滤。";
+         }
+         List<String> roleNames = scope.access().roles().stream().map(role -> role.name()).toList();
+-        String description = roleNames.isEmpty() ? scope.access().roleCodes().toString() : String.join("、", roleNames);
++        String description =
++                roleNames.isEmpty()
++                        ? scope.access().roleCodes().toString()
++                        : String.join("、", roleNames);
+         StringBuilder context = new StringBuilder(description).append("：");
+         if (scope.studentNo() != null) {
+             context.append("本人学号 ")
+                     .append(scope.studentNo())
+                     .append("，所属班级 id ")
+                     .append(scope.classIds().stream().sorted().toList())
+                     .append("。问题中的“我/我的”指该学生本人，用 student_no = '")
+                     .append(scope.studentNo())
+                     .append("' 过滤。");
+         } else if (!scope.classIds().isEmpty()) {
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java
+index bc67a04..89ead1f 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java
+@@ -58,211 +58,220 @@ public class DataScopeRewriter {
+      *
+      * @param policy the table/row policy
+      */
+     public DataScopeRewriter(TablePolicy policy) {
+         this.policy = policy;
+     }
+ 
+     /**
+      * Rewrites a statement for the caller's scope.
+      *
+-     * @param sql   the validated, read-only SQL
++     * @param sql the validated, read-only SQL
+      * @param scope the caller's scope
++     * @param datasourceId the datasource the statement will run against
+      * @return the enforced SQL (identical to the input for admins)
+      * @throws SqlPermissionException when the query cannot be safely scoped
+      */
+-    public String rewrite(String sql, DataScope scope) {
++    public String rewrite(String sql, DataScope scope, String datasourceId) {
+         if (scope != null && scope.bypassesDataScope()) {
+             return sql;
+         }
+         Statement statement;
+         try {
+             statement = CCJSqlParserUtil.parse(sql);
+         } catch (Exception ex) {
+             throw new SqlPermissionException("无法解析 SQL，已拒绝执行以保护数据范围", ex);
+         }
+         if (!(statement instanceof Select select)) {
+             throw new SqlPermissionException("只支持单条只读查询");
+         }
+         try {
+-            rewriteSelect(select, scope, new HashSet<>());
++            rewriteSelect(select, scope, datasourceId, new HashSet<>());
+             return select.toString();
+         } catch (SqlPermissionException ex) {
+             throw ex;
+         } catch (RuntimeException ex) {
+             throw new SqlPermissionException("无法应用数据权限，已拒绝执行", ex);
+         }
+     }
+ 
+-    private void rewriteSelect(Select select, DataScope scope, Set<String> inheritedCtes) {
++    private void rewriteSelect(
++            Select select, DataScope scope, String datasourceId, Set<String> inheritedCtes) {
+         Set<String> ctes = new HashSet<>(inheritedCtes);
+         List<WithItem> withItems = select.getWithItemsList();
+         if (withItems != null) {
+             for (WithItem item : withItems) {
+                 if (item.getAlias() != null && item.getAlias().getName() != null) {
+                     ctes.add(item.getAlias().getName().toLowerCase(Locale.ROOT));
+                 }
+             }
+             for (WithItem item : withItems) {
+-                rewriteSelect(item.getSelect(), scope, ctes);
++                rewriteSelect(item.getSelect(), scope, datasourceId, ctes);
+             }
+         }
+ 
+         switch (select) {
+-            case PlainSelect plain -> rewritePlainSelect(plain, scope, ctes);
++            case PlainSelect plain -> rewritePlainSelect(plain, scope, datasourceId, ctes);
+             case SetOperationList setOperation -> {
+                 for (Select branch : setOperation.getSelects()) {
+-                    rewriteSelect(branch, scope, ctes);
++                    rewriteSelect(branch, scope, datasourceId, ctes);
+                 }
+-                rewriteOrderBy(setOperation.getOrderByElements(), scope, ctes);
++                rewriteOrderBy(setOperation.getOrderByElements(), scope, datasourceId, ctes);
+             }
+             case ParenthesedSelect parenthesed -> {
+-                rewriteSelect(parenthesed.getSelect(), scope, ctes);
+-                rewriteOrderBy(parenthesed.getOrderByElements(), scope, ctes);
++                rewriteSelect(parenthesed.getSelect(), scope, datasourceId, ctes);
++                rewriteOrderBy(parenthesed.getOrderByElements(), scope, datasourceId, ctes);
+             }
+             case Values _ ->
+                 // A VALUES list can carry scalar subqueries; rejecting it keeps enforcement total.
+                     throw new SqlPermissionException("不支持 VALUES 查询，无法应用数据权限");
+             default -> throw new SqlPermissionException("不支持该查询结构，无法应用数据权限");
+         }
+     }
+ 
+-    private void rewritePlainSelect(PlainSelect select, DataScope scope, Set<String> ctes) {
++    private void rewritePlainSelect(
++            PlainSelect select, DataScope scope, String datasourceId, Set<String> ctes) {
+         if (select.getIntoTables() != null && !select.getIntoTables().isEmpty()) {
+             throw new SqlPermissionException("不支持 SELECT ... INTO，已拒绝执行");
+         }
+         Set<String> aliases = new HashSet<>();
+-        select.setFromItem(rewriteFromItem(select.getFromItem(), scope, ctes, aliases));
++        select.setFromItem(rewriteFromItem(select.getFromItem(), scope, datasourceId, ctes, aliases));
+ 
+         List<Join> joins = select.getJoins();
+         if (joins != null) {
+             for (Join join : joins) {
+-                join.setRightItem(rewriteFromItem(join.getRightItem(), scope, ctes, aliases));
++                join.setRightItem(rewriteFromItem(join.getRightItem(), scope, datasourceId, ctes, aliases));
+                 if (join.getOnExpressions() != null) {
+                     for (Expression on : join.getOnExpressions()) {
+-                        rewriteExpression(on, scope, ctes);
++                        rewriteExpression(on, scope, datasourceId, ctes);
+                     }
+                 }
+             }
+         }
+ 
+-        rewriteExpression(select.getWhere(), scope, ctes);
+-        rewriteExpression(select.getHaving(), scope, ctes);
++        rewriteExpression(select.getWhere(), scope, datasourceId, ctes);
++        rewriteExpression(select.getHaving(), scope, datasourceId, ctes);
+         for (SelectItem<?> item : select.getSelectItems()) {
+-            rewriteExpression(item.getExpression(), scope, ctes);
++            rewriteExpression(item.getExpression(), scope, datasourceId, ctes);
+         }
+         if (select.getGroupBy() != null) {
+-            rewriteExpression(select.getGroupBy().getGroupByExpressionList(), scope, ctes);
++            rewriteExpression(select.getGroupBy().getGroupByExpressionList(), scope, datasourceId, ctes);
+         }
+-        rewriteOrderBy(select.getOrderByElements(), scope, ctes);
++        rewriteOrderBy(select.getOrderByElements(), scope, datasourceId, ctes);
+     }
+ 
+     private void rewriteOrderBy(
+-            List<OrderByElement> orderByElements, DataScope scope, Set<String> ctes) {
++            List<OrderByElement> orderByElements,
++            DataScope scope,
++            String datasourceId,
++            Set<String> ctes) {
+         if (orderByElements == null) {
+             return;
+         }
+         for (OrderByElement order : orderByElements) {
+-            rewriteExpression(order.getExpression(), scope, ctes);
++            rewriteExpression(order.getExpression(), scope, datasourceId, ctes);
+         }
+     }
+ 
+     private FromItem rewriteFromItem(
+-            FromItem item, DataScope scope, Set<String> ctes, Set<String> aliases) {
++            FromItem item,
++            DataScope scope,
++            String datasourceId,
++            Set<String> ctes,
++            Set<String> aliases) {
+         switch (item) {
+             case null -> {
+                 return null;
+             }
+             case Table table -> {
+-                return rewriteTable(table, scope, ctes, aliases);
++                return rewriteTable(table, scope, datasourceId, ctes, aliases);
+             }
+             case ParenthesedSelect parenthesed -> {
+                 // Pass the parenthesized select itself: its own ORDER BY / WITH list must be visited too.
+-                rewriteSelect(parenthesed, scope, ctes);
++                rewriteSelect(parenthesed, scope, datasourceId, ctes);
+                 return item;
+             }
+             case ParenthesedFromItem parenthesed -> {
+-                parenthesed.setFromItem(rewriteFromItem(parenthesed.getFromItem(), scope, ctes, aliases));
++                parenthesed.setFromItem(rewriteFromItem(parenthesed.getFromItem(), scope, datasourceId, ctes, aliases));
+                 if (parenthesed.getJoins() != null) {
+                     for (Join join : parenthesed.getJoins()) {
+-                        join.setRightItem(rewriteFromItem(join.getRightItem(), scope, ctes, aliases));
++                        join.setRightItem(rewriteFromItem(join.getRightItem(), scope, datasourceId, ctes, aliases));
+                         if (join.getOnExpressions() != null) {
+                             for (Expression on : join.getOnExpressions()) {
+-                                rewriteExpression(on, scope, ctes);
++                                rewriteExpression(on, scope, datasourceId, ctes);
+                             }
+                         }
+                     }
+                 }
+                 return item;
+             }
+             default -> {
+             }
+         }
+         throw new SqlPermissionException("不支持该表引用形式，无法应用数据权限");
+     }
+ 
+     private FromItem rewriteTable(
+-            Table table, DataScope scope, Set<String> ctes, Set<String> aliases) {
++            Table table, DataScope scope, String datasourceId, Set<String> ctes, Set<String> aliases) {
+         String name = table.getName() == null ? "" : table.getName().toLowerCase(Locale.ROOT);
+         if (ctes.contains(name)) {
+             return table;
+         }
+-        List<RowPredicate> predicates = policy.predicates(scope, null, name);
++        List<RowPredicate> predicates = policy.predicates(scope, datasourceId, name);
+ 
+         String declaredAlias =
+                 table.getAlias() != null ? table.getAlias().getName() : name;
+         if (declaredAlias == null || declaredAlias.isBlank()) {
+             declaredAlias = "t";
+         }
+         if (predicates.isEmpty()) {
+             register(declaredAlias, aliases);
+             return table;
+         }
+ 
+         String alias = uniqueAlias(declaredAlias, aliases);
+         register(alias, aliases);
+ 
+         Table source = new Table(table.getFullyQualifiedName());
+         source.setAlias(null);
+         PlainSelect inner = new PlainSelect();
+         inner.addSelectItems(new AllColumns());
+         inner.setFromItem(source);
+-        String predicate = renderPredicates(predicates, scope, table);
++        String predicate = renderPredicates(predicates, scope);
+         try {
+             inner.setWhere(CCJSqlParserUtil.parseCondExpression(predicate));
+         } catch (Exception ex) {
+             throw new SqlPermissionException("无法生成行过滤条件", ex);
+         }
+         ParenthesedSelect derived = new ParenthesedSelect();
+         derived.setSelect(inner);
+         derived.setAlias(new Alias(alias, true));
+         return derived;
+     }
+ 
+     /**
+      * Renders the OR of the caller's row predicates.
+      *
+      * <p>Each predicate's value comes from the principal attributes; a missing or empty value denies
+      * the query instead of producing a predicate that matches nothing (which would silently return an
+      * empty result) or, worse, everything.
+      */
+-    private static String renderPredicates(
+-            List<RowPredicate> predicates, DataScope scope, Table table) {
++    private static String renderPredicates(List<RowPredicate> predicates, DataScope scope) {
+         if (predicates.size() == 1) {
+-            return renderPredicate(predicates.get(0), scope, table);
++            return renderPredicate(predicates.get(0), scope);
+         }
+         return predicates.stream()
+-                .map(predicate -> "(" + renderPredicate(predicate, scope, table) + ")")
++                .map(predicate -> "(" + renderPredicate(predicate, scope) + ")")
+                 .collect(Collectors.joining(" OR "));
+     }
+ 
+-    private static String renderPredicate(RowPredicate predicate, DataScope scope, Table table) {
++    private static String renderPredicate(RowPredicate predicate, DataScope scope) {
+         String column = predicate.column();
+         if (!DataScopePolicyEngine.isSafeColumn(column)) {
+             throw new SqlPermissionException("行过滤列不安全，已拒绝执行：" + column);
+         }
+         PrincipalAttributes principal = scope.access().principal();
+         if (principal == null) {
+             throw new SqlPermissionException("当前账号缺少数据范围属性，无法应用数据权限");
+         }
+         PrincipalAttribute attribute = predicate.attribute();
+         if (attribute == null) {
+@@ -293,46 +302,51 @@ public class DataScopeRewriter {
+     }
+ 
+     private static String text(String value, PrincipalAttribute attribute) {
+         if (value == null || value.isBlank()) {
+             throw new SqlPermissionException(
+                     "当前账号缺少数据范围值（" + attribute.code() + "），无法应用数据权限");
+         }
+         return value;
+     }
+ 
+-    private static String quote(String value) {
+-        return "'" + value.replace("'", "''") + "'";
++    /**
++     * Renders a string literal. Backslashes are doubled first so a value such as {@code a\'} cannot
++     * re-open the literal or smuggle in a second statement on a MySQL-family parser, then quotes are
++     * doubled.
++     */
++    static String quote(String value) {
++        return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'";
+     }
+ 
+     private static String uniqueAlias(String requested, Set<String> aliases) {
+         String candidate = requested;
+         int suffix = 0;
+         while (aliases.contains(candidate.toLowerCase(Locale.ROOT))) {
+             suffix++;
+             candidate = requested + "_sp" + suffix;
+         }
+         return candidate;
+     }
+ 
+     private static void register(String alias, Set<String> aliases) {
+         if (alias != null) {
+             aliases.add(alias.toLowerCase(Locale.ROOT));
+         }
+     }
+ 
+-    private void rewriteExpression(Expression expression, DataScope scope, Set<String> ctes) {
++    private void rewriteExpression(Expression expression, DataScope scope, String datasourceId, Set<String> ctes) {
+         if (expression == null) {
+             return;
+         }
+         expression.accept(
+                 new ExpressionVisitorAdapter() {
+                     @Override
+                     public void visit(Select subSelect) {
+                         // ParenthesedSelect.accept(ExpressionVisitor) dispatches to visit(Select);
+                         // it does not call the visit(ParenthesedSelect) overload. Pass it through so
+                         // its inner select AND its own ORDER BY / WITH list are rewritten.
+-                        rewriteSelect(subSelect, scope, ctes);
++                        rewriteSelect(subSelect, scope, datasourceId, ctes);
+                     }
+                 });
+     }
+ }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/knowledge/service/KnowledgeSearchServiceTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/knowledge/service/KnowledgeSearchServiceTest.java
+index 0ccdeee..76e0fcd 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/knowledge/service/KnowledgeSearchServiceTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/knowledge/service/KnowledgeSearchServiceTest.java
+@@ -119,21 +119,20 @@ class KnowledgeSearchServiceTest {
+ 
+     @Test
+     void appliesTheCallersTableWhitelist() {
+         KnowledgeSearchService service = newService();
+         vectorStore.replaceChunks(
+                 item("item-x", KnowledgeType.BUSINESS, KnowledgeScope.DATASOURCE, "campus", null,
+                         "secret_salary", "薪资口径", "薪资统计口径说明"),
+                 List.of(chunk("c9", "item-x", null, "薪资统计口径说明", null, null, 0)));
+         DataScope student = AccessFixtures.student();
+ 
+-
+         SearchResult result = service.search(student, "campus", null, "薪资", 5);
+ 
+         assertThat(result.hits()).isEmpty();
+         assertThat(result.trace().finalTables()).isEmpty();
+         assertThat(result.trace().fallback()).isTrue();
+         assertThat(result.trace().fallbackReason()).isNotBlank();
+     }
+ 
+     @Test
+     void aScopeWithoutResolvedAccessRecallsNothing() {
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java
+index 2f71a57..37834c7 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java
+@@ -102,21 +102,22 @@ class DataScopeResolverTest {
+     void aMissingTokenVersionFailsClosed() {
+         String userId = account("student");
+         scope(userId, "class_id", "1");
+         scope(userId, "student_id", "1");
+         scope(userId, "student_no", "2023001");
+ 
+         assertThatThrownBy(() -> resolver.resolve(userId, "student", null).block())
+                 .isInstanceOf(ResponseStatusException.class)
+                 .satisfies(ex -> assertThat(((ResponseStatusException) ex).getStatusCode())
+                         .isEqualTo(HttpStatus.UNAUTHORIZED));
+-        assertThatThrownBy(() -> resolver.resolve(userId, "student").block())
++        // The 2-arg overload was removed so every caller must pass the token version.
++        assertThatThrownBy(() -> resolver.resolve(userId, "student", null).block())
+                 .isInstanceOf(ResponseStatusException.class);
+     }
+ 
+     @Test
+     void aStaleTokenVersionIsRejected() {
+         String userId = account("student");
+ 
+         assertThatThrownBy(() -> resolver.resolve(userId, "student", 99).block())
+                 .isInstanceOf(ResponseStatusException.class)
+                 .satisfies(ex -> assertThat(((ResponseStatusException) ex).getStatusCode())
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java
+index b91f1df..a7a3b65 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java
+@@ -257,18 +257,19 @@ class Text2SqlPipelineServiceTest {
+                                                     @Override
+                                                     public void onFailure(String ds, String message) {
+                                                         failure.set(message);
+                                                     }
+                                                 })
+                                         .block())
+                 .isInstanceOf(com.nekocong.text2sql.security.SqlPermissionException.class);
+         assertThat(failure.get()).contains("没有任何可用的数据源");
+     }
+ 
+-    private static int indexOf(List<Text2SqlEvent> events, Class<? extends Text2SqlEvent> type) {        for (int i = 0; i < events.size(); i++) {
++    private static int indexOf(List<Text2SqlEvent> events, Class<? extends Text2SqlEvent> type) {
++        for (int i = 0; i < events.size(); i++) {
+             if (type.isInstance(events.get(i))) {
+                 return i;
+             }
+         }
+         return -1;
+     }
+ }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPolicyEnforcementTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPolicyEnforcementTest.java
+index 0e572a0..8a5bc0d 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPolicyEnforcementTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPolicyEnforcementTest.java
+@@ -160,20 +160,35 @@ class Text2SqlPolicyEnforcementTest {
+                 new DataScope("u", "student", Set.of(1L), 1L, "2023001", Set.of("campus"));
+         Text2SqlPipelineService pipeline =
+                 pipelineReturning("SELECT student_no FROM student", executor, null);
+ 
+         assertThatThrownBy(() -> pipeline.runBlocking(legacy, "campus", "列出学号"))
+                 .isInstanceOf(SqlPermissionException.class);
+ 
+         assertThat(executor.calls.get()).isZero();
+     }
+ 
++    @Test
++    void theScopeNoteIsLabelledByTheEffectiveFilterNotTheRoleName() {
++        assertThat(Text2SqlPipelineService.scopedExplanation(null, AccessFixtures.student()))
++                .isEqualTo("结果已按当前账号的数据范围（仅本人）过滤");
++        assertThat(Text2SqlPipelineService.scopedExplanation(null, AccessFixtures.counselor()))
++                .isEqualTo("结果已按当前账号的数据范围（所管班级）过滤");
++        // username/userId rules are a policy the seeded roles never use: the generic wording applies.
++        DataScope byUsername = AccessFixtures.custom(
++                "auditor",
++                List.of(rule("a1", "campus", "student", DataScopePolicy.FILTER, "username", "username")),
++                Set.of());
++        assertThat(Text2SqlPipelineService.scopedExplanation(null, byUsername))
++                .isEqualTo("结果已按当前账号的数据范围（当前数据范围）过滤");
++    }
++
+     @Test
+     void aCustomRoleIsFilteredFromItsPolicyAndSaysSo() {
+         CountingExecutor executor = new CountingExecutor(realExecutor);
+         DataScope teacher = AccessFixtures.custom(
+                 "teacher",
+                 List.of(rule("t1", "campus", "score", DataScopePolicy.FILTER, "class_id", "classIds")),
+                 Set.of(1L, 3L));
+         Text2SqlPipelineService pipeline =
+                 pipelineReturning("SELECT class_id FROM score", executor, null);
+ 
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java
+index 44c2eee..f003895 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java
+@@ -26,21 +26,21 @@ class DataPermissionIntegrationTest {
+     private DataScopeRewriter rewriter;
+ 
+     @Autowired
+     private SqlSafetyValidator safetyValidator;
+ 
+     @Autowired
+     private SqlExecutor executor;
+ 
+     private QueryResult run(String sql, DataScope scope) {
+         String safe = safetyValidator.validateAndNormalize(sql);
+-        return executor.executeBlocking("campus", rewriter.rewrite(safe, scope));
++        return executor.executeBlocking("campus", rewriter.rewrite(safe, scope, "campus"));
+     }
+ 
+     @Test
+     void studentOnlySeesItselfEvenWithoutAWhereClause() {
+         QueryResult result = run("SELECT student_no, name FROM student", studentScope());
+ 
+         assertThat(result.rowCount()).isEqualTo(1);
+         assertThat(result.rows().get(0)).containsEntry("student_no", "2023001");
+     }
+ 
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java
+index 6e79f1e..5d3fdd5 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java
+@@ -43,268 +43,326 @@ class DataScopeRewriterTest {
+     private static DataScope customTeacher() {
+         return AccessFixtures.custom(
+                 "teacher",
+                 List.of(rule("t-score", CAMPUS, "score", DataScopePolicy.FILTER, "class_id", "classIds"),
+                         rule("t-course", CAMPUS, "course", DataScopePolicy.ALL, null, null)),
+                 Set.of(1L));
+     }
+ 
+     @Test
+     void filtersATableWithoutAlias() {
+-        String sql = rewriter.rewrite("SELECT student_no FROM student", student());
++        String sql = rewriter.rewrite("SELECT student_no FROM student", student(), CAMPUS);
+ 
+         assertThat(sql).containsIgnoringCase("student_no IN ('2023001')");
+         assertThat(compact(sql)).contains(") as student");
+         assertThat(compact(sql)).doesNotContain("_sp2");
+     }
+ 
+     @Test
+     void filtersJoinSidesAndKeepsAliases() {
+         String sql =
+                 rewriter.rewrite(
+                         "SELECT s.name, avg(sc.score) FROM score sc JOIN student s ON s.id = sc.student_id "
+                                 + "GROUP BY s.name",
+-                        student());
++                        student(),
++                        CAMPUS);
+ 
+         assertThat(sql).containsIgnoringCase("AS sc").containsIgnoringCase("AS s");
+         assertThat(sql).containsIgnoringCase("student_id IN (1)");
+         assertThat(sql).containsIgnoringCase("student_no IN ('2023001')");
+     }
+ 
+     @Test
+     void filtersEveryBranchOfAUnion() {
+         String sql =
+                 rewriter.rewrite(
+-                        "SELECT student_no FROM student UNION SELECT student_no FROM student", student());
++                        "SELECT student_no FROM student UNION SELECT student_no FROM student", student(), CAMPUS);
+ 
+         assertThat(countOccurrences(sql.toLowerCase(), "student_no in ('2023001')")).isEqualTo(2);
+     }
+ 
+     @Test
+     void filtersSubqueriesInsideExpressions() {
+         String sql =
+                 rewriter.rewrite(
+                         "SELECT name FROM student WHERE class_id IN (SELECT class_id FROM student)",
+-                        student());
++                        student(),
++                        CAMPUS);
+ 
+         assertThat(countOccurrences(sql, "SELECT * FROM student")).isEqualTo(2);
+     }
+ 
+     @Test
+     void rewritesCteBodiesButLeavesCteReferencesAlone() {
+         String sql =
+                 rewriter.rewrite(
+-                        "WITH x AS (SELECT * FROM score) SELECT * FROM x", student());
++                        "WITH x AS (SELECT * FROM score) SELECT * FROM x", student(), CAMPUS);
+ 
+         assertThat(sql).containsIgnoringCase("student_id IN (1)");
+         // The outer reference is a CTE, not a physical table, so it must not be wrapped again.
+         assertThat(sql).doesNotContainIgnoringCase("AS x");
+     }
+ 
+     @Test
+     void counselorFiltersByManagedClasses() {
+         String sql =
+-                rewriter.rewrite("SELECT class_id, count(*) FROM score GROUP BY class_id", counselor());
++                rewriter.rewrite("SELECT class_id, count(*) FROM score GROUP BY class_id", counselor(), CAMPUS);
+ 
+         assertThat(compact(sql)).contains("class_id in (1,2)");
+         assertThat(compact(sql)).doesNotContain("student_id in");
+     }
+ 
+     @Test
+     void adminStatementIsReturnedUnchanged() {
+         String sql = "SELECT * FROM student";
+ 
+-        assertThat(rewriter.rewrite(sql, admin())).isEqualTo(sql);
++        assertThat(rewriter.rewrite(sql, admin(), CAMPUS)).isEqualTo(sql);
+     }
+ 
+     @Test
+     void rejectsTablesOutsideTheWhitelist() {
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM salary", student()))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM salary", student(), CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("salary");
+     }
+ 
+     @Test
+     void rejectsUnparsableSql() {
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT FROM", student()))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT FROM", student(), CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class);
+     }
+ 
+     @Test
+     void filtersExistsSubqueries() {
+         String sql =
+                 rewriter.rewrite(
+-                        "SELECT name FROM student WHERE EXISTS (SELECT 1 FROM score)", student());
++                        "SELECT name FROM student WHERE EXISTS (SELECT 1 FROM score)", student(), CAMPUS);
+ 
+         assertThat(compact(sql)).contains("student_id in (1)");
+         assertThat(compact(sql)).contains("student_no in ('2023001')");
+     }
+ 
+     @Test
+     void rewritesParenthesizedSelectOrderBy() {
+         String sql =
+                 rewriter.rewrite(
+                         "SELECT (SELECT student_no FROM student ORDER BY (SELECT MAX(score) FROM score)) FROM student",
+-                        student());
++                        student(),
++                        CAMPUS);
+ 
+         assertThat(compact(sql)).contains("student_id in (1)");
+     }
+ 
+     @Test
+     void rejectsValuesQueries() {
+         assertThatThrownBy(
+-                        () -> rewriter.rewrite("WITH v AS (VALUES (1)) SELECT * FROM v", student()))
++                        () -> rewriter.rewrite("WITH v AS (VALUES (1)) SELECT * FROM v", student(), CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("VALUES");
+     }
+ 
+     @Test
+     void rejectsNonWhitelistedTablesInsideExistsSubqueries() {
+         assertThatThrownBy(
+                         () ->
+                                 rewriter.rewrite(
+                                         "SELECT name FROM student WHERE EXISTS (SELECT 1 FROM salary)",
+-                                        student()))
++                                        student(),
++                                        CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("salary");
+     }
+ 
+     @Test
+     void filtersOrderBySubqueriesOfSetOperations() {
+         String sql =
+                 rewriter.rewrite(
+                         "SELECT student_no FROM student UNION SELECT student_no FROM student "
+                                 + "ORDER BY (SELECT MAX(score) FROM score)",
+-                        student());
++                        student(),
++                        CAMPUS);
+ 
+         assertThat(compact(sql)).contains("student_id in (1)");
+     }
+ 
+     @Test
+     void rejectsNonWhitelistedTablesInsideSetOperationOrderBy() {
+         assertThatThrownBy(
+                         () ->
+                                 rewriter.rewrite(
+                                         "SELECT student_no FROM student UNION SELECT student_no FROM student "
+                                                 + "ORDER BY (SELECT score FROM salary)",
+-                                        student()))
++                                        student(),
++                                        CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("salary");
+     }
+ 
+     @Test
+     void rejectsSelectInto() {
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student INTO backup", student()))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student INTO backup", student(), CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class);
+     }
+ 
+     @Test
+     void rewritesNestedCteBodiesOnce() {
+         String sql =
+                 rewriter.rewrite(
+                         "WITH a AS (WITH b AS (SELECT * FROM score) SELECT * FROM b) SELECT * FROM a",
+-                        student());
++                        student(),
++                        CAMPUS);
+ 
+         assertThat(countOccurrences(compact(sql), "student_id in (1)")).isEqualTo(1);
+         assertThat(compact(sql)).doesNotContain("as b").doesNotContain("as a");
+     }
+ 
+     @Test
+     void givesRepeatedTableReferencesDistinctAliases() {
+-        String sql = rewriter.rewrite("SELECT 1 FROM student, student", student());
++        String sql = rewriter.rewrite("SELECT 1 FROM student, student", student(), CAMPUS);
+ 
+         assertThat(sql).containsIgnoringCase("AS student_sp1");
+     }
+ 
+     @Test
+     void aCustomRoleIsEnforcedFromItsPolicyNotItsName() {
+         // The role code "teacher" is unknown to the legacy code; only the DB policy can filter score.
+-        String sql = rewriter.rewrite("SELECT AVG(score) FROM score", customTeacher());
++        String sql = rewriter.rewrite("SELECT AVG(score) FROM score", customTeacher(), CAMPUS);
+ 
+         assertThat(compact(sql)).contains("class_id in (1)");
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", customTeacher()))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", customTeacher(), CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("student");
+     }
+ 
+     @Test
+     void orsEveryPredicateOfAFilteredTable() {
+         DataScope scope = AccessFixtures.custom(
+                 "reviewer",
+                 List.of(
+                         rule("r1", CAMPUS, "student", DataScopePolicy.FILTER, "student_no", "studentNo"),
+                         rule("r2", CAMPUS, "student", DataScopePolicy.FILTER, "class_id", "classIds")),
+                 Set.of(2L),
+                 "2023002",
+                 null);
+ 
+-        String sql = rewriter.rewrite("SELECT * FROM student", scope);
++        String sql = rewriter.rewrite("SELECT * FROM student", scope, CAMPUS);
+ 
+         assertThat(compact(sql)).contains("(student_no in ('2023002')) or (class_id in (2))");
+     }
+ 
+     @Test
+     void quotesValuesAndEscapesSingleQuotes() {
+         DataScope scope = AccessFixtures.custom(
+                 "o'brien",
+                 List.of(rule("u1", CAMPUS, "student", DataScopePolicy.FILTER, "username", "username")),
+                 Set.of());
+ 
+-        String sql = rewriter.rewrite("SELECT * FROM student", scope);
++        String sql = rewriter.rewrite("SELECT * FROM student", scope, CAMPUS);
+ 
+         assertThat(sql).contains("'o''brien'");
+     }
+ 
+     @Test
+     void aMissingPrincipalValueDeniesInsteadOfRunning() {
+         DataScope noStudentId = AccessFixtures.custom(
+                 "nograde",
+                 List.of(rule("g1", CAMPUS, "score", DataScopePolicy.FILTER, "student_id", "studentId")),
+                 Set.of(1L));
+ 
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noStudentId))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noStudentId, CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("studentId");    }
+ 
+     @Test
+     void anEmptyClassSetDeniesInsteadOfRunning() {
+         DataScope noClasses = AccessFixtures.custom(
+                 "noclass",
+                 List.of(rule("c1", CAMPUS, "score", DataScopePolicy.FILTER, "class_id", "classIds")),
+                 Set.of());
+ 
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noClasses))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM score", noClasses, CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class);
+     }
+ 
+     @Test
+     void aDeniedTableIsRejectedBeforeAnySqlIsProduced() {
+         DataScope denied = AccessFixtures.custom(
+                 "denied",
+                 List.of(rule("d1", CAMPUS, "student", DataScopePolicy.DENY, null, null)),
+                 Set.of(1L));
+ 
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT name FROM student", denied))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT name FROM student", denied, CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class)
+                 .hasMessageContaining("student");
+     }
+ 
+     @Test
+     void aScopeWithoutResolvedAccessIsRejected() {
+         DataScope legacy = new DataScope("u", "student", Set.of(1L), 1L, "2023001", Set.of(CAMPUS));
+ 
+-        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", legacy))
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT * FROM student", legacy, CAMPUS))
+                 .isInstanceOf(SqlPermissionException.class);
+     }
+ 
+-    private static String compact(String sql) {
+-        return sql.toLowerCase().replaceAll("\\s+", " ").replaceAll(",\\s*", ",");
++    @Test
++    void usesTheExplicitDatasourceIdForACallerWithSeveralGrants() {
++        // Two grants: the single-grant fallback cannot guess, so passing the resolved id is what
++        // makes the multi-datasource caller usable.
++        DataScope multi = multiGrantStudent();
++        TablePolicy policy = new TablePolicy();
++        assertThat(policy.visibleTables(multi, null)).isEmpty();
++        assertThatThrownBy(() -> policy.predicates(multi, null, "student"))
++                .isInstanceOf(SqlPermissionException.class);
++
++        String sql = rewriter.rewrite("SELECT student_no FROM student", multi, CAMPUS);
++
++        assertThat(sql).containsIgnoringCase("student_no IN ('2023001')");
++    }
++
++    @Test
++    void theExplicitDatasourceIdSelectsThatDatasourcesPolicies() {
++        // The student policies only exist for campus: the same caller is denied on the other grant.
++        DataScope multi = multiGrantStudent();
++
++        assertThatThrownBy(() -> rewriter.rewrite("SELECT student_no FROM student", multi, "archive"))
++                .isInstanceOf(SqlPermissionException.class)
++                .hasMessageContaining("student");
++    }
++
++    @Test
++    void escapesBackslashesAsWellAsQuotes() {
++        // The literal renderer is the single place a principal value becomes SQL text. A backslash is
++        // doubled so a following quote cannot be reinterpreted as an escape on a MySQL-family parser.
++        assertThat(DataScopeRewriter.quote("2023001")).isEqualTo("'2023001'");
++        assertThat(DataScopeRewriter.quote("o'brien")).isEqualTo("'o''brien'");
++        assertThat(DataScopeRewriter.quote("a\\")).isEqualTo("'a\\\\'");
++        assertThat(DataScopeRewriter.quote("a\\'b")).isEqualTo("'a\\\\''b'");
++    }
++
++    @Test
++    void anAdminIsUnrestrictedEvenOnAnUnknownDatasource() {
++        assertThat(rewriter.rewrite("SELECT * FROM student", admin(), "unknown")).isEqualTo(
++                "SELECT * FROM student");
++    }
++
++    private static DataScope multiGrantStudent() {
++        DataScope base = AccessFixtures.student();
++        return DataScope.from(new com.nekocong.text2sql.access.EffectiveAccess(
++                base.access().userId(),
++                base.access().roles(),
++                base.access().permissions(),
++                Set.of(CAMPUS, "archive"),
++                base.access().dataScopes(),
++                base.access().principal()));
++    }
++
++    private static String compact(String sql) {        return sql.toLowerCase().replaceAll("\\s+", " ").replaceAll(",\\s*", ",");
+     }
+ 
+     private static int countOccurrences(String text, String needle) {
+         int count = 0;
+         int index = 0;
+         String lowerText = text.toLowerCase();
+         String lowerNeedle = needle.toLowerCase();
+         while ((index = lowerText.indexOf(lowerNeedle, index)) >= 0) {
+             count++;
+             index += lowerNeedle.length();
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/TestAuth.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/TestAuth.java
+index c82e749..ab4e440 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/TestAuth.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/TestAuth.java
+@@ -45,29 +45,27 @@ final class TestAuth {
+                         .getResponseBody();
+         try {
+             return MAPPER.readTree(body).get("token").asText();
+         } catch (Exception ex) {
+             throw new IllegalStateException("Failed to parse login token", ex);
+         }
+     }
+ 
+     /** Reads the current user's id from {@code /api/auth/me}. */
+     static String currentUserId(WebTestClient client, String token) {
+-        var result =
++        String body =
+                 client.get()
+                         .uri("/api/auth/me")
+                         .header(org.springframework.http.HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                         .exchange()
++                        .expectStatus()
++                        .isOk()
+                         .expectBody(String.class)
+-                        .returnResult();
+-        String body = result.getResponseBody();
+-        if (body == null || body.isBlank()) {
+-            // Some suites assert on the rejection themselves; nothing to seed in that case.
+-            return "unresolved-" + UUID.randomUUID();
+-        }
++                        .returnResult()
++                        .getResponseBody();
+         try {
+             return MAPPER.readTree(body).get("id").asText();
+         } catch (Exception ex) {
+             throw new IllegalStateException("Failed to parse current user", ex);
+         }
+     }
+ }

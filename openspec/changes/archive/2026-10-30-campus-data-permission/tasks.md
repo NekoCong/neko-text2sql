@@ -2,7 +2,7 @@
 
 ## 1. 校园数据集与应用库模型
 
-- [x] 1.1 用校园域重写业务库种子：`text2sql-backend/src/main/resources/db/schema.sql`（`class` / `course` / `student` / `score` / `attendance`，过滤列索引，删除电商四表）与 `db/data.sql`（至少 3 个班、5 名学生含一组同班与一组异班、成绩与考勤，`score/attendance.class_id` 与所属学生一致）。验证：`mvnw.cmd test -Dtest=SeedDataScriptTest` 通过，且 H2 seed 后能内省出五张表、无 `orders/customers` 表。
+- [x] 1.1 用校园域重写业务库种子：`neko-text2sql-backend/src/main/resources/db/schema.sql`（`class` / `course` / `student` / `score` / `attendance`，过滤列索引，删除电商四表）与 `db/data.sql`（至少 3 个班、5 名学生含一组同班与一组异班、成绩与考勤，`score/attendance.class_id` 与所属学生一致）。验证：`mvnw.cmd test -Dtest=SeedDataScriptTest` 通过，且 H2 seed 后能内省出五张表、无 `orders/customers` 表。
 - [x] 1.2 扩展应用库 schema：`db/app-schema.sql` 新增 `user_scope(user_id, scope_type, scope_value)` 与 `datasource_access(role, datasource_id)`，并更新 `app_user.role` 注释为 `student|counselor|admin`。验证：测试 profile 启动时 H2 建表成功，新查询可读写两张表。
 - [x] 1.3 重写 `db/app-data.sql`：移除 `alice/bob/admin` 旧账号与电商会话；种子 `student01/student02/student03/counselor01/admin`，写入对应 `user_scope`（学生含 `class_id`+`student_id`+`student_no`，辅导员两条 `class_id`）、`datasource_access`（学生/辅导员 → `campus`，管理员无需记录），以及引用校园问题的示例会话。验证：`mvnw.cmd test -Dtest=SeedDataScriptTest` 通过；种子脚本可在空库重复执行不产生重复行。
 - [x] 1.4 默认数据源切换为 `campus`：更新 `application.yml`、`src/test/resources/application-test.yaml`、`docker-compose.yml`、`deploy/docker-compose.prod.yml`、`deploy/.env.example` 中的数据源 id、schema 名与说明。验证：启动后 `GET /api/text2sql/datasources` 的默认项为 `campus`，日志显示种子来源为校园脚本。

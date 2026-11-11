@@ -10,10 +10,10 @@
     </parent>
 
     <groupId>com.nekocong</groupId>
-    <artifactId>text2sql-backend</artifactId>
+    <artifactId>neko-text2sql-backend</artifactId>
     <version>0.0.1-SNAPSHOT</version>
-    <name>text2sql-backend</name>
-    <description>text2sql-backend - Java + AgentScope backend for the Text2SQL monorepo</description>
+    <name>neko-text2sql-backend</name>
+    <description>neko-text2sql-backend - Java + AgentScope backend for neko-text2sql</description>
 
     <properties>
         <java.version>25</java.version>

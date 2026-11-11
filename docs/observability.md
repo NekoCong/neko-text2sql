@@ -1,6 +1,6 @@
 # 可观测性指南（Health / Metrics / Traces）
 
-面向 `text2sql-backend` 与本地 `otel-lgtm` 监控栈的实操文档，包含**配置步骤**、
+面向 `neko-text2sql-backend` 与本地 `otel-lgtm` 监控栈的实操文档，包含**配置步骤**、
 **自定义 Health 端点**、**自定义 Metrics 端点**，以及本仓库踩过的坑（FAQ）。
 
 - 适用对象：本仓库后端（Java 25 + Spring Boot 4.1 + WebFlux + AgentScope）
@@ -52,7 +52,7 @@ Grafana :3000  ← 统一查询/展示（数据源已自动预置）
 
 ## 2. 配置步骤（从零到看板）
 
-### 2.1 依赖（`text2sql-backend/pom.xml`）
+### 2.1 依赖（`neko-text2sql-backend/pom.xml`）
 
 ```xml
 <!-- Actuator：暴露 health / metrics 等管理端点 -->
@@ -71,7 +71,7 @@ Grafana :3000  ← 统一查询/展示（数据源已自动预置）
 > 说明：`spring-boot-starter-opentelemetry` 已传递引入 Micrometer 及 OTLP 指标注册表，
 > **无需**额外再加 `micrometer-registry-prometheus`（除非你要用 Prometheus 拉模式，见 FAQ）。
 
-### 2.2 应用配置（`text2sql-backend/src/main/resources/application.yaml`）
+### 2.2 应用配置（`neko-text2sql-backend/src/main/resources/application.yaml`）
 
 ```yaml
 management:
@@ -127,7 +127,7 @@ docker compose down             # 停止
 ### 2.4 启动后端
 
 ```bash
-cd text2sql-backend
+cd neko-text2sql-backend
 ./mvnw spring-boot:run          # Windows: .\mvnw.cmd spring-boot:run
 ```
 
@@ -396,7 +396,7 @@ public class ChatMetrics {
 应用把指标经 OTLP **推送**到 Collector，Collector 再推给 Prometheus 的 OTLP 接收器
 （`/api/v1/otlp`）。因此：
 
-- Prometheus 里 `job` / `service_name` = `spring.application.name` = `text2sql-backend`。
+- Prometheus 里 `job` / `service_name` = `spring.application.name` = `neko-text2sql-backend`。
 - 只有**应用在运行时**才会持续推送；应用停止后约 5 分钟，其 series 会在 Prometheus 中变为 stale，
   查询返回空。
 
@@ -404,7 +404,7 @@ public class ChatMetrics {
 
 ```promql
 demo_component_check
-{job="text2sql-backend"}
+{job="neko-text2sql-backend"}
 sum by (uri) (http_server_requests_milliseconds_count)
 histogram_quantile(0.95, sum by (le) (rate(http_server_requests_milliseconds_bucket[5m])))
 jvm_memory_used_bytes{area="heap"}
@@ -470,7 +470,7 @@ public class DemoCheckEndpoint {
 `spring-boot-starter-opentelemetry` 会自动为每个 HTTP 请求创建 server span，
 名字形如 `http get /api/text2sql/health`。
 
-- 查看：Grafana → **Explore** → 数据源 **Tempo** → `Search` → `Service Name = text2sql-backend`。
+- 查看：Grafana → **Explore** → 数据源 **Tempo** → `Search` → `Service Name = neko-text2sql-backend`。
 - 应用内自定义 span：使用 `@Observed`（需启用 AOP/`ObservedAspect`）或注入 `io.opentelemetry.api.trace.Tracer` 手动 start/end。
 - exporter 是**异步批量**的（默认 `schedule-delay≈5s`），因此请求后需等几秒才能在 Tempo 看到。
 
@@ -493,7 +493,7 @@ public class DemoCheckEndpoint {
 按顺序排查：
 1. **后端是否在运行？** 应用停止超过约 5 分钟，指标即失效。`curl http://localhost:8080/actuator/health` 验证。
 2. **时间范围**是否覆盖有数据的时段（选"最近 15 分钟"）。
-3. 看板顶部 **`job` 变量**是否选为 `All` 或 `text2sql-backend`。
+3. 看板顶部 **`job` 变量**是否选为 `All` 或 `neko-text2sql-backend`。
 4. **指标名是否匹配**：见 [5.5](#55-指标如何进入-prometheus--grafana)——自带的 RED 看板与 Boot 4 名字不符，会一直空。
 
 ### Q3. 启动时报 `Failed to publish metrics to OTLP receiver`
@@ -535,7 +535,7 @@ management:
 | 1 | `curl localhost:8080/actuator/health` | `components.demoIndicator.status = UP` |
 | 2 | `curl localhost:8080/actuator/metrics/demo.component.check` | `value = 1.0` |
 | 3 | Grafana → Explore → Prometheus → `demo_component_check` | 值 = 1 |
-| 4 | Grafana → Explore → Tempo → `text2sql-backend` | 有 trace（如 `http get /actuator/health`） |
+| 4 | Grafana → Explore → Tempo → `neko-text2sql-backend` | 有 trace（如 `http get /actuator/health`） |
 | 5 | Grafana → Dashboards → JVM Overview | 7/8 面板有数据（`Error %` 无 5xx 时为空属正常） |
 
 ---

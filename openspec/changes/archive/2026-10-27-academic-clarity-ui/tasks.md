@@ -2,7 +2,7 @@
 
 ## 1. Theme foundation
 
-- [x] 1.1 Add the Academic Clarity token block to `text2sql-frontend/src/style.css`: primary/success/warning/danger/info palette and Element Plus light/dark derivations, page/surface/text/border colors, 10px/8px radii, `--ac-shadow-sm/md`, 8pt spacing aliases, and the Chinese-first body + serif display + monospace stacks. Verify `npm run build` succeeds and DevTools shows `--el-color-primary` as `#1E5AA8` and body text at 14px.
+- [x] 1.1 Add the Academic Clarity token block to `neko-text2sql-frontend/src/style.css`: primary/success/warning/danger/info palette and Element Plus light/dark derivations, page/surface/text/border colors, 10px/8px radii, `--ac-shadow-sm/md`, 8pt spacing aliases, and the Chinese-first body + serif display + monospace stacks. Verify `npm run build` succeeds and DevTools shows `--el-color-primary` as `#1E5AA8` and body text at 14px.
 - [x] 1.2 Add global base rules in `style.css`: page background, selection color, thin scrollbars, `:focus-visible` ring, `prefers-reduced-motion` handling, and a light-only `color-scheme`. Verify a keyboard Tab across the current pages shows a visible focus ring and the build stays green.
 - [x] 1.3 Add shared page primitives (page header, page description, action bar, surface card, table wrapper, empty state, muted text) as global classes with short usage comments. Verify the shell and one data page can adopt them without local color declarations.
 
@@ -37,7 +37,7 @@
 
 ## 7. Integration verification
 
-- [x] 7.1 Run `npm test` and `npm run build` from `text2sql-frontend`; both must pass with a clean exit code.
+- [x] 7.1 Run `npm test` and `npm run build` from `neko-text2sql-frontend`; both must pass with a clean exit code.
 - [x] 7.2 Walk every route at 1440px, 1024px, 768px, and 375px: chat, data sources, model settings, datasource access (admin), and login. Confirm no horizontal page scroll, no clipped controls, and consistent gutters.
 - [x] 7.3 Keyboard and accessibility pass: Tab through the header, sidebar, chat composer, dialogs, and tables; confirm visible focus, readable labels, and AA contrast for text and essential controls; enable reduced motion and confirm non-essential animations stop.
 - [x] 7.4 Role pass: sign in as a student, a counselor, and an administrator; confirm the admin-only datasource-access item appears only for the administrator, About is absent for every role, and no role sees a broken layout.

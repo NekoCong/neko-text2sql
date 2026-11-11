@@ -1,0 +1,1521 @@
+﻿## Commits
+4b8d669 feat(access): role-record datasource matrix (task 5.5)
+
+## Stat
+ .../text2sql/access/AccessAdminRepository.java     |  29 ++
+ .../access/R2dbcAccessAdminRepository.java         |  45 ++
+ .../nekocong/text2sql/access/RoleDatasource.java   |  12 +
+ .../text2sql/access/RoleDatasourceService.java     | 460 ++++++++++++++++++
+ .../access/api/AccessControlController.java        |  55 ++-
+ .../api/dto/DatasourceMatrixDatasourceView.java    |  14 +
+ .../access/api/dto/DatasourceMatrixRoleView.java   |  27 ++
+ .../access/api/dto/DatasourceMatrixView.java       |  20 +
+ .../access/api/dto/RoleDatasourcesRequest.java     |  14 +
+ .../access/api/dto/RoleDatasourcesView.java        |  20 +
+ .../access/AccessAdminServiceTransactionTest.java  |  15 +
+ .../RolePermissionServiceTransactionTest.java      |  15 +
+ .../web/AccessControlDatasourceMatrixTest.java     | 529 +++++++++++++++++++++
+ 13 files changed, 1254 insertions(+), 1 deletion(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+index c36ba50..2ae9744 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+@@ -82,20 +82,49 @@ public interface AccessAdminRepository {
+      *
+      * <p>Deletes every grant of the role, then inserts the given ones. Both statements must run in
+      * the caller's transaction so the set is replaced atomically.
+      *
+      * @param roleId the role id
+      * @param permissionIds the catalog ids to grant (already validated against the catalog)
+      * @return completion
+      */
+     Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds);
+ 
++    /**
++     * Loads the datasource ids granted to one role directly, ordered by id.
++     *
++     * <p>Inherited grants are not included: this is the role's own, editable set.
++     *
++     * @param roleId the role id
++     * @return the granted datasource ids (empty when the role holds none)
++     */
++    Mono<List<String>> datasourceIdsOf(String roleId);
++
++    /**
++     * Loads every role → datasource grant, for the full matrix.
++     *
++     * @return the grants (one row per {@code (role_id, datasource_id)} pair)
++     */
++    Mono<List<RoleDatasource>> datasourceGrants();
++
++    /**
++     * Replaces one role's datasource grant set.
++     *
++     * <p>Deletes every grant of the role, then inserts the given ones. Both statements must run in
++     * the caller's transaction so the set is replaced atomically.
++     *
++     * @param roleId the role id
++     * @param datasourceIds the datasource ids to grant (already validated against the registry)
++     * @return completion
++     */
++    Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds);
++
+     /**
+      * Lists one role's data-scope rules, ordered by datasource then table.
+      *
+      * @param roleId the role id
+      * @param datasourceId the datasource to restrict the listing to, or {@code null} for all
+      * @return the rules (empty when the role has none)
+      */
+     Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId);
+ 
+     /**
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+index 3cf7f3e..e86fd16 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+@@ -151,20 +151,65 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+                     insert.then(
+                             client.sql("INSERT INTO access_role_permission (role_id, permission_id)"
+                                             + " VALUES (:roleId, :permissionId)")
+                                     .bind("roleId", roleId)
+                                     .bind("permissionId", permissionId)
+                                     .then());
+         }
+         return delete.then(insert);
+     }
+ 
++    @Override
++    public Mono<List<String>> datasourceIdsOf(String roleId) {
++        return client.sql("SELECT datasource_id FROM access_role_datasource"
++                        + " WHERE role_id = :roleId"
++                        + " ORDER BY datasource_id")
++                .bind("roleId", roleId)
++                .map((row, meta) -> row.get("datasource_id", String.class))
++                .all()
++                .collectList();
++    }
++
++    @Override
++    public Mono<List<RoleDatasource>> datasourceGrants() {
++        return client.sql("SELECT role_id, datasource_id FROM access_role_datasource")
++                .map((row, meta) -> new RoleDatasource(
++                        row.get("role_id", String.class),
++                        row.get("datasource_id", String.class)))
++                .all()
++                .collectList();
++    }
++
++    @Override
++    public Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds) {
++        Mono<Void> delete =
++                client.sql("DELETE FROM access_role_datasource WHERE role_id = :roleId")
++                        .bind("roleId", roleId)
++                        .then();
++        if (datasourceIds == null || datasourceIds.isEmpty()) {
++            return delete;
++        }
++        // One INSERT ... VALUES per id keeps every value bound (no IN-list is built from client
++        // input). Duplicates are already removed by the service, so the primary key cannot collide.
++        Mono<Void> insert = Mono.empty();
++        for (String datasourceId : List.copyOf(datasourceIds)) {
++            insert =
++                    insert.then(
++                            client.sql("INSERT INTO access_role_datasource (role_id, datasource_id)"
++                                            + " VALUES (:roleId, :datasourceId)")
++                                    .bind("roleId", roleId)
++                                    .bind("datasourceId", datasourceId)
++                                    .then());
++        }
++        return delete.then(insert);
++    }
++
+     @Override
+     public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
+         if (datasourceId == null) {
+             return client.sql("SELECT " + DATA_SCOPE_COLUMNS + " FROM access_data_scope"
+                             + " WHERE role_id = :roleId"
+                             + " ORDER BY datasource_id, table_name")
+                     .bind("roleId", roleId)
+                     .map((row, meta) -> dataScope(row))
+                     .all()
+                     .collectList();
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasource.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasource.java
+new file mode 100644
+index 0000000..9cce817
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasource.java
+@@ -0,0 +1,12 @@
++package com.nekocong.text2sql.access;
++
++/**
++ * One {@code access_role_datasource} row, as read for the matrix: a role id and a granted datasource
++ * id. The enforcement source is the row itself, so the matrix is keyed by role records rather than
++ * role-code constants.
++ *
++ * @param roleId the role id
++ * @param datasourceId the datasource id
++ */
++public record RoleDatasource(String roleId, String datasourceId) {
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasourceService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasourceService.java
+new file mode 100644
+index 0000000..93c8897
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasourceService.java
+@@ -0,0 +1,460 @@
++package com.nekocong.text2sql.access;
++
++import com.fasterxml.jackson.core.JsonProcessingException;
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.nekocong.text2sql.access.api.dto.DatasourceMatrixDatasourceView;
++import com.nekocong.text2sql.access.api.dto.DatasourceMatrixRoleView;
++import com.nekocong.text2sql.access.api.dto.DatasourceMatrixView;
++import com.nekocong.text2sql.access.api.dto.RoleDatasourcesView;
++import com.nekocong.text2sql.datasource.DataSourceDefinition;
++import com.nekocong.text2sql.datasource.DataSourceRegistry;
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.LinkedHashSet;
++import java.util.List;
++import java.util.Map;
++import java.util.Objects;
++import java.util.Set;
++import java.util.TreeSet;
++import java.util.regex.Pattern;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++import org.springframework.http.HttpStatus;
++import org.springframework.stereotype.Service;
++import org.springframework.transaction.ReactiveTransactionManager;
++import org.springframework.transaction.TransactionDefinition;
++import org.springframework.transaction.reactive.TransactionalOperator;
++import org.springframework.transaction.support.DefaultTransactionDefinition;
++import org.springframework.web.server.ResponseStatusException;
++import reactor.core.publisher.Mono;
++
++/**
++ * The role → datasource matrix: read the full matrix, read one role's own grant set, and replace it.
++ *
++ * <p>Kept separate from {@link RolePermissionService} (permissions) and {@link DataScopeService}
++ * (data scopes) so each stays focused. The transaction and audit patterns are the same:
++ *
++ * <ul>
++ *   <li>A replace runs in one reactive transaction: the set replacement (delete + inserts) and its
++ *       {@code role.datasources} {@code SUCCESS} audit row commit together or not at all, so a failed
++ *       audit insert also rolls the set back.
++ *   <li>A rejection decided against the loaded role (unknown role, unknown datasource) writes exactly
++ *       one {@code DENIED} row in its own {@code REQUIRES_NEW} transaction, then fails with the mapped
++ *       status.
++ *   <li>Shape validation (a malformed role id, a missing body, a malformed datasource id, too many
++ *       ids) fails with {@code 400} before the role is loaded and writes no row: there is no entity to
++ *       attribute the attempt to.
++ * </ul>
++ *
++ * <p>An omitted body or a {@code null} {@code datasourceIds} field is <em>not</em> an empty set: only
++ * an explicit {@code []} clears the role, so a client bug cannot silently revoke every grant.
++ *
++ * <p>{@code access_role_datasource} is the single enforcement source (read by {@code
++ * DatasourceAccessService} through the resolver), so a change is effective on the next request
++ * without a new login. Admins bypass datasource grants by definition, so no rows are synthesised for
++ * them; a stored grant on an admin role is still shown because it is harmless.
++ */
++@Service
++public class RoleDatasourceService {
++
++    private static final Logger log = LoggerFactory.getLogger(RoleDatasourceService.class);
++
++    /** The alphabet role ids are generated from (UUIDs and the deterministic seed ids). */
++    private static final Pattern ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
++
++    /** The datasource id space (dots, dashes, underscores); bound, never interpolated. */
++    private static final Pattern DATASOURCE_ID_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,64}$");
++
++    /** Upper bound on distinct ids per replace request, so a huge body cannot drive unbounded work. */
++    static final int MAX_DATASOURCE_IDS = 256;
++
++    /** Matches {@code access_audit.reason VARCHAR(512)}. */
++    private static final int MAX_REASON_LENGTH = 512;
++
++    private static final String ENTITY_TYPE = "ROLE";
++    private static final String ACTION_DATASOURCES = "role.datasources";
++    private static final String RESULT_SUCCESS = "SUCCESS";
++    private static final String RESULT_DENIED = "DENIED";
++
++    private static final String REASON_ROLE_MISSING = "角色不存在";
++    private static final String REASON_BODY_MISSING = "datasourceIds 不能为空";
++    private static final String REASON_MALFORMED = "数据源列表格式不正确";
++    private static final String REASON_DATASOURCE_ID_INVALID = "数据源标识无效";
++    private static final String REASON_TOO_MANY_DATASOURCES =
++            "数据源数量不能超过 " + MAX_DATASOURCE_IDS + " 个";
++    private static final String REASON_DATASOURCE_MISSING = "数据源不存在：";
++
++    private final AccessAdminRepository repository;
++    private final DataSourceRegistry datasources;
++    private final TransactionalOperator transactions;
++    private final TransactionalOperator newTransactions;
++    private final ObjectMapper objectMapper;
++
++    /**
++     * Creates the service.
++     *
++     * @param repository the admin repository
++     * @param datasources the target-datasource registry, to validate ids and build the matrix
++     * @param transactionManager the R2DBC reactive transaction manager
++     * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
++     */
++    public RoleDatasourceService(
++            AccessAdminRepository repository,
++            DataSourceRegistry datasources,
++            ReactiveTransactionManager transactionManager,
++            ObjectMapper objectMapper) {
++        this.repository = repository;
++        this.datasources = datasources;
++        this.transactions = TransactionalOperator.create(transactionManager);
++        this.newTransactions =
++                TransactionalOperator.create(
++                        transactionManager,
++                        new DefaultTransactionDefinition(
++                                TransactionDefinition.PROPAGATION_REQUIRES_NEW));
++        this.objectMapper = objectMapper;
++    }
++
++    /**
++     * Reads the full matrix: every role (ordered by code) with its sorted grant set, and every
++     * registered datasource.
++     *
++     * <p>A stored grant for a datasource that is no longer registered is ignored (not an error), so
++     * a runtime-removed datasource cannot break the page.
++     *
++     * @return the matrix
++     */
++    public Mono<DatasourceMatrixView> matrix() {
++        return Mono.zip(repository.roles(), repository.datasourceGrants())
++                .map(tuple -> build(tuple.getT1(), tuple.getT2()));
++    }
++
++    /**
++     * Reads one role's own datasource grant set.
++     *
++     * <p>An unknown role is a {@code 404}; reads are not audited.
++     *
++     * @param roleId the role id
++     * @return the role's datasource ids, ordered
++     */
++    public Mono<RoleDatasourcesView> datasourcesOf(String roleId) {
++        return Mono.defer(
++                () -> {
++                    requireIdentifier(roleId);
++                    Set<String> registered = registeredIds();
++                    return repository
++                            .role(roleId)
++                            .switchIfEmpty(Mono.error(notFound()))
++                            .then(repository.datasourceIdsOf(roleId))
++                            .map(ids -> new RoleDatasourcesView(
++                                    roleId, visibleIds(ids, registered)));
++                });
++    }
++
++    /**
++     * Replaces one role's datasource grant set.
++     *
++     * <p>The <em>whole</em> set is replaced: a previously granted datasource absent from the request
++     * is revoked. Only an explicit empty list clears the role; a missing body or a {@code null} {@code
++     * datasourceIds} field is rejected with {@code 400} so a malformed client cannot wipe the set.
++     *
++     * @param actorId the acting user id
++     * @param roleId the role id
++     * @param request the complete new set; {@code null} means the body or field was absent
++     * @return the stored set
++     */
++    public Mono<RoleDatasourcesView> replaceDatasources(
++            String actorId, String roleId, List<String> request) {
++        return Mono.defer(
++                        () -> {
++                            // Shape-only checks first: they need no entity, so they are not audited.
++                            requireIdentifier(roleId);
++                            if (request == null) {
++                                throw badRequest(REASON_BODY_MISSING);
++                            }
++                            List<String> requestedIds = normalizeIds(request);
++                            Mono<AccessRole> loaded =
++                                    repository
++                                            .role(roleId)
++                                            .switchIfEmpty(
++                                                    Mono.defer(
++                                                            () ->
++                                                                    Mono.defer(
++                                                                                    () ->
++                                                                                            denyUnknownRole(
++                                                                                                            actorId,
++                                                                                                            roleId,
++                                                                                                            requestedIds))
++                                                                            .cast(AccessRole.class)));
++                            return loaded.flatMap(
++                                    role ->
++                                            replace(actorId, role, requestedIds)
++                                                    .onErrorMap(
++                                                            Denial.class,
++                                                            RoleDatasourceService::asStatus));
++                        })
++                .as(transactions::transactional)
++                // Denials raised by either branch (including the unknown role) map to their status.
++                .onErrorMap(Denial.class, RoleDatasourceService::asStatus)
++                .map(ids -> new RoleDatasourcesView(roleId, ids));
++    }
++
++    /** Applies a shape-valid replace request to a loaded role. */
++    private Mono<List<String>> replace(
++            String actorId, AccessRole role, List<String> requestedIds) {
++        Set<String> registered = registeredIds();
++        // The current set is read first so a DENIED row reports the real before state.
++        return repository
++                .datasourceIdsOf(role.id())
++                .flatMap(before -> {
++                    List<String> beforeIds = sortedIds(before);
++                    for (String id : requestedIds) {
++                        if (!registered.contains(id)) {
++                            return deny(
++                                    actorId,
++                                    role.id(),
++                                    beforeIds,
++                                    requestedIds,
++                                    new Denial(
++                                            REASON_DATASOURCE_MISSING + id,
++                                            HttpStatus.NOT_FOUND));
++                        }
++                    }
++                    return apply(actorId, role.id(), beforeIds, requestedIds);
++                });
++    }
++
++    /** Replaces the set and records the SUCCESS row, in the caller's transaction. */
++    private Mono<List<String>> apply(
++            String actorId, String roleId, List<String> beforeIds, List<String> requestedIds) {
++        return Mono.defer(() -> repository.replaceRoleDatasources(roleId, requestedIds))
++                .then(
++                        repository.record(
++                                actorId,
++                                ACTION_DATASOURCES,
++                                ENTITY_TYPE,
++                                roleId,
++                                jsonIds(beforeIds),
++                                jsonIds(requestedIds),
++                                RESULT_SUCCESS,
++                                null))
++                .thenReturn(requestedIds);
++    }
++
++    /**
++     * Appends the {@code DENIED} row for an unknown role, then fails with {@code 404}.
++     *
++     * @param actorId the acting user id
++     * @param roleId the requested role id
++     * @param requestedIds the requested ids
++     * @return never completes normally
++     */
++    private Mono<List<String>> denyUnknownRole(
++            String actorId, String roleId, List<String> requestedIds) {
++        return deny(
++                actorId,
++                roleId,
++                List.of(),
++                requestedIds,
++                new Denial(REASON_ROLE_MISSING, HttpStatus.NOT_FOUND));
++    }
++
++    /**
++     * Appends the {@code DENIED} row in its own transaction, then fails with the denial.
++     *
++     * <p>The audit insert is best effort: a rejection must still reach the caller with its status, so
++     * an audit failure is logged rather than replacing the denial.
++     */
++    private Mono<List<String>> deny(
++            String actorId,
++            String roleId,
++            List<String> beforeIds,
++            List<String> requestedIds,
++            Denial denial) {
++        Mono<Void> record =
++                repository
++                        .record(
++                                actorId,
++                                ACTION_DATASOURCES,
++                                ENTITY_TYPE,
++                                roleId,
++                                jsonIdsForDenial(beforeIds),
++                                jsonIdsForDenial(requestedIds),
++                                RESULT_DENIED,
++                                truncate(denial.getMessage()))
++                        .onErrorResume(
++                                error -> {
++                                    log.error(
++                                            "Failed to append the DENIED audit row {}",
++                                            ACTION_DATASOURCES,
++                                            error);
++                                    return Mono.empty();
++                                });
++        return record.as(newTransactions::transactional).then(Mono.error(denial));
++    }
++
++    // --- matrix building -------------------------------------------------------------------
++
++    private DatasourceMatrixView build(List<AccessRole> roles, List<RoleDatasource> grants) {
++        Set<String> registered = registeredIds();
++        Map<String, List<String>> byRole = new HashMap<>();
++        for (RoleDatasource grant : grants) {
++            byRole.computeIfAbsent(grant.roleId(), key -> new ArrayList<>())
++                    .add(grant.datasourceId());
++        }
++        // repository.roles() is already ordered by code.
++        List<DatasourceMatrixRoleView> roleViews =
++                roles.stream()
++                        .map(
++                                role ->
++                                        new DatasourceMatrixRoleView(
++                                                role.id(),
++                                                role.code(),
++                                                role.name(),
++                                                role.builtIn(),
++                                                role.enabled(),
++                                                visibleIds(
++                                                        byRole.getOrDefault(role.id(), List.of()),
++                                                        registered)))
++                        .toList();
++        String defaultId = datasources.defaultId();
++        List<DatasourceMatrixDatasourceView> datasourceViews =
++                datasources.definitions().stream()
++                        .map(
++                                definition ->
++                                        new DatasourceMatrixDatasourceView(
++                                                definition.getId(),
++                                                displayName(definition),
++                                                definition.getId().equals(defaultId)))
++                        .toList();
++        return new DatasourceMatrixView(roleViews, datasourceViews);
++    }
++
++    private static String displayName(DataSourceDefinition definition) {
++        return definition.getName() == null ? definition.getId() : definition.getName();
++    }
++
++    private Set<String> registeredIds() {
++        Set<String> ids = new LinkedHashSet<>();
++        for (DataSourceDefinition definition : datasources.definitions()) {
++            ids.add(definition.getId());
++        }
++        return ids;
++    }
++
++    /** Keeps only ids still registered, sorted and free of duplicates. */
++    private static List<String> visibleIds(List<String> ids, Set<String> registered) {
++        if (ids == null || ids.isEmpty()) {
++            return List.of();
++        }
++        return ids.stream()
++                .filter(Objects::nonNull)
++                .filter(registered::contains)
++                .distinct()
++                .sorted()
++                .toList();
++    }
++
++    // --- validation ------------------------------------------------------------------------
++
++    /**
++     * Validates the shape of a requested id set: trims each id, rejects an over-long or malformed id,
++     * and returns the de-duplicated ids in canonical (sorted) order.
++     *
++     * <p>The size cap is applied <em>after</em> de-duplication. Existence is checked against the
++     * registry afterwards, because that denial depends on the loaded role and is audited.
++     */
++    static List<String> normalizeIds(List<String> request) {
++        if (request.isEmpty()) {
++            return List.of();
++        }
++        TreeSet<String> ids = new TreeSet<>();
++        for (String raw : request) {
++            if (raw == null) {
++                throw badRequest(REASON_MALFORMED);
++            }
++            String id = raw.trim();
++            if (id.isEmpty()) {
++                throw badRequest(REASON_MALFORMED);
++            }
++            if (!DATASOURCE_ID_PATTERN.matcher(id).matches()) {
++                throw badRequest(REASON_DATASOURCE_ID_INVALID);
++            }
++            ids.add(id);
++        }
++        if (ids.size() > MAX_DATASOURCE_IDS) {
++            throw badRequest(REASON_TOO_MANY_DATASOURCES);
++        }
++        return List.copyOf(ids);
++    }
++
++    private static List<String> sortedIds(List<String> ids) {
++        if (ids == null || ids.isEmpty()) {
++            return List.of();
++        }
++        return ids.stream().filter(Objects::nonNull).distinct().sorted().toList();
++    }
++
++    private static void requireIdentifier(String roleId) {
++        if (roleId == null || roleId.isBlank() || !ID_PATTERN.matcher(roleId).matches()) {
++            throw badRequest("角色标识无效");
++        }
++    }
++
++    /** Serializes an id array for the DENIED payload; never fails the rejection. */
++    private String jsonIdsForDenial(List<String> ids) {
++        try {
++            return jsonIds(ids);
++        } catch (IllegalStateException ex) {
++            log.warn("Failed to serialize the DENIED audit payload; storing null instead", ex);
++            return null;
++        }
++    }
++
++    private String jsonIds(List<String> ids) {
++        if (ids == null) {
++            return null;
++        }
++        try {
++            return objectMapper.writeValueAsString(ids);
++        } catch (JsonProcessingException ex) {
++            throw new IllegalStateException("Failed to serialize the access-audit payload", ex);
++        }
++    }
++
++    private static String truncate(String reason) {
++        return reason == null || reason.length() <= MAX_REASON_LENGTH
++                ? reason
++                : reason.substring(0, MAX_REASON_LENGTH);
++    }
++
++    private static ResponseStatusException notFound() {
++        return new ResponseStatusException(HttpStatus.NOT_FOUND, REASON_ROLE_MISSING);
++    }
++
++    private static ResponseStatusException badRequest(String message) {
++        return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
++    }
++
++    /** Maps an audited rejection onto the response status it carries. */
++    private static Throwable asStatus(Denial denial) {
++        return denial.toException();
++    }
++
++    /**
++     * A rejected datasource-set change, carrying the reason and the HTTP status. Internal: rejected
++     * requests are rendered by the controller through {@link #asStatus}.
++     */
++    private static final class Denial extends RuntimeException {
++
++        private final transient HttpStatus status;
++
++        private Denial(String reason, HttpStatus status) {
++            super(reason, null, false, false);
++            this.status = status;
++        }
++
++        private ResponseStatusException toException() {
++            return new ResponseStatusException(status, getMessage());
++        }
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index aae543d..87e58e6 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -1,30 +1,34 @@
+ package com.nekocong.text2sql.access.api;
+ 
+ import com.nekocong.text2sql.access.AccessAdminService;
+ import com.nekocong.text2sql.access.DataScopeService;
++import com.nekocong.text2sql.access.RoleDatasourceService;
+ import com.nekocong.text2sql.access.RolePermissionService;
+ import com.nekocong.text2sql.access.UserAdminService;
+ import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPage;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserView;
+ import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
+ import com.nekocong.text2sql.access.api.dto.DataScopeView;
++import com.nekocong.text2sql.access.api.dto.DatasourceMatrixView;
++import com.nekocong.text2sql.access.api.dto.RoleDatasourcesRequest;
++import com.nekocong.text2sql.access.api.dto.RoleDatasourcesView;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.security.core.Authentication;
+ import org.springframework.security.core.context.ReactiveSecurityContextHolder;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.web.bind.annotation.DeleteMapping;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+@@ -61,42 +65,48 @@ import reactor.core.publisher.Mono;
+  */
+ @RestController
+ public class AccessControlController {
+ 
+     private static final String ROLES = "/api/admin/access-control/roles";
+ 
+     private static final String DATA_SCOPES = "/api/admin/access-control/data-scopes";
+ 
+     private static final String USERS = "/api/admin/access-control/users";
+ 
++    private static final String DATASOURCE_ACCESS = "/api/admin/access-control/datasource-access";
++
+     private final AccessAdminService service;
+     private final RolePermissionService permissions;
+     private final DataScopeService dataScopes;
+     private final UserAdminService users;
++    private final RoleDatasourceService roleDatasources;
+ 
+     /**
+      * Creates the controller.
+      *
+      * @param service the role administration service
+      * @param permissions the permission catalog and role-permission matrix service
+      * @param dataScopes the data-scope policy service
+      * @param users the user lifecycle service
++     * @param roleDatasources the role → datasource matrix service
+      */
+     public AccessControlController(
+             AccessAdminService service,
+             RolePermissionService permissions,
+             DataScopeService dataScopes,
+-            UserAdminService users) {
++            UserAdminService users,
++            RoleDatasourceService roleDatasources) {
+         this.service = service;
+         this.permissions = permissions;
+         this.dataScopes = dataScopes;
+         this.users = users;
++        this.roleDatasources = roleDatasources;
+     }
+ 
+     /**
+      * Lists every role, ordered by code.
+      *
+      * @return the roles
+      */
+     @GetMapping(path = ROLES)
+     public Mono<List<AccessRoleView>> list() {
+         return service.list();
+@@ -169,20 +179,63 @@ public class AccessControlController {
+     @PutMapping(path = ROLES + "/{id}/permissions")
+     public Mono<AccessRolePermissionsView> replaceRolePermissions(
+             @PathVariable String id,
+             @RequestBody(required = false) AccessRolePermissionsRequest request) {
+         return actorId()
+                 .flatMap(actor ->
+                         permissions.replacePermissions(
+                                 actor, id, request == null ? null : request.permissions()));
+     }
+ 
++    /**
++     * Reads the full role → datasource matrix: every role (ordered by code) with its sorted grant
++     * set, and every registered datasource.
++     *
++     * @return the matrix
++     */
++    @GetMapping(path = DATASOURCE_ACCESS)
++    public Mono<DatasourceMatrixView> datasourceMatrix() {
++        return roleDatasources.matrix();
++    }
++
++    /**
++     * Reads a role's own datasource grant set.
++     *
++     * @param id the role id
++     * @return the role's datasource ids
++     */
++    @GetMapping(path = ROLES + "/{id}/datasources")
++    public Mono<RoleDatasourcesView> roleDatasources(@PathVariable String id) {
++        return roleDatasources.datasourcesOf(id);
++    }
++
++    /**
++     * Replaces a role's datasource grant set with the complete requested set.
++     *
++     * <p>The body is <em>required</em>: a missing body, or a body without a {@code datasourceIds}
++     * array, is a {@code 400} rather than an empty set. Only an explicit {@code {"datasourceIds": []}}
++     * clears the role.
++     *
++     * @param id the role id
++     * @param request the new set
++     * @return the stored set
++     */
++    @PutMapping(path = ROLES + "/{id}/datasources")
++    public Mono<RoleDatasourcesView> replaceRoleDatasources(
++            @PathVariable String id,
++            @RequestBody(required = false) RoleDatasourcesRequest request) {
++        return actorId()
++                .flatMap(actor ->
++                        roleDatasources.replaceDatasources(
++                                actor, id, request == null ? null : request.datasourceIds()));
++    }
++
+     /**
+      * Lists a role's data-scope rules, ordered by datasource then table.
+      *
+      * @param roleId the role id (required; a missing one is a {@code 400})
+      * @param datasourceId the datasource to filter by, or omitted for all
+      * @return the rules
+      */
+     @GetMapping(path = DATA_SCOPES)
+     public Mono<List<DataScopeView>> listDataScopes(
+             @RequestParam(required = false) String roleId,
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixDatasourceView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixDatasourceView.java
+new file mode 100644
+index 0000000..0c82063
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixDatasourceView.java
+@@ -0,0 +1,14 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import com.fasterxml.jackson.annotation.JsonProperty;
++
++/**
++ * One datasource row in the datasource matrix.
++ *
++ * @param id the datasource id
++ * @param name the display name
++ * @param defaultDatasource whether this is the configured default datasource (serialised as {@code
++ *     "default"} to preserve the public contract)
++ */
++public record DatasourceMatrixDatasourceView(
++        String id, String name, @JsonProperty("default") boolean defaultDatasource) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixRoleView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixRoleView.java
+new file mode 100644
+index 0000000..54a73b8
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixRoleView.java
+@@ -0,0 +1,27 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * One role row in the datasource matrix.
++ *
++ * @param id the role id
++ * @param code the stable code
++ * @param name the display name
++ * @param builtIn whether the role is seeded and protected
++ * @param enabled whether the role participates in effective access
++ * @param datasourceIds the datasources granted to the role, sorted and free of duplicates
++ */
++public record DatasourceMatrixRoleView(
++        String id,
++        String code,
++        String name,
++        boolean builtIn,
++        boolean enabled,
++        List<String> datasourceIds) {
++
++    /** Normalizes the grant list so the view is structurally immutable. */
++    public DatasourceMatrixRoleView {
++        datasourceIds = datasourceIds == null ? List.of() : List.copyOf(datasourceIds);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixView.java
+new file mode 100644
+index 0000000..8b634cb
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixView.java
+@@ -0,0 +1,20 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * The role → datasource matrix shown on the admin page, keyed by role records (not role-code
++ * constants) so custom roles can be granted datasources.
++ *
++ * @param roles every role (built-in and custom), ordered by code, each with its datasource grants
++ * @param datasources every registered datasource, in registration order
++ */
++public record DatasourceMatrixView(
++        List<DatasourceMatrixRoleView> roles, List<DatasourceMatrixDatasourceView> datasources) {
++
++    /** Normalizes the collections so the view is structurally immutable. */
++    public DatasourceMatrixView {
++        roles = roles == null ? List.of() : List.copyOf(roles);
++        datasources = datasources == null ? List.of() : List.copyOf(datasources);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesRequest.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesRequest.java
+new file mode 100644
+index 0000000..d9fc4f6
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesRequest.java
+@@ -0,0 +1,14 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * Request body for replacing a role's datasource grant set.
++ *
++ * <p>The list is the <em>complete</em> new set, not a delta: an id absent from it is revoked. An
++ * empty list clears every grant of the role. Duplicates are de-duplicated and every id must exist in
++ * the datasource registry.
++ *
++ * @param datasourceIds the datasource ids the role should be able to query
++ */
++public record RoleDatasourcesRequest(List<String> datasourceIds) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesView.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesView.java
+new file mode 100644
+index 0000000..9bd144b
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesView.java
+@@ -0,0 +1,20 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import java.util.List;
++
++/**
++ * One role's datasource grant set, as datasource ids.
++ *
++ * <p>Returned by both the read and the replace endpoints, so a client can apply the result without a
++ * second round trip. The list is ordered (by id) and free of duplicates.
++ *
++ * @param roleId the role id
++ * @param datasourceIds the datasource ids the role may query
++ */
++public record RoleDatasourcesView(String roleId, List<String> datasourceIds) {
++
++    /** Normalizes the id list so the view is structurally immutable. */
++    public RoleDatasourcesView {
++        datasourceIds = datasourceIds == null ? List.of() : List.copyOf(datasourceIds);
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+index 0b95aa3..9c3bf16 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+@@ -181,20 +181,35 @@ class AccessAdminServiceTransactionTest {
+             @Override
+             public Mono<List<String>> permissionKeysOf(String roleId) {
+                 return delegate.permissionKeysOf(roleId);
+             }
+ 
+             @Override
+             public Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds) {
+                 return delegate.replaceRolePermissions(roleId, permissionIds);
+             }
+ 
++            @Override
++            public Mono<List<String>> datasourceIdsOf(String roleId) {
++                return delegate.datasourceIdsOf(roleId);
++            }
++
++            @Override
++            public Mono<List<RoleDatasource>> datasourceGrants() {
++                return delegate.datasourceGrants();
++            }
++
++            @Override
++            public Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds) {
++                return delegate.replaceRoleDatasources(roleId, datasourceIds);
++            }
++
+             @Override
+             public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
+                 return delegate.dataScopesOf(roleId, datasourceId);
+             }
+ 
+             @Override
+             public Mono<DataScopeRule> dataScope(
+                     String roleId, String datasourceId, String tableName) {
+                 return delegate.dataScope(roleId, datasourceId, tableName);
+             }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+index a35b980..ffcbc44 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+@@ -155,20 +155,35 @@ class RolePermissionServiceTransactionTest {
+             @Override
+             public Mono<List<String>> permissionKeysOf(String roleId) {
+                 return delegate.permissionKeysOf(roleId);
+             }
+ 
+             @Override
+             public Mono<Void> replaceRolePermissions(String roleId, List<String> permissionIds) {
+                 return delegate.replaceRolePermissions(roleId, permissionIds);
+             }
+ 
++            @Override
++            public Mono<List<String>> datasourceIdsOf(String roleId) {
++                return delegate.datasourceIdsOf(roleId);
++            }
++
++            @Override
++            public Mono<List<RoleDatasource>> datasourceGrants() {
++                return delegate.datasourceGrants();
++            }
++
++            @Override
++            public Mono<Void> replaceRoleDatasources(String roleId, List<String> datasourceIds) {
++                return delegate.replaceRoleDatasources(roleId, datasourceIds);
++            }
++
+             @Override
+             public Mono<List<DataScopeRule>> dataScopesOf(String roleId, String datasourceId) {
+                 return delegate.dataScopesOf(roleId, datasourceId);
+             }
+ 
+             @Override
+             public Mono<DataScopeRule> dataScope(
+                     String roleId, String datasourceId, String tableName) {
+                 return delegate.dataScope(roleId, datasourceId, tableName);
+             }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDatasourceMatrixTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDatasourceMatrixTest.java
+new file mode 100644
+index 0000000..5cbab7e
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDatasourceMatrixTest.java
+@@ -0,0 +1,529 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.nekocong.text2sql.access.AccessContextResolver;
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.access.EffectiveAccess;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.core.ParameterizedTypeReference;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/**
++ * The role → datasource matrix: read the full matrix, read and replace one role's grant set, with
++ * audit, next-request effect and legacy compatibility.
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class AccessControlDatasourceMatrixTest {
++
++    private static final String PASSWORD = "secret123";
++
++    private static final String BASE = "/api/admin/access-control";
++
++    private static final String ROLES = BASE + "/roles";
++
++    private static final String DATASOURCE_ACCESS = BASE + "/datasource-access";
++
++    private static final String DATASOURCE = "campus";
++
++    /** A second configured datasource (dash in the id, same demo schema). */
++    private static final String SECOND_DATASOURCE = "erp-prod";
++
++    private static final String LEGACY = "/api/admin/datasource-access";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
++    @Autowired
++    private AccessContextResolver resolver;
++
++    @Autowired
++    private DatabaseClient db;
++
++    private WebTestClient client;
++    private String adminToken;
++    private String adminId;
++    private String customRoleId;
++
++    @BeforeEach
++    void setUp() {
++        client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++        String username = unique("admin");
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++        adminId = admin.id();
++        adminToken = TestAuth.login(client, username, PASSWORD);
++
++        // A fresh, non built-in role per test: the H2 database is shared across test contexts, so the
++        // seeded roles must not be edited in place.
++        customRoleId = createRole();
++    }
++
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    @Test
++    void matrixListsBuiltInRolesWithTheirSeededGrantsAndTheRegisteredDatasources() {
++        Map<String, Object> matrix = matrix();
++        List<Map<String, Object>> roles = (List) matrix.get("roles");
++
++        // Ordered by code; every built-in role appears, each carrying its stable identity fields.
++        List<String> codes = roles.stream().map(role -> String.valueOf(role.get("code"))).toList();
++        assertThat(codes).isSorted();
++        assertThat(codes).contains("admin", "counselor", "student");
++
++        assertThat(roleByCode(matrix, "student").get("builtIn")).isEqualTo(true);
++        assertThat(roleByCode(matrix, "student").get("enabled")).isEqualTo(true);
++        assertThat((List<String>) roleByCode(matrix, "student").get("datasourceIds"))
++                .contains(DATASOURCE);
++        assertThat((List<String>) roleByCode(matrix, "counselor").get("datasourceIds"))
++                .contains(DATASOURCE);
++        // Admins bypass datasource grants by definition; no rows are synthesised for them.
++        assertThat((List<String>) roleByCode(matrix, "admin").get("datasourceIds")).isEmpty();
++
++        // The registered datasources, with the default flagged and the rest not.
++        List<Map<String, Object>> datasources = (List) matrix.get("datasources");
++        assertThat(datasources)
++                .extracting(datasource -> String.valueOf(datasource.get("id")))
++                .containsExactly(DATASOURCE, SECOND_DATASOURCE);
++        assertThat(datasources)
++                .filteredOn(datasource -> DATASOURCE.equals(datasource.get("id")))
++                .first()
++                .satisfies(datasource -> assertThat(datasource.get("default")).isEqualTo(true));
++        assertThat(datasources)
++                .filteredOn(datasource -> SECOND_DATASOURCE.equals(datasource.get("id")))
++                .first()
++                .satisfies(datasource -> assertThat(datasource.get("default")).isEqualTo(false));
++    }
++
++    @Test
++    void aFreshCustomRoleStartsEmptyAndPutReplacesRatherThanUnions() {
++        assertThat(datasourceIdsInMatrix(customRoleId)).isEmpty();
++        assertThat(getDatasources()).isEmpty();
++
++        putDatasources(List.of(DATASOURCE, SECOND_DATASOURCE))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.roleId")
++                .isEqualTo(customRoleId)
++                .jsonPath("$.datasourceIds.length()")
++                .isEqualTo(2)
++                .jsonPath("$.datasourceIds[0]")
++                .isEqualTo(DATASOURCE);
++
++        assertThat(getDatasources()).containsExactly(DATASOURCE, SECOND_DATASOURCE);
++        assertThat(datasourceIdsInMatrix(customRoleId))
++                .containsExactly(DATASOURCE, SECOND_DATASOURCE);
++
++        // Re-PUT replaces (does not union): only the requested ids remain.
++        putDatasources(List.of(DATASOURCE))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.datasourceIds.length()")
++                .isEqualTo(1);
++        assertThat(getDatasources()).containsExactly(DATASOURCE);
++
++        // An empty array clears every grant.
++        putDatasources(List.of())
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.datasourceIds.length()")
++                .isEqualTo(0);
++        assertThat(getDatasources()).isEmpty();
++        assertThat(datasourceIdsInMatrix(customRoleId)).isEmpty();
++    }
++
++    @Test
++    void duplicateIdsAreDeduplicated() {
++        putDatasources(List.of(DATASOURCE, DATASOURCE))
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.datasourceIds.length()")
++                .isEqualTo(1);
++
++        assertThat(getDatasources()).containsExactly(DATASOURCE);
++    }
++
++    @Test
++    void unknownRoleAndDatasourceAreNotFound() {
++        String unknownRole = UUID.randomUUID().toString();
++
++        client.put()
++                .uri(ROLES + "/" + unknownRole + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("datasourceIds", List.of(DATASOURCE)))
++                .exchange()
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("角色不存在");
++
++        client.get()
++                .uri(ROLES + "/" + unknownRole + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("角色不存在");
++
++        putDatasources(List.of("no-such-ds"))
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("数据源不存在：no-such-ds");
++    }
++
++    @Test
++    void aMissingBodyDoesNotClearTheSet() {
++        putDatasources(List.of(DATASOURCE)).expectStatus().isOk();
++
++        client.put()
++                .uri(ROLES + "/" + customRoleId + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("datasourceIds 不能为空");
++
++        client.put()
++                .uri(ROLES + "/" + customRoleId + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue("{\"datasourceIds\": null}")
++                .exchange()
++                .expectStatus()
++                .isBadRequest();
++
++        assertThat(getDatasources())
++                .as("omitting the body must not revoke every grant")
++                .containsExactly(DATASOURCE);
++        assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(1);
++    }
++
++    @Test
++    void aStudentCannotReadOrReplaceTheMatrix() {
++        String username = unique("student");
++        AppUser student =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Student", Roles.STUDENT)
++                        .block();
++        access.assignRoleByCode(student.id(), Roles.STUDENT).block();
++        String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
++
++        client.get()
++                .uri(DATASOURCE_ACCESS)
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        client.get()
++                .uri(ROLES + "/" + customRoleId + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        client.put()
++                .uri(ROLES + "/" + customRoleId + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("datasourceIds", List.of(DATASOURCE)))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        assertThat(getDatasources()).isEmpty();
++        assertThat(auditRows(customRoleId, "SUCCESS")).isZero();
++    }
++
++    @Test
++    void eachReplaceWritesOneSuccessRowWithSortedBeforeAndAfter() {
++        putDatasources(List.of(SECOND_DATASOURCE, DATASOURCE)).expectStatus().isOk();
++        putDatasources(List.of(DATASOURCE)).expectStatus().isOk();
++
++        assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(2);
++        assertThat(auditDistinct(customRoleId, "SUCCESS", "action"))
++                .containsExactly("role.datasources");
++        assertThat(auditDistinct(customRoleId, "SUCCESS", "entity_type")).containsExactly("ROLE");
++        assertThat(auditTransitions(customRoleId, "SUCCESS"))
++                .containsExactlyInAnyOrder(
++                        "[] -> [\"" + DATASOURCE + "\",\"" + SECOND_DATASOURCE + "\"]",
++                        "[\"" + DATASOURCE + "\",\"" + SECOND_DATASOURCE + "\"]"
++                                + " -> [\"" + DATASOURCE + "\"]");
++    }
++
++    @Test
++    void anUnknownDatasourceIsNotFoundAndAudited() {
++        putDatasources(List.of(DATASOURCE)).expectStatus().isOk();
++        long successBefore = auditRows(customRoleId, "SUCCESS");
++
++        putDatasources(List.of(DATASOURCE, "no-such-ds"))
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("数据源不存在：no-such-ds");
++
++        assertThat(getDatasources())
++                .as("a rejected request does not change the set")
++                .containsExactly(DATASOURCE);
++        assertThat(auditRows(customRoleId, "DENIED")).isEqualTo(1);
++        assertThat(auditRows(customRoleId, "SUCCESS")).isEqualTo(successBefore);
++        assertThat(auditDistinct(customRoleId, "DENIED", "reason"))
++                .containsExactly("数据源不存在：no-such-ds");
++        // The DENIED row's before state is the role's real current set, not [].
++        assertThat(auditTransitions(customRoleId, "DENIED"))
++                .containsExactly(
++                        "[\"" + DATASOURCE + "\"]"
++                                + " -> [\"" + DATASOURCE + "\",\"no-such-ds\"]");
++    }
++
++    @Test
++    void aGrantedDatasourceAppliesToTheNextRequest() {
++        AppUser user =
++                users.insert(unique("u"), passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT)
++                        .block();
++        assign(user.id(), customRoleId);
++        assertThat(resolve(user.id()).datasourceIds()).doesNotContain(DATASOURCE);
++
++        putDatasources(List.of(DATASOURCE)).expectStatus().isOk();
++
++        EffectiveAccess after = resolve(user.id());
++        assertThat(after.roles()).extracting(role -> role.id()).contains(customRoleId);
++        assertThat(after.datasourceIds())
++                .as("the edited set applies on the next resolution, without a new token")
++                .contains(DATASOURCE);
++
++        // Revoking the grant removes it from the very next resolution.
++        putDatasources(List.of()).expectStatus().isOk();
++        assertThat(resolve(user.id()).datasourceIds()).doesNotContain(DATASOURCE);
++    }
++
++    @Test
++    void legacyDatasourceAccessEndpointKeepsTheSameUnderlyingGrant() {
++        String studentRoleId = String.valueOf(roleByCode(matrix(), "student").get("id"));
++
++        // The legacy endpoint grants by role code and dual-writes the enforcement row; the new
++        // role-record matrix must reflect the same underlying grant.
++        client.put()
++                .uri(LEGACY + "/student/" + SECOND_DATASOURCE)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isOk();
++
++        assertThat(datasourceIdsInMatrix(studentRoleId))
++                .contains(DATASOURCE, SECOND_DATASOURCE);
++
++        client.delete()
++                .uri(LEGACY + "/student/" + SECOND_DATASOURCE)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isOk();
++
++        assertThat(datasourceIdsInMatrix(studentRoleId))
++                .contains(DATASOURCE)
++                .doesNotContain(SECOND_DATASOURCE);
++    }
++
++    // --- helpers ----------------------------------------------------------------------------
++
++    private String bearer() {
++        return "Bearer " + adminToken;
++    }
++
++    private WebTestClient.ResponseSpec putDatasources(List<String> ids) {
++        return client.put()
++                .uri(ROLES + "/" + customRoleId + "/datasources")
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("datasourceIds", ids))
++                .exchange();
++    }
++
++    private Map<String, Object> matrix() {
++        Map<String, Object> body =
++                client.get()
++                        .uri(DATASOURCE_ACCESS)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBody(new ParameterizedTypeReference<Map<String, Object>>() {})
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(body).isNotNull();
++        return body;
++    }
++
++    @SuppressWarnings("unchecked")
++    private Map<String, Object> roleByCode(Map<String, Object> matrix, String code) {
++        List<Map<String, Object>> roles = (List<Map<String, Object>>) matrix.get("roles");
++        return roles.stream()
++                .filter(role -> code.equals(String.valueOf(role.get("code"))))
++                .findFirst()
++                .orElseThrow();
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<String> datasourceIdsInMatrix(String roleId) {
++        List<Map<String, Object>> roles = (List<Map<String, Object>>) matrix().get("roles");
++        return roles.stream()
++                .filter(role -> roleId.equals(String.valueOf(role.get("id"))))
++                .map(role -> (List<String>) role.getOrDefault("datasourceIds", List.of()))
++                .findFirst()
++                .orElseThrow();
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<String> getDatasources() {
++        Map<String, Object> body =
++                client.get()
++                        .uri(ROLES + "/" + customRoleId + "/datasources")
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBody(new ParameterizedTypeReference<Map<String, Object>>() {})
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(body).isNotNull();
++        assertThat(body.get("roleId")).isEqualTo(customRoleId);
++        return (List<String>) body.getOrDefault("datasourceIds", List.of());
++    }
++
++    private EffectiveAccess resolve(String userId) {
++        Integer tokenVersion =
++                db.sql("SELECT token_version FROM app_user WHERE id = :id")
++                        .bind("id", userId)
++                        .map((row, meta) -> {
++                            Integer version = row.get("token_version", Integer.class);
++                            return version == null ? 0 : version;
++                        })
++                        .one()
++                        .block();
++        return resolver.resolve(userId, tokenVersion).block();
++    }
++
++    /** Creates a fresh, non built-in role and returns its id. */
++    private String createRole() {
++        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String roleId = "test-role-ds-" + suffix;
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_role (id, code, name, description, parent_id, built_in,"
++                                + " enabled, created_at, updated_at)"
++                                + " VALUES (:id, :code, :name, NULL, NULL, FALSE, TRUE, :now, :now)")
++                .bind("id", roleId)
++                .bind("code", "ds-" + suffix)
++                .bind("name", "DS " + suffix)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        return roleId;
++    }
++
++    private void assign(String userId, String roleId) {
++        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:user, :role, :now)")
++                .bind("user", userId)
++                .bind("role", roleId)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++    }
++
++    private long auditRows(String entityId, String result) {
++        Long count =
++                db.sql(
++                                "SELECT COUNT(*) AS n FROM access_audit"
++                                        + " WHERE actor_id = :actorId AND action = :action"
++                                        + " AND entity_id = :entityId AND result = :result")
++                        .bind("actorId", adminId)
++                        .bind("action", "role.datasources")
++                        .bind("entityId", entityId)
++                        .bind("result", result)
++                        .map((row, meta) -> row.get("n", Long.class))
++                        .one()
++                        .block();
++        return count == null ? 0L : count;
++    }
++
++    /**
++     * The distinct values of one audit column, for this test's actor and the given result.
++     *
++     * <p>Asserted on content rather than on row order: two rows written in the same millisecond have
++     * no stable order (the id is a random UUID).
++     */
++    private List<String> auditDistinct(String entityId, String result, String column) {
++        return db.sql(
++                        "SELECT DISTINCT " + column + " AS audit_value FROM access_audit"
++                                + " WHERE actor_id = :actorId AND action = :action"
++                                + " AND entity_id = :entityId AND result = :result")
++                .bind("actorId", adminId)
++                .bind("action", "role.datasources")
++                .bind("entityId", entityId)
++                .bind("result", result)
++                .map((row, meta) -> row.get("audit_value", String.class))
++                .all()
++                .collectList()
++                .block();
++    }
++
++    /** The distinct before -> after transitions recorded for the role. */
++    private List<String> auditTransitions(String entityId, String result) {
++        return db.sql(
++                        "SELECT DISTINCT before_json, after_json FROM access_audit"
++                                + " WHERE actor_id = :actorId AND action = :action"
++                                + " AND entity_id = :entityId AND result = :result")
++                .bind("actorId", adminId)
++                .bind("action", "role.datasources")
++                .bind("entityId", entityId)
++                .bind("result", result)
++                .map((row, meta) -> row.get("before_json", String.class)
++                        + " -> "
++                        + row.get("after_json", String.class))
++                .all()
++                .collectList()
++                .block();
++    }
++
++    private static String unique(String prefix) {
++        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++    }
++}

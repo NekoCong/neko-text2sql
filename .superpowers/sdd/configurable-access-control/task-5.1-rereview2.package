@@ -1,0 +1,716 @@
+﻿## Commits
+eeb8471 ﻿fix(access): remove the global ResponseStatusException handler
+
+## Stat
+ .../task-5.1-fix-report.md                         | 237 +++++++++++++++++++++
+ .../text2sql/access/AccessAdminService.java        |  62 ++++--
+ .../text2sql/controller/ApiExceptionHandler.java   |  27 +--
+ .../access/AccessAdminServiceTransactionTest.java  |  47 ++++
+ .../text2sql/web/ConversationControllerTest.java   |  32 +++
+ 5 files changed, 356 insertions(+), 49 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/configurable-access-control/task-5.1-fix-report.md b/.superpowers/sdd/configurable-access-control/task-5.1-fix-report.md
+new file mode 100644
+index 0000000..988f162
+--- /dev/null
++++ b/.superpowers/sdd/configurable-access-control/task-5.1-fix-report.md
+@@ -0,0 +1,237 @@
++# Task 5.1 — fix report (review round 1: "Needs fixes")
++
++Commit under review: `8f6b8d9` (task 5.1 initial delivery). Fix commit: see the follow-up commit
++`fix(access): ...` on this branch.
++
++## Blocking issues
++
++### 1. Audit/mutation atomicity — premise was wrong; now transactional
++
++**Review claim:** Spring Boot 4.1.1 auto-configures `R2dbcTransactionManager` and `TransactionalOperator`,
++and the conditional JDBC `knowledgeTransactionManager` does not suppress them.
++
++**Verified, not assumed.** `spring-boot-r2dbc-4.1.1.jar` ships
++`org/springframework/boot/r2dbc/autoconfigure/R2dbcTransactionManagerAutoConfiguration`, annotated
++`@ConditionalOnMissingBean(ReactiveTransactionManager.class)` — a *different* type from the JDBC
++`PlatformTransactionManager`, so the knowledge manager cannot block it. A throwaway probe test on the
++real application context printed:
++
++```
++PROBE reactive=[connectionFactoryTransactionManager] all=[connectionFactoryTransactionManager]
++```
++
++That is the only `TransactionManager` bean; my earlier claim in the task report was wrong.
++
++**Fix.** `AccessAdminService` now takes a `ReactiveTransactionManager` and builds two
++`TransactionalOperator`s:
++
++- `transactions` — default propagation, wraps the whole of `create(...)` and `update(...)`
++  (`.as(transactions::transactional)`). The role write and its `SUCCESS` audit row commit or roll
++  back together.
++- `newTransactions` — `PROPAGATION_REQUIRES_NEW`, used only when writing a `DENIED` row. The
++  rejection is signalled by throwing inside the outer transaction, which would otherwise roll the
++  `DENIED` row back with it; the nested transaction commits the row first, then rethrows.
++  `R2dbcTransactionManager` implements `doSuspend`/`doResume`, so `REQUIRES_NEW` is supported.
++
++A failed `SUCCESS` audit insert is no longer swallowed: it propagates, rolling the mutation back.
++The false "no transaction manager" Javadoc paragraph was replaced with the transactional contract.
++
++**Proof the tests are real.** New `AccessAdminServiceTransactionTest` (3 tests, real
++`R2dbcTransactionManager`, a delegating wrapper whose `record(...)` always fails):
++
++- `aFailedAuditInsertRollsTheCreateBack` — create with a broken audit → the role row is absent.
++- `aFailedAuditInsertRollsTheUpdateBack` — update with a broken audit → the old name survives.
++- `aSuccessfulCreateCommitsTheRoleAndItsAuditRowTogether` — role row and audit row both present.
++
++I temporarily removed `.as(transactions::transactional)` and re-ran the class: the two rollback tests
++**failed** (`[no role may be committed without its audit row]`, `[the rename must be rolled back]`),
++then passed again once restored. The tests bind the behaviour rather than passing vacuously.
++`AccessControlRoleTest#createsARoleThatAppearsInTheList` also asserts role count + exactly one
++`SUCCESS` row.
++
++### 2. Global `ResponseStatusException` handler reverted; scoped handler added
++
++`controller/ApiExceptionHandler.java` is byte-for-byte the pre-5.1 version (`git diff` is empty for
++that path). The `{status, message}` rendering now lives in `AccessControlController` as a local
++`@ExceptionHandler(ResponseStatusException.class)`, so only this API's error shape changed.
++`AccessStatusIntegrationTest` (which exercises the filter's `{status: 401}` body on `/api/auth`)
++stays green in the full run.
++
++The service raises its rejections as a private `Denial` exception carrying the HTTP status
++(`denial.toException()`), which the controller maps with `onErrorMap` — this keeps
++`AccessAdminService.toResponseStatusException(...)` the only bridge and avoids leaking the internal
++exception type.
++
++### 3. `parentId` null semantics made consistent
++
++- **Update:** `parentId` omitted or `null` → keep the current parent; `""` (or blank) → clear it.
++  This matches `name` / `description` / `enabled`.
++- **Create:** `parentId` omitted, `null` or `""` → root role. A new role has no stored parent, so
++  there is nothing to keep.
++- `AccessRoleRequest` Javadoc documents the rule; the service Javadoc does too.
++- Tests: `omittingParentOnUpdateKeepsIt` (covers omitted *and* explicit `null`), `emptyStringClearsTheParent`.
++
++### 4. Privilege escalation via inheritance blocked
++
++`permitParent(...)` rejects the built-in `admin` role as a parent on both create and update with
++`409 内置管理员角色不能作为父角色`, before any cycle walk. Rationale is in the Javadoc: inheriting
++`access.bypass_data_scope` would let an `access.manage` holder escalate; subset checks land in 5.7.
++Test: `rejectsTheBuiltInAdminRoleAsAParent` (create path and update path, both audited `DENIED`).
++
++## Minor items
++
++| Item | Status |
++| --- | --- |
++| `description` ≤ 512 (column width) | Added `MAX_DESCRIPTION_LENGTH = 512` in `normalizeDescription` → 400. Test `rejectsAnOversizedDescription` (513 chars). |
++| Duplicate `id` bind in `R2dbcAccessAdminRepository` | Removed (`insertRole` bound `:id` twice). |
++| Audit/response projection via a map round-trip (`String.valueOf`) | Replaced with a private `AuditRole` record serialized by Jackson (same field set as `AccessRoleView`, never secrets). Responses are mapped from `AccessRoleView.of(AccessRole)` directly. |
++| `DENIED` rows for unknown role / unknown parent | `<id>` PUT with an unknown id writes `DENIED` (entity_id = requested id) then 404. An unknown/rejected parent on **update** writes `DENIED` against the moved role's id; on **create** it writes `DENIED` against the client-supplied parent id (the only id available). |
++| Rule for 400s documented | Service Javadoc: validation that runs before an entity can be identified (bad code, missing name, oversized description, malformed path id) writes no row — there is no entity to reference. |
++| Deeper ancestor cycle test | `rejectsACycleThroughADeepAncestor` (top → mid → leaf, then re-parent top under leaf). |
++| Disabled parent allowed | `allowsADisabledParent`. |
++| GET ordering by code | `listsRolesOrderedByCode` asserts the returned codes are sorted. |
++| Restore seeded admin role name | `renamingTheBuiltInAdminIsAllowedAndRestored` restores in a `finally`; asserts the restore. |
++| Unambiguous `auditRows` null parameter | Javadoc states `null` = **no id filter** (never `IS NULL`); the SQL fragment is only appended when non-null. |
++
++## Test names that changed
++
++`renamingTheBuiltInAdminIsAllowed` → `renamingTheBuiltInAdminIsAllowedAndRestored`;
++`rejectsAnUnknownRoleId` → `rejectsAnUnknownRoleIdAndAuditsIt`.
++
++## Validation
++
++- Covering tests: `mvnw -o test -Dtest=AccessAdminServiceTransactionTest,AccessControlRoleTest`
++  → `Tests run: 21, Failures: 0, Errors: 0, Skipped: 0`, BUILD SUCCESS.
++- Full suite: `mvnw -o test` with `DASHSCOPE_API_KEY` unset
++  → `Tests run: 276, Failures: 0, Errors: 0, Skipped: 0`, **BUILD SUCCESS**
++  (266 before this round; +18 web tests, +3 transaction tests, −11 old web tests = +10 net).
++- **Correction (round 2):** the claim "`git diff` on `controller/ApiExceptionHandler.java`: empty"
++  above was wrong. It was measured against the working tree/index, not the pre-5.1 base, so it could
++  not see that the global handler had been introduced in `8f6b8d9`. See round 2 below.
++
++## Residual notes
++
++- Unknown-parent rejection on update is filed against the moved role's id (the entity that exists);
++  the client-supplied parent id is not written as `entity_id` there because it identifies no row. On
++  create there is no role row yet, so the requested parent id is used.
++- The `DENIED` path uses `REQUIRES_NEW`. If the audit write itself fails, the rejection is still
++  returned (the failure is logged) — a rejection is never suppressed because its trail could not be
++  written.
++- Create with a duplicate code files the `DENIED` row against the *existing* role's id (that is the
++  row the code collides with), so the attempted create is attributable.
++
++---
++
++# Round 2 — re-review: finding #2 reopened
++
++**Finding: the global `@ExceptionHandler(ResponseStatusException.class)` in
++`controller/ApiExceptionHandler.java` was still present.** Correct. It was introduced in the 5.1 base
++commit `8f6b8d9`, so my round-1 check (`git diff` of the working tree against the index) was vacuous
++and could never have caught it. Acknowledged and fixed.
++
++## 1. Global handler removed — verified against the real base
++
++`ApiExceptionHandler` is restored **byte-for-byte** to its pre-5.1 content: only the
++`SqlPermissionException` → 403 handler.
++
++The reference the re-review gave, `80f132e`, is a **blob**, not a commit
++(`git cat-file -t 80f132e` → `blob`). I verified it is exactly the pre-5.1 file: its hash equals the
++blob at `383fad9` (the commit that authored the advice, "fix(api): map permission failures to 403
++instead of 500"):
++
++```
++$ git rev-parse 80f132e
++80f132ed7332ff642ecd21cf6b6a820c2bfe5958
++$ git rev-parse 383fad9:text2sql-backend/.../ApiExceptionHandler.java
++80f132ed7332ff642ecd21cf6b6a820c2bfe5958
++```
++
++Restored with `git update-index --cacheinfo` + `git checkout-index` (not shell redirection, which
++would have rewritten the line endings and left the bytes different):
++
++```
++$ git diff 80f132e -- text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ApiExceptionHandler.java
++(empty)
++$ git rev-parse ':text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ApiExceptionHandler.java'
++80f132ed7332ff642ecd21cf6b6a820c2bfe5958
++```
++
++The same check also fails, as required, for the 5.1 commit range: before this fix,
++`git diff 8f6b8d9 -- <file>` shows the global handler being added; after this commit,
++`git diff 8f6b8d9..HEAD -- <file>` is empty.
++
++The controller-local `@ExceptionHandler(ResponseStatusException.class)` in `AccessControlController`
++is kept, so the role API still returns `{status, message}`. Verified independently: `AccessControlRoleTest`
++(18 tests, which assert on `$.message`) passes, and `ConversationControllerTest` passes with the
++default Spring body.
++
++## 2. Minor cleanups
++
++| Item | Status |
++| --- | --- |
++| Dead `notFound(...)` helper | Removed; every `404` now comes from `new Denial(reason, HttpStatus.NOT_FOUND)`. |
++| `deny(...)` re-deriving the status by string-matching the reason | `deny(...)` now takes the `Denial` itself and uses its own status; `statusFor(String)` deleted. Call sites pass `new Denial(REASON_X, HttpStatus.Y)` explicitly, so the status is declared where the rejection is created. |
++| `json()` must not turn a DENIED 409/404 into a 500 or drop the row | The DENIED path uses `jsonForDenial(...)`, which catches a serialization failure, logs it and writes a `null` payload; the rejection and its row still go through. The SUCCESS path keeps the throwing `json()` — there a failure must roll the mutation back, which is the transactional contract. Test: `AccessAdminServiceTransactionTest#anUnserializableDeniedPayloadStillRecordsTheRowAndKeepsTheStatus` (a throwing `ObjectMapper`) asserts the caller still gets a `404` denial and exactly one `DENIED` row is written; restoring `json(...)` in the DENIED path makes it fail. |
++| Javadoc overclaim "every rejection that names an existing entity is audited" | Corrected (option: fix the sentence, not add rows). The class Javadoc now states the rule explicitly: field validation (`400`) runs before the entity is loaded and writes no row; every rejection decided against a loaded entity is audited as `DENIED`; a `400` on an existing role is not audited. |
++
++## 3. Guard test for the global handler
++
++`ConversationControllerTest#unknownConversationKeepsTheDefaultErrorBodyShape` asserts that an
++unrelated `ResponseStatusException` (a conversation not owned by the caller → 404) still returns
++Spring's default body: `timestamp`, `status: 404`, `error: "Not Found"`, `path` present and `message`
++absent (Boot suppresses `message` by default). The role API's `{status, message}` shape would fail
++this.
++
++**Verified the guard bites.** I temporarily re-added a global `@ExceptionHandler(ResponseStatusException.class)`
++to `ApiExceptionHandler`, re-ran the class, and it failed:
++
++```
++java.lang.AssertionError: No value at JSON path "$.timestamp"
++  ConversationControllerTest.unknownConversationKeepsTheDefaultErrorBodyShape:148
++```
++
++Then restored the clean file and it passes. The test cannot silently degenerate.
++
++## Validation (round 2)
++
++- `mvnw -o test -Dtest=AccessControlRoleTest` → `Tests run: 18, Failures: 0, Errors: 0` (role API
++  still returns `{status,message}` with no global handler).
++- `mvnw -o test -Dtest=ConversationControllerTest` → `Tests run: 4, Failures: 0, Errors: 0`.
++- Full suite, `DASHSCOPE_API_KEY` unset, after `mvn clean`-equivalent (`target/classes`,
++  `target/test-classes` removed): **`Tests run: 278, Failures: 0, Errors: 0, Skipped: 0`,
++  BUILD SUCCESS** (276 → 278: the conversation error-shape guard + the DENIED serialization test).
++- `git diff 80f132e -- .../ApiExceptionHandler.java` → empty; blob equals `80f132e`.
++
++> Note: an intermediate full run showed one failure in `AccessAdminServiceTransactionTest` that did
++> not reproduce in isolation. It was a stale `target/classes` artefact from an experiment that
++> temporarily edited the service, not a code defect; a clean rebuild is green. Flagged for honesty
++> rather than quietly re-run.
++
++## Commit hygiene note (round 3, self-caught)
++
++The first commit attempt (`7fe6d8a`) did **not** contain the restoration: `git update-index --cacheinfo`
++had staged the clean blob, but a later `git checkout-index -f` ran with `core.autocrlf` converting the
++worktree copy to CRLF, so the follow-up `git add` restaged a CRLF blob (`sha 77a1434` = same text,
++different bytes) and the commit recorded the handler as still absent only by accident of which blob won.
++Caught by re-reading `HEAD:<file>` instead of trusting the diff. Fixed by writing LF bytes and
++`git commit --amend`; the commit is now `819d155`, and verification is done on the tree, not the diff:
++
++```
++$ git rev-parse 'HEAD:.../ApiExceptionHandler.java'
++80f132ed7332ff642ecd21cf6b6a820c2bfe5958      # == 80f132e, pre-5.1
++$ git hash-object .../ApiExceptionHandler.java
++80f132ed7332ff642ecd21cf6b6a820c2bfe5958      # worktree, LF, no CRLF
++$ git diff 8f6b8d9..819d155 -- <file> | grep '^-'
++-@ExceptionHandler(ResponseStatusException.class)   # the handler is removed in the committed range
++```
++
++Note `80f132e` is a **blob**, so `git diff 80f132e..HEAD` is not a valid revision range
++(`fatal: unable to read tree`); the equivalent check is the blob comparison above.
++
++## Residual notes (round 2)
++
++- The 400-not-audited rule is a deliberate choice, documented in the class Javadoc. If a later task
++  wants attempts-on-known-entities recorded even when malformed, it would need to load the entity
++  before validating fields — a deliberate ordering change, not a silent one.
++- `Denial` remains a private nested type surfaced through `AccessAdminService.toResponseStatusException`;
++  the controller-local handler is the only consumer.
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+index 30d8fbf..89f4e92 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+@@ -38,24 +38,33 @@ import reactor.core.publisher.Mono;
+  *       {@code access.bypass_data_scope} from it.
+  *   <li>Built-in roles keep their {@code code}; the built-in administrator role cannot be disabled.
+  *       Other built-in roles may be renamed or disabled.
+  * </ul>
+  *
+  * <p>Each mutation runs in one reactive transaction (the R2DBC {@code TransactionalOperator}): the
+  * role write and its {@code access_audit} row commit together or not at all, so a failed audit insert
+  * also rolls the mutation back. A rejected mutation writes exactly one {@code DENIED} row in its own
+  * transaction before the rejection is returned.
+  *
+- * <p>Request validation that runs before a role or parent can be identified (a malformed code, a
+- * missing name, an oversized description, a malformed path id) writes no audit row: there is no
+- * entity to reference. Every rejection that names an existing entity, or a parent id supplied by the
+- * client, is audited.
++ * <p>Not every rejection is audited, and the rule is <em>validation first, audit second</em>:
++ *
++ * <ul>
++ *   <li>Field validation (a malformed code, a missing or over-long name, an oversized description, a
++ *       malformed path id) fails with {@code 400} before the target entity is even loaded, so it
++ *       writes no row — there is no entity to attribute the attempt to.
++ *   <li>Every rejection decided <em>against a loaded entity</em> is audited as {@code DENIED}: an
++ *       unknown role id, an unknown or forbidden parent, a cycle, an immutable code change, a
++ *       duplicate code, and disabling the built-in administrator.
++ * </ul>
++ *
++ * <p>So a {@code 400} on an existing role is not audited; it is a malformed request rather than a
++ * denial of an identifiable change. The audit trail records attempts that reached the entity.
+  */
+ @Service
+ public class AccessAdminService {
+ 
+     private static final Logger log = LoggerFactory.getLogger(AccessAdminService.class);
+ 
+     /** A role code: a lowercase letter, then lowercase letters/digits/underscore/dash (2-64 chars). */
+     static final String CODE_PATTERN_DESCRIPTION = "^[a-z][a-z0-9_-]{1,63}$";
+ 
+     private static final Pattern CODE_PATTERN = Pattern.compile(CODE_PATTERN_DESCRIPTION);
+@@ -152,42 +161,42 @@ public class AccessAdminService {
+                             return repository
+                                     .roleByCode(code)
+                                     .flatMap(
+                                             existing ->
+                                                     deny(
+                                                             actorId,
+                                                             ACTION_CREATE,
+                                                             existing.id(),
+                                                             null,
+                                                             requested,
+-                                                            REASON_DUPLICATE_CODE))
++                                                            new Denial(REASON_DUPLICATE_CODE, HttpStatus.CONFLICT)))
+                                     .switchIfEmpty(
+                                             Mono.defer(
+                                                     () -> insert(actorId, requested)))
+                                     .map(AccessRoleView::of);
+                         })
+                 .as(transactions::transactional);
+     }
+ 
+     /** Validates the parent, inserts the role and appends its audit row. */
+     private Mono<AccessRole> insert(String actorId, AccessRole requested) {
+         return requireUsableParent(requested.parentId())
+                 .onErrorResume(
+                         Denial.class,
+                         denial ->
+                                 deny(
+                                                 actorId,
+                                                 ACTION_CREATE,
+                                                 requested.parentId(),
+                                                 null,
+                                                 requested,
+-                                                denial.getMessage())
++                                                denial)
+                                         .then())
+                 .then(
+                         Mono.defer(
+                                 () ->
+                                         repository.insertRole(
+                                                 requested.code(),
+                                                 requested.name(),
+                                                 requested.description(),
+                                                 requested.parentId(),
+                                                 requested.enabled())))
+@@ -222,21 +231,21 @@ public class AccessAdminService {
+                                                                     roleId,
+                                                                     null,
+                                                                     roleView(
+                                                                             roleId,
+                                                                             body.code(),
+                                                                             body.name(),
+                                                                             body.description(),
+                                                                             body.parentId(),
+                                                                             false,
+                                                                             body.enabled()),
+-                                                                    REASON_ROLE_MISSING)))
++                                                                    new Denial(REASON_ROLE_MISSING, HttpStatus.NOT_FOUND))))
+                                     .flatMap(before -> update(actorId, before, body))
+                                     .map(AccessRoleView::of);
+                         })
+                 .as(transactions::transactional);
+     }
+ 
+     /**
+      * Applies an update request to a loaded role. The denial checks run first (they are audited); the
+      * validation and cycle check happen in {@link #applyUpdate}.
+      */
+@@ -250,38 +259,38 @@ public class AccessAdminService {
+                     before.id(),
+                     before,
+                     roleView(
+                             before.id(),
+                             body.code(),
+                             body.name(),
+                             body.description(),
+                             body.parentId(),
+                             before.builtIn(),
+                             body.enabled()),
+-                    REASON_IMMUTABLE_CODE);
++                    new Denial(REASON_IMMUTABLE_CODE, HttpStatus.CONFLICT));
+         }
+         boolean enabled = body.enabled() == null ? before.enabled() : body.enabled();
+         if (before.builtIn() && Roles.ADMIN.equals(before.code()) && !enabled) {
+             return deny(
+                     actorId,
+                     ACTION_DISABLE,
+                     before.id(),
+                     before,
+                     roleView(
+                             before.id(),
+                             before.code(),
+                             before.name(),
+                             before.description(),
+                             before.parentId(),
+                             true,
+                             false),
+-                    REASON_BUILT_IN_ADMIN);
++                    new Denial(REASON_BUILT_IN_ADMIN, HttpStatus.CONFLICT));
+         }
+         return applyUpdate(actorId, before, body);
+     }
+ 
+     private Mono<AccessRole> applyUpdate(
+             String actorId, AccessRole before, AccessRoleRequest body) {
+         String name = body.name() == null ? before.name() : validateName(body.name());
+         String description =
+                 body.description() == null
+                         ? before.description()
+@@ -307,21 +316,21 @@ public class AccessAdminService {
+         return parentCheck
+                 .onErrorResume(
+                         Denial.class,
+                         denial ->
+                                 deny(
+                                                 actorId,
+                                                 action,
+                                                 before.id(),
+                                                 before,
+                                                 requested,
+-                                                denial.getMessage())
++                                                denial)
+                                         .then())
+                 .then(
+                         Mono.defer(
+                                 () ->
+                                         repository.updateRole(
+                                                 before.id(), name, description, parentId, enabled)))
+                 .then(repository.role(before.id()))
+                 .switchIfEmpty(Mono.error(new IllegalStateException("角色更新后丢失：" + before.id())))
+                 .flatMap(after -> audit(actorId, action, before, after));
+     }
+@@ -510,61 +519,71 @@ public class AccessAdminService {
+                         ENTITY_TYPE,
+                         after.id(),
+                         json(before),
+                         json(after),
+                         RESULT_SUCCESS,
+                         null)
+                 .thenReturn(after);
+     }
+ 
+     /**
+-     * Appends a DENIED row for a rejected mutation, then fails with the matching HTTP status.
++     * Appends a DENIED row for a rejected mutation, then fails with that rejection.
+      *
+      * <p>Runs in its own nested transaction so the row survives the outer mutation transaction
+      * rolling back with the rejection.
+      */
+     private Mono<AccessRole> deny(
+             String actorId,
+             String action,
+             String entityId,
+             AccessRole before,
+             AccessRole requested,
+-            String reason) {
+-        Denial denial = new Denial(reason, statusFor(reason));
++            Denial denial) {
+         Mono<Void> record =
+                 repository
+                         .record(
+                                 actorId,
+                                 action,
+                                 ENTITY_TYPE,
+                                 entityId,
+-                                json(before),
+-                                json(requested),
++                                jsonForDenial(before),
++                                jsonForDenial(requested),
+                                 RESULT_DENIED,
+-                                truncate(reason))
++                                truncate(denial.getMessage()))
+                         .onErrorResume(
+                                 error -> {
+                                     log.error(
+                                             "Failed to append the DENIED audit row {}",
+                                             action,
+                                             error);
+                                     return Mono.empty();
+                                 });
+         // The audit row is part of the rejection: it commits, then the request fails. If the row
+         // cannot be written the request still fails, so a rejection is never silently unrecorded.
+         return record.as(newTransactions::transactional).then(Mono.error(denial));
+     }
+ 
+-    private static HttpStatus statusFor(String reason) {
+-        return REASON_PARENT_MISSING.equals(reason) || REASON_ROLE_MISSING.equals(reason)
+-                ? HttpStatus.NOT_FOUND
+-                : HttpStatus.CONFLICT;
++    /**
++     * Serializes an audit payload for a <em>rejected</em> request.
++     *
++     * <p>Unlike the success path, this must never fail: the rejection's status (409/404) has to reach
++     * the client and the DENIED row must still be written. A serialization failure is logged and the
++     * payload is written as {@code null} rather than turning the response into a 500 or dropping the
++     * row.
++     */
++    private String jsonForDenial(AccessRole role) {
++        try {
++            return json(role);
++        } catch (IllegalStateException ex) {
++            log.warn("Failed to serialize the DENIED audit payload; storing null instead", ex);
++            return null;
++        }
+     }
+ 
+     private static String actionFor(AccessRole before, boolean enabled) {
+         return before.enabled() && !enabled ? ACTION_DISABLE : ACTION_UPDATE;
+     }
+ 
+     private String json(AccessRole role) {
+         if (role == null) {
+             return null;
+         }
+@@ -634,14 +653,11 @@ public class AccessAdminService {
+     }
+ 
+     private static AccessRoleRequest empty() {
+         return new AccessRoleRequest(null, null, null, null, null);
+     }
+ 
+     private static ResponseStatusException badRequest(String message) {
+         return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
+     }
+ 
+-    private static ResponseStatusException notFound(String message) {
+-        return new ResponseStatusException(HttpStatus.NOT_FOUND, message);
+-    }
+ }
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ApiExceptionHandler.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ApiExceptionHandler.java
+index 6d7e852..80f132e 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ApiExceptionHandler.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/ApiExceptionHandler.java
+@@ -1,55 +1,30 @@
+ package com.nekocong.text2sql.controller;
+ 
+ import com.nekocong.text2sql.security.SqlPermissionException;
+ import java.util.Map;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.http.ResponseEntity;
+ import org.springframework.web.bind.annotation.ExceptionHandler;
+ import org.springframework.web.bind.annotation.RestControllerAdvice;
+-import org.springframework.web.server.ResponseStatusException;
+ 
+ /**
+  * Maps permission failures raised outside the SSE path onto HTTP 403 with a readable reason.
+  *
+  * <p>The SSE endpoints already turn errors into an {@code error} event, so this advice mainly covers
+- * the synchronous endpoints (and keeps a permission problem from surfacing as a bare 500). It also
+- * renders a deliberate {@link ResponseStatusException} raised by a controller or service as
+- * {@code {"status": ..., "message": ...}}, the same shape Spring's default handler uses.
+- *
+- * <p>Status exceptions raised in a filter (before handler mapping) never reach this advice: Spring no
+- * longer routes them through the handler-exception resolvers, so the access-status filter's own JSON
+- * body is preserved.
++ * the synchronous endpoints (and keeps a permission problem from surfacing as a bare 500).
+  */
+ @RestControllerAdvice
+ public class ApiExceptionHandler {
+ 
+     /**
+      * Handles a rejected statement or datasource.
+      *
+      * @param exception the failure
+      * @return a 403 response carrying the reason
+      */
+     @ExceptionHandler(SqlPermissionException.class)
+     public ResponseEntity<Map<String, String>> handlePermission(SqlPermissionException exception) {
+         return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                 .body(Map.of("error", "Forbidden", "message", exception.getMessage()));
+     }
+-
+-    /**
+-     * Renders a deliberate status exception raised by a controller or service.
+-     *
+-     * @param exception the failure
+-     * @return the mapped response
+-     */
+-    @ExceptionHandler(ResponseStatusException.class)
+-    public ResponseEntity<Map<String, Object>> handleStatus(ResponseStatusException exception) {
+-        HttpStatus resolved = HttpStatus.resolve(exception.getStatusCode().value());
+-        if (resolved == null) {
+-            resolved = HttpStatus.INTERNAL_SERVER_ERROR;
+-        }
+-        String reason = exception.getReason();
+-        String message = reason == null || reason.isBlank() ? resolved.getReasonPhrase() : reason;
+-        return ResponseEntity.status(resolved)
+-                .body(Map.of("status", resolved.value(), "message", message));
+-    }
+ }
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+index 2bff537..4f6dea3 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+@@ -89,20 +89,67 @@ class AccessAdminServiceTransactionTest {
+ 
+         service.create(actorId, new AccessRoleRequest(code, "原子", null, null, true))
+                 .as(StepVerifier::create)
+                 .expectNextCount(1)
+                 .verifyComplete();
+ 
+         assertThat(roleCount(code)).isEqualTo(1);
+         assertThat(auditCount(actorId)).isEqualTo(1);
+     }
+ 
++    /**
++     * A serializer that blows up while writing a DENIED payload must not turn the 409/404 into a 500
++     * and must not drop the row: the rejection's status still reaches the caller and the row is
++     * written with a {@code null} payload.
++     */
++    @Test
++    void anUnserializableDeniedPayloadStillRecordsTheRowAndKeepsTheStatus() {
++        ObjectMapper broken =
++                new ObjectMapper() {
++                    @Override
++                    public String writeValueAsString(Object value)
++                            throws com.fasterxml.jackson.core.JsonProcessingException {
++                        throw new com.fasterxml.jackson.core.JsonProcessingException("boom") {};
++                    }
++                };
++        AccessAdminService brokenService =
++                new AccessAdminService(repository, transactionManager, broken);
++
++        String unknown = UUID.randomUUID().toString();
++        // Unknown role -> 404 denial whose payload cannot be serialized.
++        assertThatThrownBy(
++                        () ->
++                                brokenService
++                                        .update(
++                                                actorId,
++                                                unknown,
++                                                new AccessRoleRequest(null, "x", null, null, null))
++                                        .block())
++                // The rejection stays a denial (the controller maps it), not a 500 from serialization.
++                .satisfies(
++                        error ->
++                                assertThat(AccessAdminService.toResponseStatusException(error))
++                                        .isNotNull()
++                                        .extracting(
++                                                e ->
++                                                        ((org.springframework.web.server
++                                                                        .ResponseStatusException)
++                                                                e)
++                                                                .getStatusCode()
++                                                                .value())
++                                        .isEqualTo(404));
++
++        assertThat(auditCount(actorId))
++                .as("the DENIED row is written even though its payload was null")
++                .isEqualTo(1);
++    }
++
+     /** Wraps the repository so only {@code record} fails, after any mutation statement has run. */
+     private static AccessAdminRepository failingAudit(AccessAdminRepository delegate) {
+         return new AccessAdminRepository() {
+             @Override
+             public Mono<List<AccessRole>> roles() {
+                 return delegate.roles();
+             }
+ 
+             @Override
+             public Mono<AccessRole> role(String id) {
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationControllerTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationControllerTest.java
+index 55b6244..a3b2685 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationControllerTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationControllerTest.java
+@@ -117,20 +117,52 @@ class ConversationControllerTest {
+         String otherToken = TestAuth.registerAndLogin(client);
+ 
+         client.get()
+                 .uri("/api/conversations/{id}/messages", id)
+                 .header(HttpHeaders.AUTHORIZATION, "Bearer " + otherToken)
+                 .exchange()
+                 .expectStatus()
+                 .isNotFound();
+     }
+ 
++    /**
++     * Guards the shared error contract: a {@link ResponseStatusException} from an unrelated endpoint
++     * keeps Spring's default body ({@code timestamp/status/error/message/path}), not the
++     * {@code {status, message}} shape the role admin API uses. If a global
++     * {@code @ExceptionHandler(ResponseStatusException.class)} is ever added to the application advice
++     * again, this fails.
++     */
++    @Test
++    void unknownConversationKeepsTheDefaultErrorBodyShape() {
++        String id = createConversation();
++        String otherToken = TestAuth.registerAndLogin(client);
++
++        client.get()
++                .uri("/api/conversations/{id}/messages", id)
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + otherToken)
++                .exchange()
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                // The default Spring error body carries these; the role API's shape does not.
++                .jsonPath("$.timestamp")
++                .exists()
++                .jsonPath("$.status")
++                .isEqualTo(404)
++                .jsonPath("$.error")
++                .isEqualTo("Not Found")
++                .jsonPath("$.path")
++                .exists()
++                .jsonPath("$.message")
++                .doesNotExist();
++    }
++
+     @Test
+     void historyEmbedsRowsAndChartAsRealJson() {
+         String id = createConversation();
+         String userId = TestAuth.currentUserId(client, token);
+         String chart = "{\"type\":\"TABLE\",\"xField\":null,\"yField\":null,\"title\":\"成绩\"}";
+         String rows =
+                 "{\"columns\":[{\"name\":\"score\",\"typeName\":\"DOUBLE\"}],"
+                         + "\"rows\":[{\"score\":92.0}],\"rowCount\":1,\"truncated\":false,\"elapsedMs\":3}";
+         conversations.appendAssistantMessage(id, "答案", "SELECT 1", chart, rows).block();
+ 

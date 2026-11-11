@@ -5,7 +5,7 @@
 - [x] 1.1 在 `docker-compose.yml` 增加 pgvector 服务（端口 5433，华为云镜像 `${REGISTRY_PREFIX}/docker.io/pgvector/pgvector:pg16`）与初始化脚本，执行 `CREATE EXTENSION IF NOT EXISTS vector`；验证：`docker compose up -d pgvector` 后能查询到 `vector` 扩展版本
 - [x] 1.2 在 `docker-compose.yml` 增加 MinIO 服务（9000/9001，华为云镜像 `${REGISTRY_PREFIX}/docker.io/minio/minio:RELEASE.2025-07-23T15-54-02Z`）与数据卷；验证：控制台可登录，API 健康检查返回 200
 - [x] 1.3 将现有 MySQL 与 otel-lgtm 镜像改为同一 `REGISTRY_PREFIX` 变量（默认华为云 SWR），保留切回官方源的能力；验证：`docker compose config` 渲染出的镜像地址正确，`docker compose pull` 成功
-- [x] 1.4 在 `text2sql-backend/pom.xml` 增加 PostgreSQL 驱动、pgvector Java 依赖、MinIO SDK（`io.minio:minio`）、Tika（`tika-core` + `tika-parsers-standard-package` 3.x）；验证：`mvn -q -DskipTests compile` 通过
+- [x] 1.4 在 `neko-text2sql-backend/pom.xml` 增加 PostgreSQL 驱动、pgvector Java 依赖、MinIO SDK（`io.minio:minio`）、Tika（`tika-core` + `tika-parsers-standard-package` 3.x）；验证：`mvn -q -DskipTests compile` 通过
 - [x] 1.5 新增 `text2sql.knowledge.*` 配置项（开关、pgvector 连接、embedding、检索参数、chunk 大小、MinIO endpoint/bucket/预签名 TTL、解析引擎选择、MinerU token 与超时、文件大小/页数上限）并写入 `application.yml`；验证：配置绑定测试通过，开关关闭时可正常启动
 - [x] 1.6 在 `README.md` 补充 pgvector 与 MinIO 启动方式、华为云镜像变量、环境变量与回滚开关；验证：按文档命令可启动容器并连接
 

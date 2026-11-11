@@ -1,0 +1,1823 @@
+﻿## Commits
+8824a7b feat(access): gate user routes by user.read/user.manage, paginate list, add display-name edit/detail
+d00eaac fix(access): cover role-change token-version test and close 5.4 review minors
+
+## Stat
+ .../task-5.4-fix-report.md                         |  92 +++++
+ .../text2sql/access/AccessAdminRepository.java     |  32 +-
+ .../access/R2dbcAccessAdminRepository.java         | 105 +++--
+ .../nekocong/text2sql/access/UserAdminService.java | 252 ++++++++++--
+ .../access/api/AccessControlController.java        |  43 +-
+ .../api/dto/AccessUserDisplayNameRequest.java      |  11 +
+ .../text2sql/access/api/dto/AccessUserPage.java    |  34 ++
+ .../nekocong/text2sql/config/SecurityConfig.java   |  32 ++
+ .../access/AccessAdminServiceTransactionTest.java  |  15 +-
+ .../RolePermissionServiceTransactionTest.java      |  15 +-
+ .../text2sql/web/AccessControlUserTest.java        | 445 +++++++++++++++++++--
+ 11 files changed, 970 insertions(+), 106 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/configurable-access-control/task-5.4-fix-report.md b/.superpowers/sdd/configurable-access-control/task-5.4-fix-report.md
+new file mode 100644
+index 0000000..18b7d7b
+--- /dev/null
++++ b/.superpowers/sdd/configurable-access-control/task-5.4-fix-report.md
+@@ -0,0 +1,92 @@
++# Task 5.4 fix report — user lifecycle admin API
++
++Review outcome addressed: **approved with one missing brief test + minors**. All items below are
++in commit on `master`; covering class `AccessControlUserTest` is now 13 tests.
++
++## Required
++
++1. **Role changes do not bump `token_version` and take effect on the next request.**
++   - Added `roleChangesTakeEffectOnTheNextRequestWithoutBumpingTokenVersion` (HTTP-level).
++   - Creates a user with the `student` role (no `access.manage`), logs in and keeps the token;
++     asserts `GET /api/admin/access-control/roles` is 403 with that token.
++   - As admin, replaces the user's roles with a fresh role granting `access.manage`
++     (`createRoleGranting(Permissions.ACCESS_MANAGE)`); asserts 200 and that the DB
++     `token_version` is unchanged.
++   - With the *same* token, `GET /api/admin/access-control/roles` now returns 200 (no re-login),
++     because permissions are resolved from the database on every request.
++   - Removes the role again and asserts the same token is once more 403, with `token_version`
++     still unchanged.
++   - Note: `datasource.read` is a catalog-only permission with no HTTP route gate in this
++     codebase, so the test uses `access.manage` (gated by `PermissionAuthorizationManager` on
++     `/api/admin/**`) to observe the effect through a real route.
++
++## Minors
++
++- **Duplicate-username race returns 409, not 500.** The user insert is now wrapped in
++  `onErrorResume(DuplicateKeyException.class, …)` → `duplicateRace(...)`, which reloads the
++  winning row in a `REQUIRES_NEW` transaction, writes an audited `user.create` DENIED row
++  (`entity_id` = winning id), and fails with 409 `用户名已存在`. If the winning row cannot be
++  located the conflict is logged and still answered 409 (no audit). The pre-read
++  (`userByUsername`) remains the friendly path.
++- **Honest `roleCodes` in unknown-role denials.** `create` and `replaceRoles` no longer pass raw
++  `roleIds` into the denial payload. Both now resolve the known ids to their codes via
++  `knownRoleCodes(...)` (unknown ids stay absent), so `after_json.roleCodes` contains codes, not
++  ids.
++- **Test gaps.** Added `anUnknownUserIsNotFound` (status/reset/roles → 404 `用户不存在`) and
++  `aNoOpStatusChangeReturns200AndWritesNoAuditRow` (no-op enable/disable writes no audit row; the
++  real disable still writes exactly one).
++
++## Validation
++
++- `mvn test -Dtest=AccessControlUserTest` — 13 run, 0 failures.
++- `mvn test` (no `DASHSCOPE_API_KEY`) — **BUILD SUCCESS**, Tests run: **328**, Failures: 0,
++  Errors: 0, Skipped: 0.
++
++## Notes / residual concerns
++
++- The `DuplicateKeyException` race path is defensive: it only fires when the pre-read loses a
++  concurrent insert race, which is not deterministically exercised by the HTTP-level tests. The
++  friendly duplicate path (pre-read → 409 `用户名已存在` + DENIED row) remains covered by
++  `rejectsADuplicateUsernameAndAnUnknownRole`.
++- The permission-gated route used by the token-version test is `/api/admin/access-control/roles`
++  (`access.manage`); `datasource.read` is currently unenforced at any HTTP route, so it was not
++  used to avoid asserting a no-op.
++
++## Fix round 2 (spec/design cross-check — 3 gaps)
++
++1. **User routes gated by `user.read` / `user.manage`, not `access.manage`.**
++   `SecurityConfig` now maps `GET /api/admin/access-control/users` (list) and `GET
++   /api/admin/access-control/users/*` (detail) to `Permissions.USER_READ`, and `POST
++   /api/admin/access-control/users` + `/api/admin/access-control/users/**` (create / display-name
++   / status / reset-password / roles) to `Permissions.USER_MANAGE`. These matchers precede the
++   generic `/api/admin/**` → `access.manage` rule, so roles/permissions/data-scopes stay on
++   `access.manage`. Helpers `userRead()`/`userManage()` mirror the file's existing style; the JWT
++   role claim is not consulted.
++2. **Pagination on the user list.** `GET /users` now takes `page`/`size` (defaults 0/20, `size`
++   capped at 100; negative `page`/`size` or `size=0` → 400 `分页参数无效`) and returns
++   `{items, total, page, size}`. `total` is a `COUNT(*)` over the same filters and paging is
++   applied in SQL (`LIMIT :size OFFSET :offset`, ordered by `username, id`), never in memory.
++   New DTO `AccessUserPage`; repository `users(...)` gained `size`/`offset` and a `countUsers`
++   method (shared `WHERE` builder).
++3. **Display-name edit + detail.** Added `PUT /users/{id}` (body `{displayName}`; null/blank
++   clears; ≤100 else 400) auditing `user.update` with before/after `{displayName}` only and no
++   `token_version` bump, and `GET /users/{id}` (unknown → 404 `用户不存在`). New DTO
++   `AccessUserDisplayNameRequest`; repository `updateUserDisplayName`.
++
++Tests added in `AccessControlUserTest` (now 18): `listIsPaginatedInSqlWithATotalAndNoOverlap`
++(3 users, size 2 → 2 pages, total 3, no overlap), `editsAndClearsTheDisplayNameWithAuditAndNoTokenBump`,
++`readsOneUserAndReturnsNotFoundForUnknown`, `aUserReadOnlyRoleCanReadButNotWrite`, and
++`aUserManageOnlyRoleCanWriteButNotRead`. Existing list assertions were updated for the envelope.
++
++## Validation
++
++- `mvn test -Dtest=AccessControlUserTest` — 18 run, 0 failures.
++- `mvn test` (no `DASHSCOPE_API_KEY`) — **BUILD SUCCESS**, Tests run: **333**, Failures: 0,
++  Errors: 0, Skipped: 0.
++
++## Notes / residual concerns
++
++- `LIMIT :size OFFSET :offset` uses bound parameters, verified against H2 (the test dialect).
++  Production MySQL also accepts parameterised `LIMIT ? OFFSET ?`; no literal is interpolated.
++- The `total` JSON field is an integer; the test reads it via `Number` to stay agnostic of the
++  Jackson `Integer` vs `Long` deserialization choice.
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+index e6693ac..c36ba50 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+@@ -141,32 +141,46 @@ public interface AccessAdminRepository {
+ 
+     /**
+      * Deletes one data-scope rule by id.
+      *
+      * @param id the rule id
+      * @return the number of rows deleted ({@code 0} when the id is unknown)
+      */
+     Mono<Long> deleteDataScope(String id);
+ 
+     /**
+-     * Lists users, ordered by username, with each user's directly assigned roles attached.
++     * Lists users, ordered by username then id, with each user's directly assigned roles attached.
+      *
+      * <p>Every filter is optional; a {@code null} filter means "any". The {@code query} matches
+      * username and display name case-insensitively (contains); {@code roleId} keeps only users
+-     * directly assigned that role.
++     * directly assigned that role. The page is applied in SQL ({@code LIMIT}/{@code OFFSET}), never
++     * in memory.
+      *
+      * @param query the case-insensitive username/display-name contains filter, or {@code null}
+      * @param enabled keep only enabled/disabled users, or {@code null} for both
+      * @param roleId keep only users directly holding this role, or {@code null}
+-     * @return the matching users, ordered by username
++     * @param size the page size (already validated, at least 1)
++     * @param offset the zero-based offset of the page (already validated, at least 0)
++     * @return the matching users, ordered by username then id
+      */
+-    Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId);
++    Mono<List<AccessUser>> users(
++            String query, Boolean enabled, String roleId, int size, long offset);
++
++    /**
++     * Counts the users matching the given filters (the {@code total} of a page query).
++     *
++     * @param query the case-insensitive username/display-name contains filter, or {@code null}
++     * @param enabled keep only enabled/disabled users, or {@code null} for both
++     * @param roleId keep only users directly holding this role, or {@code null}
++     * @return the matching user count
++     */
++    Mono<Long> countUsers(String query, Boolean enabled, String roleId);
+ 
+     /**
+      * Finds one user by id, with directly assigned roles.
+      *
+      * @param id the user id
+      * @return the user, or empty
+      */
+     Mono<AccessUser> user(String id);
+ 
+     /**
+@@ -204,20 +218,30 @@ public interface AccessAdminRepository {
+ 
+     /**
+      * Replaces a user's password hash and bumps {@code token_version} in the same statement.
+      *
+      * @param id the user id
+      * @param passwordHash the new BCrypt hash
+      * @return completion
+      */
+     Mono<Void> updateUserPassword(String id, String passwordHash);
+ 
++    /**
++     * Updates a user's display name. This is the only mutable free-form field; it does not bump
++     * {@code token_version} (display name is not authorization-relevant).
++     *
++     * @param id the user id
++     * @param displayName the new display name, or {@code null} to clear
++     * @return completion
++     */
++    Mono<Void> updateUserDisplayName(String id, String displayName);
++
+     /**
+      * Replaces one user's role assignments.
+      *
+      * <p>Deletes every assignment of the user, then inserts the given ones. Both must run in the
+      * caller's transaction so the set is replaced atomically.
+      *
+      * @param userId the user id
+      * @param roleIds the complete new set (already validated)
+      * @return completion
+      */
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+index 5dd5fca..3cf7f3e 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+@@ -238,55 +238,43 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+ 
+     @Override
+     public Mono<Long> deleteDataScope(String id) {
+         return client.sql("DELETE FROM access_data_scope WHERE id = :id")
+                 .bind("id", id)
+                 .fetch()
+                 .rowsUpdated();
+     }
+ 
+     @Override
+-    public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
+-        boolean hasQuery = query != null && !query.isBlank();
+-        boolean hasEnabled = enabled != null;
+-        boolean hasRole = roleId != null && !roleId.isBlank();
+-        List<String> where = new ArrayList<>();
+-        if (hasQuery) {
+-            where.add("(LOWER(u.username) LIKE :query OR LOWER(u.display_name) LIKE :query)");
+-        }
+-        if (hasEnabled) {
+-            where.add("u.enabled = :enabled");
+-        }
+-        if (hasRole) {
+-            where.add(
+-                    "EXISTS (SELECT 1 FROM access_user_role ur"
+-                            + " WHERE ur.user_id = u.id AND ur.role_id = :roleId)");
+-        }
+-        StringBuilder sql = new StringBuilder("SELECT " + USER_COLUMNS + " FROM app_user u");
+-        if (!where.isEmpty()) {
+-            sql.append(" WHERE ").append(String.join(" AND ", where));
+-        }
+-        sql.append(" ORDER BY u.username");
+-
+-        DatabaseClient.GenericExecuteSpec spec = client.sql(sql.toString());
+-        if (hasQuery) {
+-            spec = spec.bind("query", "%" + query.trim().toLowerCase(Locale.ROOT) + "%");
+-        }
+-        if (hasEnabled) {
+-            spec = spec.bind("enabled", enabled);
+-        }
+-        if (hasRole) {
+-            spec = spec.bind("roleId", roleId.trim());
+-        }
++    public Mono<List<AccessUser>> users(
++            String query, Boolean enabled, String roleId, int size, long offset) {
++        Where where = where(query, enabled, roleId);
++        String sql = "SELECT " + USER_COLUMNS + " FROM app_user u" + where.sql
++                + " ORDER BY u.username, u.id"
++                + " LIMIT :size OFFSET :offset";
++        DatabaseClient.GenericExecuteSpec spec = bindWhere(client.sql(sql), where);
++        spec = spec.bind("size", size).bind("offset", offset);
+         return spec.map((row, meta) -> baseUser(row)).all().collectList().flatMap(this::attachRoles);
+     }
+ 
++    @Override
++    public Mono<Long> countUsers(String query, Boolean enabled, String roleId) {
++        Where where = where(query, enabled, roleId);
++        String sql = "SELECT COUNT(*) AS n FROM app_user u" + where.sql;
++        return bindWhere(client.sql(sql), where)
++                .map((row, meta) -> {
++                    Long count = row.get("n", Long.class);
++                    return count == null ? 0L : count;
++                })
++                .one();
++    }
++
+     @Override
+     public Mono<AccessUser> user(String id) {
+         return client.sql("SELECT " + USER_COLUMNS + " FROM app_user u WHERE u.id = :id")
+                 .bind("id", id)
+                 .map((row, meta) -> baseUser(row))
+                 .one()
+                 .flatMap(this::withRoles);
+     }
+ 
+     @Override
+@@ -329,20 +317,29 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+     @Override
+     public Mono<Void> updateUserPassword(String id, String passwordHash) {
+         return client.sql(
+                         "UPDATE app_user SET password_hash = :passwordHash,"
+                                 + " token_version = token_version + 1 WHERE id = :id")
+                 .bind("id", id)
+                 .bind("passwordHash", passwordHash)
+                 .then();
+     }
+ 
++    @Override
++    public Mono<Void> updateUserDisplayName(String id, String displayName) {
++        DatabaseClient.GenericExecuteSpec spec =
++                client.sql("UPDATE app_user SET display_name = :displayName WHERE id = :id")
++                        .bind("id", id);
++        spec = bindNullable(spec, "displayName", displayName);
++        return spec.then();
++    }
++
+     @Override
+     public Mono<Void> replaceUserRoles(String userId, List<String> roleIds) {
+         Mono<Void> delete =
+                 client.sql("DELETE FROM access_user_role WHERE user_id = :userId")
+                         .bind("userId", userId)
+                         .then();
+         return delete.then(assignRoles(userId, roleIds));
+     }
+ 
+     @Override
+@@ -380,20 +377,64 @@ public class R2dbcAccessAdminRepository implements AccessAdminRepository {
+         spec = bindNullable(spec, "afterJson", afterJson);
+         spec = bindNullable(spec, "reason", reason);
+         return spec.then();
+     }
+ 
+     private static DatabaseClient.GenericExecuteSpec bindNullable(
+             DatabaseClient.GenericExecuteSpec spec, String name, String value) {
+         return value == null ? spec.bindNull(name, String.class) : spec.bind(name, value);
+     }
+ 
++    /** Builds the shared user-list/count {@code WHERE} fragment and its bound values. */
++    private static Where where(String query, Boolean enabled, String roleId) {
++        boolean hasQuery = query != null && !query.isBlank();
++        boolean hasEnabled = enabled != null;
++        boolean hasRole = roleId != null && !roleId.isBlank();
++        List<String> conditions = new ArrayList<>();
++        if (hasQuery) {
++            conditions.add("(LOWER(u.username) LIKE :query OR LOWER(u.display_name) LIKE :query)");
++        }
++        if (hasEnabled) {
++            conditions.add("u.enabled = :enabled");
++        }
++        if (hasRole) {
++            conditions.add(
++                    "EXISTS (SELECT 1 FROM access_user_role ur"
++                            + " WHERE ur.user_id = u.id AND ur.role_id = :roleId)");
++        }
++        String sql = conditions.isEmpty() ? "" : " WHERE " + String.join(" AND ", conditions);
++        return new Where(
++                sql,
++                hasQuery ? query.trim().toLowerCase(Locale.ROOT) : null,
++                enabled,
++                hasRole ? roleId.trim() : null);
++    }
++
++    /** Binds the {@link Where} values to a statement (skipping the absent filters). */
++    private static DatabaseClient.GenericExecuteSpec bindWhere(
++            DatabaseClient.GenericExecuteSpec spec, Where where) {
++        DatabaseClient.GenericExecuteSpec bound = spec;
++        if (where.query != null) {
++            bound = bound.bind("query", "%" + where.query + "%");
++        }
++        if (where.enabled != null) {
++            bound = bound.bind("enabled", where.enabled);
++        }
++        if (where.roleId != null) {
++            bound = bound.bind("roleId", where.roleId);
++        }
++        return bound;
++    }
++
++    /** The user-list/count filter state: the SQL fragment plus the values to bind. */
++    private record Where(String sql, String query, Boolean enabled, String roleId) {}
++
+     /** The account columns of a user row, without its roles. */
+     private static UserBase baseUser(io.r2dbc.spi.Row row) {
+         return new UserBase(
+                 row.get("id", String.class),
+                 row.get("username", String.class),
+                 row.get("display_name", String.class),
+                 Boolean.TRUE.equals(row.get("enabled", Boolean.class)),
+                 row.get("created_at", Long.class) == null ? 0L : row.get("created_at", Long.class));
+     }
+ 
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/UserAdminService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/UserAdminService.java
+index 45f4a62..794476d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/UserAdminService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/UserAdminService.java
+@@ -1,28 +1,31 @@
+ package com.nekocong.text2sql.access;
+ 
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
++import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
++import com.nekocong.text2sql.access.api.dto.AccessUserPage;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserView;
+ import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.LinkedHashSet;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import java.util.regex.Pattern;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
++import org.springframework.dao.DuplicateKeyException;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.ReactiveTransactionManager;
+ import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.reactive.TransactionalOperator;
+ import org.springframework.transaction.support.DefaultTransactionDefinition;
+ import org.springframework.web.server.ResponseStatusException;
+ import reactor.core.publisher.Flux;
+ import reactor.core.publisher.Mono;
+@@ -69,38 +72,43 @@ public class UserAdminService {
+ 
+     /** The alphabet user ids are generated from (UUIDs). */
+     private static final Pattern ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+ 
+     /** Matches {@code app_user.display_name VARCHAR(100)}. */
+     private static final int MAX_DISPLAY_NAME_LENGTH = 100;
+ 
+     /** Matches {@code access_audit.reason VARCHAR(512)}. */
+     private static final int MAX_REASON_LENGTH = 512;
+ 
++    /** Upper bound on the user-list page size; larger requests are capped, not rejected. */
++    static final int MAX_PAGE_SIZE = 100;
++
+     private static final String ENTITY_TYPE = "USER";
+ 
+     private static final String ACTION_CREATE = "user.create";
+     private static final String ACTION_ENABLE = "user.enable";
+     private static final String ACTION_DISABLE = "user.disable";
+     private static final String ACTION_PASSWORD_RESET = "user.password_reset";
+     private static final String ACTION_ROLES = "user.roles";
++    private static final String ACTION_UPDATE = "user.update";
+ 
+     private static final String RESULT_SUCCESS = "SUCCESS";
+     private static final String RESULT_DENIED = "DENIED";
+ 
+     private static final String REASON_DUPLICATE_USERNAME = "用户名已存在";
+     private static final String REASON_USER_MISSING = "用户不存在";
+     private static final String REASON_ROLE_MISSING = "角色不存在：";
+     private static final String REASON_LAST_ADMIN = "不能移除最后一个拥有 access.manage 的管理员";
+     private static final String REASON_ROLE_REQUIRED = "至少需要一个角色";
+     private static final String REASON_ROLES_BODY_MISSING = "roleIds 不能为空";
+     private static final String REASON_ROLE_ID_BLANK = "角色标识不能为空";
++    private static final String REASON_PAGE_INVALID = "分页参数无效";
+ 
+     private final AccessAdminRepository repository;
+     private final AccessContextResolver access;
+     private final TransactionalOperator transactions;
+     private final TransactionalOperator newTransactions;
+     private final ObjectMapper objectMapper;
+     private final PasswordEncoder passwordEncoder;
+ 
+     /**
+      * Creates the service.
+@@ -123,64 +131,146 @@ public class UserAdminService {
+         this.newTransactions =
+                 TransactionalOperator.create(
+                         transactionManager,
+                         new DefaultTransactionDefinition(
+                                 TransactionDefinition.PROPAGATION_REQUIRES_NEW));
+         this.objectMapper = objectMapper;
+         this.passwordEncoder = passwordEncoder;
+     }
+ 
+     /**
+-     * Lists users, ordered by username.
++     * Lists users, ordered by username, paginated.
+      *
+      * <p>Reads are not audited. Missing filters mean "any"; the {@code query} filter matches
+-     * username/display name case-insensitively (contains).
++     * username/display name case-insensitively (contains). The page is applied in SQL, so it works
++     * for large tables. {@code size} is capped at {@value #MAX_PAGE_SIZE}.
+      *
+      * @param query the username/display-name filter, or {@code null}
+      * @param enabled the enabled filter, or {@code null}
+      * @param roleId the direct-role filter, or {@code null}
+-     * @return the matching users
++     * @param page the zero-based page number (must be at least 0)
++     * @param size the requested page size (must be at least 1)
++     * @return the page of users with the total count
+      */
+-    public Mono<List<AccessUserView>> list(String query, Boolean enabled, String roleId) {
+-        return repository
+-                .users(query, enabled, roleId)
+-                .map(users -> users.stream().map(AccessUserView::of).toList());
++    public Mono<AccessUserPage> list(
++            String query, Boolean enabled, String roleId, int page, int size) {
++        return Mono.defer(
++                () -> {
++                    int limit = validatePage(page, size);
++                    long offset = (long) page * limit;
++                    return Mono.zip(
++                                    repository.users(query, enabled, roleId, limit, offset),
++                                    repository.countUsers(query, enabled, roleId))
++                            .map(
++                                    tuple ->
++                                            AccessUserPage.of(
++                                                    tuple.getT1(), tuple.getT2(), page, limit));
++                });
++    }
++
++    /**
++     * Reads one user.
++     *
++     * <p>An unknown id is a {@code 404}; reads are not audited.
++     *
++     * @param userId the user id
++     * @return the user
++     */
++    public Mono<AccessUserView> detail(String userId) {
++        return Mono.defer(
++                        () -> {
++                            requireIdentifier(userId);
++                            return repository.user(userId).switchIfEmpty(Mono.error(notFound()));
++                        })
++                .map(AccessUserView::of);
++    }
++
++    /**
++     * Updates a user's display name.
++     *
++     * <p>The display name is the only mutable free-form field; a {@code null} or blank value clears
++     * it. This does <em>not</em> bump {@code token_version}: the display name is not part of any
++     * authorization decision, so no token needs to be invalidated.
++     *
++     * @param actorId the acting user id
++     * @param userId the user id
++     * @param request the request; {@code displayName} may be {@code null}/blank to clear
++     * @return the updated user
++     */
++    public Mono<AccessUserView> updateDisplayName(
++            String actorId, String userId, AccessUserDisplayNameRequest request) {
++        return Mono.defer(
++                        () -> {
++                            requireIdentifier(userId);
++                            String displayName =
++                                    normalizeDisplayName(request == null ? null : request.displayName());
++                            return repository
++                                    .user(userId)
++                                    .switchIfEmpty(
++                                            Mono.defer(
++                                                    () ->
++                                                            deny(
++                                                                            actorId,
++                                                                            ACTION_UPDATE,
++                                                                            userId,
++                                                                            null,
++                                                                            null,
++                                                                            missing())
++                                                                    .then(Mono.<AccessUser>empty())))
++                                    .flatMap(before -> updateDisplayName(actorId, before, displayName));
++                        })
++                .as(transactions::transactional)
++                .onErrorMap(Denial.class, Denial::toException)
++                .map(AccessUserView::of);
++    }
++
++    private Mono<AccessUser> updateDisplayName(
++            String actorId, AccessUser before, String displayName) {
++        return Mono.defer(() -> repository.updateUserDisplayName(before.id(), displayName))
++                .then(repository.user(before.id()))
++                .switchIfEmpty(Mono.error(new IllegalStateException("用户更新后丢失：" + before.id())))
++                .flatMap(after -> auditDisplayName(actorId, before, after));
+     }
+ 
+     /**
+      * Creates a user.
+      *
+      * @param actorId the acting user id
+      * @param request the request (required)
+      * @return the created user
+      */
+     public Mono<AccessUserView> create(String actorId, AccessUserCreateRequest request) {
+         return Mono.defer(
+                         () -> {
+                             AccessUserCreateRequest body = request == null ? emptyCreate() : request;
+                             String username = validateUsername(body.username());
+                             String password = validatePassword(body.password());
+                             String displayName = normalizeDisplayName(body.displayName());
+                             List<String> roleIds = normalizeRoleIds(body.roleIds(), true);
+-                            AuditUser requested =
+-                                    requestedUser(username, displayName, true, roleIds);
+                             return resolveRoles(roleIds)
+                                     .onErrorResume(
+                                             Denial.class,
+                                             denial ->
+-                                                    deny(
+-                                                                    actorId,
+-                                                                    ACTION_CREATE,
+-                                                                    null,
+-                                                                    null,
+-                                                                    requested,
+-                                                                    denial)
++                                                    knownRoleCodes(roleIds)
++                                                            .flatMap(
++                                                                    codes ->
++                                                                            deny(
++                                                                                    actorId,
++                                                                                    ACTION_CREATE,
++                                                                                    null,
++                                                                                    null,
++                                                                                    requestedUser(
++                                                                                            username,
++                                                                                            displayName,
++                                                                                            true,
++                                                                                            codes),
++                                                                                    denial))
+                                                             .then(Mono.<List<AccessRole>>empty()))
+                                     .flatMap(
+                                             roles ->
+                                                     create(
+                                                             actorId,
+                                                             username,
+                                                             password,
+                                                             displayName,
+                                                             roles));
+                         })
+@@ -196,35 +286,78 @@ public class UserAdminService {
+         return repository
+                 .userByUsername(username)
+                 .flatMap(
+                         existing ->
+                                 deny(
+                                         actorId,
+                                         ACTION_CREATE,
+                                         existing.id(),
+                                         null,
+                                         requested,
+-                                        new Denial(REASON_DUPLICATE_USERNAME, HttpStatus.CONFLICT)))
++                                        duplicate()))
+                 .switchIfEmpty(
+                         Mono.defer(
+                                 () ->
+                                         encode(password)
+                                                 .flatMap(
+                                                         hash ->
+                                                                 repository.insertUser(
+                                                                         username,
+                                                                         hash,
+                                                                         displayName,
+                                                                         roleIdsOf(roles)))
++                                                // The pre-read above handles the friendly duplicate
++                                                // path; this only fires on a concurrent insert that
++                                                // loses the unique-username race.
++                                                .onErrorResume(
++                                                        DuplicateKeyException.class,
++                                                        error ->
++                                                                duplicateRace(
++                                                                        actorId,
++                                                                        username,
++                                                                        displayName,
++                                                                        roles))
+                                                 .flatMap(user -> audit(actorId, ACTION_CREATE, null, user))));
+     }
+ 
++    /**
++     * Answers a concurrent duplicate-username race: reloads the winning row to reference it in the
++     * {@code DENIED} audit row, then fails with {@code 409}. When the winning row cannot be located
++     * the conflict is logged and still answered {@code 409}, without an audit row.
++     */
++    private Mono<AccessUser> duplicateRace(
++            String actorId, String username, String displayName, List<AccessRole> roles) {
++        AuditUser requested = requestedUser(username, displayName, true, codesOf(roles));
++        return Mono.defer(
++                        () ->
++                                repository
++                                        .userByUsername(username)
++                                        .flatMap(
++                                                existing ->
++                                                        deny(
++                                                                actorId,
++                                                                ACTION_CREATE,
++                                                                existing.id(),
++                                                                null,
++                                                                requested,
++                                                                duplicate()))
++                                        .switchIfEmpty(
++                                                Mono.defer(
++                                                        () -> {
++                                                            log.error(
++                                                                    "用户名插入冲突，但无法定位已存在的用户：{}",
++                                                                    username);
++                                                            return Mono.error(duplicate());
++                                                        })))
++                .as(newTransactions::transactional);
++    }
++
+     /**
+      * Enables or disables a user.
+      *
+      * <p>A no-op (the flag is unchanged) still returns {@code 200} and writes no audit row.
+      *
+      * @param actorId the acting user id
+      * @param userId the user id
+      * @param request the request (required; {@code enabled} required)
+      * @return the updated user
+      */
+@@ -357,31 +490,34 @@ public class UserAdminService {
+                 .as(transactions::transactional)
+                 .onErrorMap(Denial.class, Denial::toException)
+                 .map(AccessUserView::of);
+     }
+ 
+     private Mono<AccessUser> replaceRoles(String actorId, AccessUser before, List<String> roleIds) {
+         return resolveRoles(roleIds)
+                 .onErrorResume(
+                         Denial.class,
+                         denial ->
+-                                deny(
+-                                                actorId,
+-                                                ACTION_ROLES,
+-                                                before.id(),
+-                                                auditUser(before),
+-                                                requestedUser(
+-                                                        before.username(),
+-                                                        before.displayName(),
+-                                                        before.enabled(),
+-                                                        roleIds),
+-                                                denial)
++                                knownRoleCodes(roleIds)
++                                        .flatMap(
++                                                codes ->
++                                                        deny(
++                                                                actorId,
++                                                                ACTION_ROLES,
++                                                                before.id(),
++                                                                auditUser(before),
++                                                                requestedUser(
++                                                                        before.username(),
++                                                                        before.displayName(),
++                                                                        before.enabled(),
++                                                                        codes),
++                                                                denial))
+                                         .then(Mono.<List<AccessRole>>empty()))
+                 .flatMap(
+                         roles ->
+                                 ensureNotLastAdmin(before.id())
+                                         .onErrorResume(
+                                                 Denial.class,
+                                                 denial ->
+                                                         deny(
+                                                                         actorId,
+                                                                         ACTION_ROLES,
+@@ -460,20 +596,41 @@ public class UserAdminService {
+                 AccessRole role = byId.get(roleId);
+                 if (role == null) {
+                     throw new Denial(REASON_ROLE_MISSING + roleId, HttpStatus.NOT_FOUND);
+                 }
+                 resolved.add(role);
+             }
+             return resolved;
+         });
+     }
+ 
++    /**
++     * Maps the requested role ids to the codes of the roles that exist, dropping any unknown id, so a
++     * {@code DENIED} audit payload's {@code roleCodes} field is honest (codes, not ids).
++     */
++    private Mono<List<String>> knownRoleCodes(List<String> roleIds) {
++        return repository.roles().map(all -> {
++            Map<String, AccessRole> byId = new HashMap<>();
++            for (AccessRole role : all) {
++                byId.put(role.id(), role);
++            }
++            return roleIds.stream()
++                    .map(byId::get)
++                    .filter(Objects::nonNull)
++                    .map(AccessRole::code)
++                    .filter(Objects::nonNull)
++                    .distinct()
++                    .sorted()
++                    .toList();
++        });
++    }
++
+     // --- validation (400, not audited) -----------------------------------------------------
+ 
+     private static String validateUsername(String username) {
+         String value = username == null ? null : username.trim();
+         if (value == null || value.isEmpty()) {
+             throw badRequest("用户名不能为空");
+         }
+         if (!USERNAME_PATTERN.matcher(value).matches()) {
+             throw badRequest("用户名只能包含字母、数字、点、下划线和短横线（3-64 位）");
+         }
+@@ -527,20 +684,33 @@ public class UserAdminService {
+         }
+         return request.enabled();
+     }
+ 
+     private static void requireIdentifier(String userId) {
+         if (userId == null || userId.isBlank() || !ID_PATTERN.matcher(userId).matches()) {
+             throw badRequest("用户标识无效");
+         }
+     }
+ 
++    /**
++     * Validates the page number and size, returning the (capped) effective size.
++     *
++     * <p>A negative page, a non-positive size, or a zero size is rejected with {@code 400}; a size
++     * larger than {@link #MAX_PAGE_SIZE} is capped rather than rejected.
++     */
++    private static int validatePage(int page, int size) {
++        if (page < 0 || size <= 0) {
++            throw badRequest(REASON_PAGE_INVALID);
++        }
++        return Math.min(size, MAX_PAGE_SIZE);
++    }
++
+     // --- audit -----------------------------------------------------------------------------
+ 
+     private Mono<AccessUser> audit(String actorId, String action, AccessUser before, AccessUser after) {
+         return repository
+                 .record(
+                         actorId,
+                         action,
+                         ENTITY_TYPE,
+                         after.id(),
+                         json(before == null ? null : auditUser(before)),
+@@ -562,20 +732,35 @@ public class UserAdminService {
+                 actorId,
+                 ACTION_PASSWORD_RESET,
+                 ENTITY_TYPE,
+                 before.id(),
+                 json(auditUser(before)),
+                 json(after),
+                 RESULT_SUCCESS,
+                 null);
+     }
+ 
++    /** Appends the {@code user.update} SUCCESS row; the payload carries only the display name. */
++    private Mono<AccessUser> auditDisplayName(String actorId, AccessUser before, AccessUser after) {
++        return repository
++                .record(
++                        actorId,
++                        ACTION_UPDATE,
++                        ENTITY_TYPE,
++                        after.id(),
++                        json(new AuditDisplayName(before.displayName())),
++                        json(new AuditDisplayName(after.displayName())),
++                        RESULT_SUCCESS,
++                        null)
++                .thenReturn(after);
++    }
++
+     /**
+      * Appends a DENIED row for a rejected mutation, then fails with that rejection. Runs in its own
+      * nested transaction so the row survives the outer transaction rolling back.
+      */
+     private Mono<AccessUser> deny(
+             String actorId,
+             String action,
+             String entityId,
+             AuditUser before,
+             AuditUser after,
+@@ -671,24 +856,32 @@ public class UserAdminService {
+     }
+ 
+     private static String actionForStatus(boolean enabled) {
+         return enabled ? ACTION_ENABLE : ACTION_DISABLE;
+     }
+ 
+     private static Denial lastAdmin() {
+         return new Denial(REASON_LAST_ADMIN, HttpStatus.CONFLICT);
+     }
+ 
++    private static Denial duplicate() {
++        return new Denial(REASON_DUPLICATE_USERNAME, HttpStatus.CONFLICT);
++    }
++
+     private static Denial missing() {
+         return new Denial(REASON_USER_MISSING, HttpStatus.NOT_FOUND);
+     }
+ 
++    private static ResponseStatusException notFound() {
++        return new ResponseStatusException(HttpStatus.NOT_FOUND, REASON_USER_MISSING);
++    }
++
+     private static String truncate(String reason) {
+         return reason == null || reason.length() <= MAX_REASON_LENGTH
+                 ? reason
+                 : reason.substring(0, MAX_REASON_LENGTH);
+     }
+ 
+     private static ResponseStatusException badRequest(String message) {
+         return new ResponseStatusException(HttpStatus.BAD_REQUEST, message);
+     }
+ 
+@@ -722,20 +915,23 @@ public class UserAdminService {
+      * The audited projection of a password reset: the user fields plus the literal {@code "changed"},
+      * never the actual password.
+      */
+     private record AuditPasswordReset(
+             String username,
+             String displayName,
+             boolean enabled,
+             List<String> roleCodes,
+             String password) {}
+ 
++    /** The audited projection of a display-name change: the display name only. */
++    private record AuditDisplayName(String displayName) {}
++
+     /**
+      * A rejected mutation, carrying the reason and the HTTP status. Carried through the reactive
+      * chain so the enclosing transaction can write its {@code DENIED} audit row.
+      */
+     private static final class Denial extends RuntimeException {
+ 
+         private final transient HttpStatus status;
+ 
+         private Denial(String reason, HttpStatus status) {
+             super(reason, null, false, false);
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index 0eef649..aae543d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -3,20 +3,22 @@ package com.nekocong.text2sql.access.api;
+ import com.nekocong.text2sql.access.AccessAdminService;
+ import com.nekocong.text2sql.access.DataScopeService;
+ import com.nekocong.text2sql.access.RolePermissionService;
+ import com.nekocong.text2sql.access.UserAdminService;
+ import com.nekocong.text2sql.access.api.dto.AccessPermissionView;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRolePermissionsView;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessRoleView;
+ import com.nekocong.text2sql.access.api.dto.AccessUserCreateRequest;
++import com.nekocong.text2sql.access.api.dto.AccessUserDisplayNameRequest;
++import com.nekocong.text2sql.access.api.dto.AccessUserPage;
+ import com.nekocong.text2sql.access.api.dto.AccessUserPasswordRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserRolesRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserStatusRequest;
+ import com.nekocong.text2sql.access.api.dto.AccessUserView;
+ import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
+ import com.nekocong.text2sql.access.api.dto.DataScopeView;
+ import java.util.List;
+ import java.util.Map;
+ import java.util.Objects;
+ import org.springframework.http.HttpStatus;
+@@ -219,49 +221,80 @@ public class AccessControlController {
+      * @param id the rule id
+      * @return no content
+      */
+     @DeleteMapping(path = DATA_SCOPES + "/{id}")
+     @ResponseStatus(HttpStatus.NO_CONTENT)
+     public Mono<Void> deleteDataScope(@PathVariable String id) {
+         return actorId().flatMap(actor -> dataScopes.delete(actor, id));
+     }
+ 
+     /**
+-     * Lists users, ordered by username.
++     * Lists users, ordered by username, paginated.
+      *
+      * @param query the case-insensitive username/display-name filter, or omitted for all
+      * @param enabled keep only enabled/disabled users, or omitted for both
+      * @param roleId keep only users directly assigned that role, or omitted for all
+-     * @return the users
++     * @param page the zero-based page number (default 0)
++     * @param size the page size (default 20; capped at the service maximum)
++     * @return the page of users with the total count
+      */
+     @GetMapping(path = USERS)
+-    public Mono<List<AccessUserView>> listUsers(
++    public Mono<AccessUserPage> listUsers(
+             @RequestParam(required = false) String query,
+             @RequestParam(required = false) Boolean enabled,
+-            @RequestParam(required = false) String roleId) {
+-        return users.list(query, enabled, roleId);
++            @RequestParam(required = false) String roleId,
++            @RequestParam(defaultValue = "0") int page,
++            @RequestParam(defaultValue = "20") int size) {
++        return users.list(query, enabled, roleId, page, size);
++    }
++
++    /**
++     * Reads one user.
++     *
++     * @param id the user id
++     * @return the user
++     */
++    @GetMapping(path = USERS + "/{id}")
++    public Mono<AccessUserView> getUser(@PathVariable String id) {
++        return users.detail(id);
+     }
+ 
+     /**
+      * Creates a user.
+      *
+      * @param request the user
+      * @return the created user
+      */
+     @PostMapping(path = USERS)
+     @ResponseStatus(HttpStatus.CREATED)
+     public Mono<AccessUserView> createUser(@RequestBody(required = false) AccessUserCreateRequest request) {
+         return actorId()
+                 .flatMap(actor -> users.create(actor, request))
+                 .onErrorMap(AccessControlController::asStatusException);
+     }
+ 
++    /**
++     * Edits a user's display name (the only mutable free-form field).
++     *
++     * @param id the user id
++     * @param request the new display name ({@code null}/blank clears it)
++     * @return the updated user
++     */
++    @PutMapping(path = USERS + "/{id}")
++    public Mono<AccessUserView> updateUserDisplayName(
++            @PathVariable String id,
++            @RequestBody(required = false) AccessUserDisplayNameRequest request) {
++        return actorId()
++                .flatMap(actor -> users.updateDisplayName(actor, id, request))
++                .onErrorMap(AccessControlController::asStatusException);
++    }
++
+     /**
+      * Enables or disables a user.
+      *
+      * @param id the user id
+      * @param request the new status
+      * @return the updated user
+      */
+     @PutMapping(path = USERS + "/{id}/status")
+     public Mono<AccessUserView> updateUserStatus(
+             @PathVariable String id, @RequestBody(required = false) AccessUserStatusRequest request) {
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserDisplayNameRequest.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserDisplayNameRequest.java
+new file mode 100644
+index 0000000..80fa600
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserDisplayNameRequest.java
+@@ -0,0 +1,11 @@
++package com.nekocong.text2sql.access.api.dto;
++
++/**
++ * Request body for editing a user's display name.
++ *
++ * <p>The display name is the only mutable free-form field on a user; a {@code null} or blank value
++ * clears it.
++ *
++ * @param displayName the new display name (at most 100 characters), or {@code null}/blank to clear
++ */
++public record AccessUserDisplayNameRequest(String displayName) {}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserPage.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserPage.java
+new file mode 100644
+index 0000000..4ed9f8c
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserPage.java
+@@ -0,0 +1,34 @@
++package com.nekocong.text2sql.access.api.dto;
++
++import com.nekocong.text2sql.access.AccessUser;
++import java.util.List;
++
++/**
++ * A page of users: the items for one page plus the total count matching the filters.
++ *
++ * @param items the users on this page, ordered by username
++ * @param total the total number of users matching the filters (across all pages)
++ * @param page the zero-based page number
++ * @param size the effective page size (the requested size capped at the service maximum)
++ */
++public record AccessUserPage(List<AccessUserView> items, long total, int page, int size) {
++
++    /** Normalizes the item list so the page is structurally immutable. */
++    public AccessUserPage {
++        items = items == null ? List.of() : List.copyOf(items);
++    }
++
++    /**
++     * Maps a page of domain users to its view.
++     *
++     * @param users the users on this page
++     * @param total the total matching count
++     * @param page the zero-based page number
++     * @param size the effective page size
++     * @return the page
++     */
++    public static AccessUserPage of(List<AccessUser> users, long total, int page, int size) {
++        return new AccessUserPage(
++                users.stream().map(AccessUserView::of).toList(), total, page, size);
++    }
++}
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+index cc50257..01e9b5c 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+@@ -88,20 +88,34 @@ public class SecurityConfig {
+                         exchange ->
+                                 exchange
+                                         .pathMatchers(HttpMethod.OPTIONS)
+                                         .permitAll()
+                                         .pathMatchers(
+                                                 "/api/auth/register",
+                                                 "/api/auth/login",
+                                                 "/api/text2sql/health",
+                                                 "/actuator/**")
+                                         .permitAll()
++                                        // The user lifecycle API is gated by its own permissions
++                                        // (user.read for list/detail, user.manage for writes) so an
++                                        // operator can manage accounts without editing roles or
++                                        // data scopes. These must precede the generic /api/admin/**
++                                        // access.manage rule below.
++                                        .pathMatchers(
++                                                HttpMethod.GET,
++                                                "/api/admin/access-control/users",
++                                                "/api/admin/access-control/users/*")
++                                        .access(userRead())
++                                        .pathMatchers(
++                                                "/api/admin/access-control/users",
++                                                "/api/admin/access-control/users/**")
++                                        .access(userManage())
+                                         .pathMatchers("/api/admin/**")
+                                         .access(accessManage())
+                                         // The three knowledge collections, their documents and the
+                                         // retrieval debug endpoints require the access-management
+                                         // permission.
+                                         // The legacy in-memory API stays open to any authenticated
+                                         // caller for backwards compatibility.
+                                         .pathMatchers("/api/text2sql/knowledge/legacy/**")
+                                         .authenticated()
+                                         .pathMatchers("/api/text2sql/knowledge/**")
+@@ -139,20 +153,38 @@ public class SecurityConfig {
+ 
+     /**
+      * Requires the {@code datasource.write} permission.
+      *
+      * @return the authorization manager
+      */
+     static ReactiveAuthorizationManager<AuthorizationContext> datasourceWrite() {
+         return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_WRITE);
+     }
+ 
++    /**
++     * Requires the {@code user.read} permission (list/detail user routes).
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> userRead() {
++        return PermissionAuthorizationManager.permission(Permissions.USER_READ);
++    }
++
++    /**
++     * Requires the {@code user.manage} permission (user create/status/reset/roles/display-name).
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> userManage() {
++        return PermissionAuthorizationManager.permission(Permissions.USER_MANAGE);
++    }
++
+     /**
+      * Maps the JWT {@code role} claim to a single granted authority.
+      *
+      * <p>An unknown or missing role maps to {@code ROLE_NONE}: the caller stays authenticated but
+      * carries no role authority. The data-permission layer validates the resolved scope on every
+      * query, and the management routes are gated by permissions resolved from the access-control
+      * tables, so this authority is informational only.
+      *
+      * @return the converter
+      */
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+index 4f60b24..0b95aa3 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+@@ -215,22 +215,28 @@ class AccessAdminServiceTransactionTest {
+                 return delegate.upsertDataScope(
+                         roleId, datasourceId, tableName, policy, columnName, principalAttribute);
+             }
+ 
+             @Override
+             public Mono<Long> deleteDataScope(String id) {
+                 return delegate.deleteDataScope(id);
+             }
+ 
+             @Override
+-            public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
+-                return delegate.users(query, enabled, roleId);
++            public Mono<List<AccessUser>> users(
++                    String query, Boolean enabled, String roleId, int size, long offset) {
++                return delegate.users(query, enabled, roleId, size, offset);
++            }
++
++            @Override
++            public Mono<Long> countUsers(String query, Boolean enabled, String roleId) {
++                return delegate.countUsers(query, enabled, roleId);
+             }
+ 
+             @Override
+             public Mono<AccessUser> user(String id) {
+                 return delegate.user(id);
+             }
+ 
+             @Override
+             public Mono<AccessUser> userByUsername(String username) {
+                 return delegate.userByUsername(username);
+@@ -245,20 +251,25 @@ class AccessAdminServiceTransactionTest {
+             @Override
+             public Mono<Void> updateUserStatus(String id, boolean enabled) {
+                 return delegate.updateUserStatus(id, enabled);
+             }
+ 
+             @Override
+             public Mono<Void> updateUserPassword(String id, String passwordHash) {
+                 return delegate.updateUserPassword(id, passwordHash);
+             }
+ 
++            @Override
++            public Mono<Void> updateUserDisplayName(String id, String displayName) {
++                return delegate.updateUserDisplayName(id, displayName);
++            }
++
+             @Override
+             public Mono<Void> replaceUserRoles(String userId, List<String> roleIds) {
+                 return delegate.replaceUserRoles(userId, roleIds);
+             }
+ 
+             @Override
+             public Mono<List<String>> enabledUserIds() {
+                 return delegate.enabledUserIds();
+             }
+ 
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+index 3beeeea..a35b980 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+@@ -189,22 +189,28 @@ class RolePermissionServiceTransactionTest {
+                 return delegate.upsertDataScope(
+                         roleId, datasourceId, tableName, policy, columnName, principalAttribute);
+             }
+ 
+             @Override
+             public Mono<Long> deleteDataScope(String id) {
+                 return delegate.deleteDataScope(id);
+             }
+ 
+             @Override
+-            public Mono<List<AccessUser>> users(String query, Boolean enabled, String roleId) {
+-                return delegate.users(query, enabled, roleId);
++            public Mono<List<AccessUser>> users(
++                    String query, Boolean enabled, String roleId, int size, long offset) {
++                return delegate.users(query, enabled, roleId, size, offset);
++            }
++
++            @Override
++            public Mono<Long> countUsers(String query, Boolean enabled, String roleId) {
++                return delegate.countUsers(query, enabled, roleId);
+             }
+ 
+             @Override
+             public Mono<AccessUser> user(String id) {
+                 return delegate.user(id);
+             }
+ 
+             @Override
+             public Mono<AccessUser> userByUsername(String username) {
+                 return delegate.userByUsername(username);
+@@ -219,20 +225,25 @@ class RolePermissionServiceTransactionTest {
+             @Override
+             public Mono<Void> updateUserStatus(String id, boolean enabled) {
+                 return delegate.updateUserStatus(id, enabled);
+             }
+ 
+             @Override
+             public Mono<Void> updateUserPassword(String id, String passwordHash) {
+                 return delegate.updateUserPassword(id, passwordHash);
+             }
+ 
++            @Override
++            public Mono<Void> updateUserDisplayName(String id, String displayName) {
++                return delegate.updateUserDisplayName(id, displayName);
++            }
++
+             @Override
+             public Mono<Void> replaceUserRoles(String userId, List<String> roleIds) {
+                 return delegate.replaceUserRoles(userId, roleIds);
+             }
+ 
+             @Override
+             public Mono<List<String>> enabledUserIds() {
+                 return delegate.enabledUserIds();
+             }
+ 
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlUserTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlUserTest.java
+index 3602d06..27780e9 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlUserTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlUserTest.java
+@@ -354,20 +354,312 @@ class AccessControlUserTest {
+         assertThat(auditRows("user.roles", id, "SUCCESS")).isEqualTo(1);
+ 
+         // The rejected role change writes exactly one DENIED row.
+         setRoles(id, List.of(UUID.randomUUID().toString())).expectStatus().isNotFound();
+         assertThat(auditRows("user.roles", id, "DENIED")).isEqualTo(1);
+ 
+         // No audit payload ever carries the raw password or the hash column.
+         assertAuditSecretFree(id, PASSWORD, "newsecret9", "password_hash");
+     }
+ 
++    @Test
++    void roleChangesTakeEffectOnTheNextRequestWithoutBumpingTokenVersion() {
++        String freshRoleId = createRoleGranting(Permissions.ACCESS_MANAGE);
++        String studentRoleId = roleIdByCode(Roles.STUDENT);
++        String username = unique("perm");
++        String id = createUser(username, "权限", List.of(studentRoleId));
++        String token = TestAuth.login(client, username, PASSWORD);
++        int versionBefore = tokenVersion(id);
++
++        // Without access.manage, the admin route is forbidden.
++        client.get()
++                .uri("/api/admin/access-control/roles")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        // Grant access.manage via a role change.
++        setRoles(id, List.of(freshRoleId)).expectStatus().isOk();
++        assertThat(tokenVersion(id))
++                .as("role changes must not bump token_version")
++                .isEqualTo(versionBefore);
++
++        // The same token now passes the permission gate — no re-login.
++        client.get()
++                .uri("/api/admin/access-control/roles")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isOk();
++
++        // Removing the role again takes effect on the very next request with the same token.
++        setRoles(id, List.of(studentRoleId)).expectStatus().isOk();
++        assertThat(tokenVersion(id)).isEqualTo(versionBefore);
++        client.get()
++                .uri("/api/admin/access-control/roles")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    @Test
++    void anUnknownUserIsNotFound() {
++        String unknown = UUID.randomUUID().toString();
++
++        setStatus(unknown, false)
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("用户不存在");
++
++        setRoles(unknown, List.of(roleIdByCode(Roles.STUDENT)))
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("用户不存在");
++
++        resetPassword(unknown, "newsecret9")
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("用户不存在");
++    }
++
++    @Test
++    void aNoOpStatusChangeReturns200AndWritesNoAuditRow() {
++        String id = createUser(unique("noop"), "不变", List.of(roleIdByCode(Roles.STUDENT)));
++
++        // Setting enabled=true on an already-enabled user is a no-op: 200, no audit row.
++        setStatus(id, true).expectStatus().isOk().expectBody().jsonPath("$.enabled").isEqualTo(true);
++        assertThat(auditRows("user.enable", id, "SUCCESS")).isZero();
++
++        setStatus(id, false).expectStatus().isOk();
++        assertThat(auditRows("user.disable", id, "SUCCESS")).isEqualTo(1);
++
++        // Repeating the disable is a no-op: still 200, and no additional audit row.
++        setStatus(id, false).expectStatus().isOk().expectBody().jsonPath("$.enabled").isEqualTo(false);
++        assertThat(auditRows("user.disable", id, "SUCCESS")).isEqualTo(1);
++        assertThat(auditRows("user.enable", id, "SUCCESS")).isZero();
++    }
++
++    @Test
++    void listIsPaginatedInSqlWithATotalAndNoOverlap() {
++        String prefix = unique("page");
++        String studentRoleId = roleIdByCode(Roles.STUDENT);
++        createUser(prefix + "a", "甲", List.of(studentRoleId));
++        createUser(prefix + "b", "乙", List.of(studentRoleId));
++        createUser(prefix + "c", "丙", List.of(studentRoleId));
++
++        Map<String, Object> first = pageEnvelope(prefix, null, null, 0, 2);
++        assertThat(((Number) first.get("total")).intValue()).isEqualTo(3);
++        assertThat(((Number) first.get("page")).intValue()).isEqualTo(0);
++        assertThat(((Number) first.get("size")).intValue()).isEqualTo(2);
++        List<String> firstNames = itemUsernames(first);
++        assertThat(firstNames).containsExactly(prefix + "a", prefix + "b");
++
++        Map<String, Object> second = pageEnvelope(prefix, null, null, 1, 2);
++        assertThat(((Number) second.get("total")).intValue()).isEqualTo(3);
++        List<String> secondNames = itemUsernames(second);
++        assertThat(secondNames).containsExactly(prefix + "c");
++
++        assertThat(firstNames).doesNotContainAnyElementsOf(secondNames);
++    }
++
++    @Test
++    void editsAndClearsTheDisplayNameWithAuditAndNoTokenBump() {
++        String id = createUser(unique("dn"), "原名", List.of(roleIdByCode(Roles.STUDENT)));
++        int versionBefore = tokenVersion(id);
++
++        setDisplayName(id, "新名")
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.displayName")
++                .isEqualTo("新名");
++        assertThat(displayNameOf(id)).isEqualTo("新名");
++        assertThat(tokenVersion(id))
++                .as("display-name edits must not bump token_version")
++                .isEqualTo(versionBefore);
++
++        // A blank value clears the name.
++        setDisplayName(id, "").expectStatus().isOk();
++        assertThat(displayNameOf(id)).isNull();
++        assertThat(tokenVersion(id)).isEqualTo(versionBefore);
++
++        assertThat(auditRows("user.update", id, "SUCCESS")).isEqualTo(2);
++        // The payload carries only the display name.
++        assertThat(auditDistinct("user.update", id, "SUCCESS", "before_json"))
++                .containsExactlyInAnyOrder("{\"displayName\":\"原名\"}", "{\"displayName\":\"新名\"}");
++        assertThat(auditDistinct("user.update", id, "SUCCESS", "after_json"))
++                .containsExactlyInAnyOrder("{\"displayName\":\"新名\"}", "{\"displayName\":null}");
++    }
++
++    @Test
++    void readsOneUserAndReturnsNotFoundForUnknown() {
++        String username = unique("dtl");
++        String id = createUser(username, "详情", List.of(roleIdByCode(Roles.STUDENT)));
++
++        client.get()
++                .uri(USERS + "/" + id)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.id")
++                .isEqualTo(id)
++                .jsonPath("$.username")
++                .isEqualTo(username)
++                .jsonPath("$.roles[0].code")
++                .isEqualTo(Roles.STUDENT);
++
++        client.get()
++                .uri(USERS + "/" + UUID.randomUUID())
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isNotFound()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("用户不存在");
++    }
++
++    @Test
++    void aUserReadOnlyRoleCanReadButNotWrite() {
++        String readRoleId = createRoleGranting(Permissions.USER_READ);
++        String username = unique("rd");
++        AppUser user =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "ReadOnly", Roles.STUDENT).block();
++        assignRoleDirectly(user.id(), readRoleId);
++        String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
++
++        client.get().uri(USERS).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
++        client.get().uri(USERS + "/" + user.id()).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isOk();
++
++        client.post()
++                .uri(USERS)
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("username", unique("nope"), "password", PASSWORD, "roleIds", List.of(roleIdByCode(Roles.STUDENT))))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++        client.put()
++                .uri(USERS + "/" + user.id())
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("displayName", "x"))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++        client.put()
++                .uri(USERS + "/" + user.id() + "/status")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("enabled", false))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++        client.post()
++                .uri(USERS + "/" + user.id() + "/reset-password")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("password", "newsecret9"))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++        client.put()
++                .uri(USERS + "/" + user.id() + "/roles")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("roleIds", List.of(roleIdByCode(Roles.STUDENT))))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    @Test
++    void aUserManageOnlyRoleCanWriteButNotRead() {
++        String manageRoleId = createRoleGranting(Permissions.USER_MANAGE);
++        String username = unique("mng");
++        AppUser user =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Manager", Roles.STUDENT).block();
++        assignRoleDirectly(user.id(), manageRoleId);
++        String token = "Bearer " + TestAuth.login(client, username, PASSWORD);
++        String studentRoleId = roleIdByCode(Roles.STUDENT);
++
++        client.get().uri(USERS).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isForbidden();
++        client.get().uri(USERS + "/" + user.id()).header(HttpHeaders.AUTHORIZATION, token).exchange().expectStatus().isForbidden();
++
++        // Create a target user, then mutate the target (not self) so the acting token stays valid
++        // across the token-version-bumping operations.
++        Map<String, Object> created =
++                client.post()
++                        .uri(USERS)
++                        .header(HttpHeaders.AUTHORIZATION, token)
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .bodyValue(
++                                Map.of(
++                                        "username",
++                                        unique("mng2"),
++                                        "password",
++                                        PASSWORD,
++                                        "roleIds",
++                                        List.of(studentRoleId)))
++                        .exchange()
++                        .expectStatus()
++                        .isCreated()
++                        .expectBody(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(created).isNotNull();
++        String targetId = String.valueOf(created.get("id"));
++
++        client.put()
++                .uri(USERS + "/" + user.id())
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("displayName", "改名"))
++                .exchange()
++                .expectStatus()
++                .isOk();
++        client.put()
++                .uri(USERS + "/" + targetId + "/status")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("enabled", false))
++                .exchange()
++                .expectStatus()
++                .isOk();
++        client.post()
++                .uri(USERS + "/" + targetId + "/reset-password")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("password", "newsecret9"))
++                .exchange()
++                .expectStatus()
++                .isNoContent();
++        client.put()
++                .uri(USERS + "/" + targetId + "/roles")
++                .header(HttpHeaders.AUTHORIZATION, token)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("roleIds", List.of(studentRoleId)))
++                .exchange()
++                .expectStatus()
++                .isOk();
++    }
++
+     // --- helpers ----------------------------------------------------------------------------
+ 
+     private String bearer() {
+         return "Bearer " + adminToken;
+     }
+ 
+     private String createUser(String username, String displayName, List<String> roleIds) {
+         Map<String, Object> body = new java.util.HashMap<>();
+         body.put("username", username);
+         body.put("password", PASSWORD);
+@@ -421,57 +713,77 @@ class AccessControlUserTest {
+         return client.post()
+                 .uri(USERS + "/" + id + "/reset-password")
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(Map.of("password", password))
+                 .exchange();
+     }
+ 
+     @SuppressWarnings({"unchecked", "rawtypes"})
+     private List<Map<String, Object>> listUsers(String query) {
+-        return (List) client.get()
+-                .uri(uriBuilder -> uriBuilder.path(USERS).queryParam("query", query).build())
+-                .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .exchange()
+-                .expectStatus()
+-                .isOk()
+-                .expectBodyList(Map.class)
+-                .returnResult()
+-                .getResponseBody();
++        return (List<Map<String, Object>>) pageEnvelope(query, null, null, null, null).get("items");
+     }
+ 
+     private List<String> usernames(String query, Boolean enabled, String roleId) {
+-        return client.get()
+-                .uri(
+-                        uriBuilder -> {
+-                            uriBuilder.path(USERS);
+-                            if (query != null) {
+-                                uriBuilder.queryParam("query", query);
+-                            }
+-                            if (enabled != null) {
+-                                uriBuilder.queryParam("enabled", enabled);
+-                            }
+-                            if (roleId != null) {
+-                                uriBuilder.queryParam("roleId", roleId);
+-                            }
+-                            return uriBuilder.build();
+-                        })
++        return itemUsernames(pageEnvelope(query, enabled, roleId, null, null));
++    }
++
++    /** GETs the user list and returns the full page envelope ({@code items}, {@code total}, ...). */
++    @SuppressWarnings({"unchecked", "rawtypes"})
++    private Map<String, Object> pageEnvelope(
++            String query, Boolean enabled, String roleId, Integer page, Integer size) {
++        Map<String, Object> body =
++                (Map) client.get()
++                        .uri(
++                                uriBuilder -> {
++                                    uriBuilder.path(USERS);
++                                    if (query != null) {
++                                        uriBuilder.queryParam("query", query);
++                                    }
++                                    if (enabled != null) {
++                                        uriBuilder.queryParam("enabled", enabled);
++                                    }
++                                    if (roleId != null) {
++                                        uriBuilder.queryParam("roleId", roleId);
++                                    }
++                                    if (page != null) {
++                                        uriBuilder.queryParam("page", page);
++                                    }
++                                    if (size != null) {
++                                        uriBuilder.queryParam("size", size);
++                                    }
++                                    return uriBuilder.build();
++                                })
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .exchange()
++                        .expectStatus()
++                        .isOk()
++                        .expectBody(Map.class)
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(body).isNotNull();
++        return body;
++    }
++
++    @SuppressWarnings("unchecked")
++    private List<String> itemUsernames(Map<String, Object> page) {
++        return ((List<Map<String, Object>>) page.get("items"))
++                .stream().map(row -> String.valueOf(row.get("username"))).toList();
++    }
++
++    private WebTestClient.ResponseSpec setDisplayName(String id, String displayName) {
++        return client.put()
++                .uri(USERS + "/" + id)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+-                .exchange()
+-                .expectStatus()
+-                .isOk()
+-                .expectBodyList(Map.class)
+-                .returnResult()
+-                .getResponseBody()
+-                .stream()
+-                .map(row -> String.valueOf(row.get("username")))
+-                .toList();
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(Map.of("displayName", displayName))
++                .exchange();
+     }
+ 
+     private void loginExpects(String username, String password, boolean success) {
+         WebTestClient.ResponseSpec spec =
+                 client.post()
+                         .uri("/api/auth/login")
+                         .contentType(MediaType.APPLICATION_JSON)
+                         .bodyValue(Map.of("username", username, "password", password))
+                         .exchange();
+         if (success) {
+@@ -485,20 +797,52 @@ class AccessControlUserTest {
+         String id =
+                 db.sql("SELECT id FROM access_role WHERE code = :code")
+                         .bind("code", code)
+                         .map((row, meta) -> row.get("id", String.class))
+                         .one()
+                         .block();
+         assertThat(id).as("role " + code).isNotNull();
+         return id;
+     }
+ 
++    /** Creates a fresh, non built-in role that grants the given permission, and returns its id. */
++    private String createRoleGranting(String permissionKey) {
++        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String roleId = "test-role-user-" + suffix;
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_role (id, code, name, description, parent_id, built_in,"
++                                + " enabled, created_at, updated_at)"
++                                + " VALUES (:id, :code, :name, NULL, NULL, FALSE, TRUE, :now, :now)")
++                .bind("id", roleId)
++                .bind("code", "userperm" + suffix)
++                .bind("name", "Perm " + suffix)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        String permissionId =
++                db.sql("SELECT id FROM access_permission WHERE permission_key = :key")
++                        .bind("key", permissionKey)
++                        .map((row, meta) -> row.get("id", String.class))
++                        .one()
++                        .block();
++        assertThat(permissionId).as("permission " + permissionKey).isNotNull();
++        db.sql("INSERT INTO access_role_permission (role_id, permission_id) VALUES (:roleId, :permissionId)")
++                .bind("roleId", roleId)
++                .bind("permissionId", permissionId)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        return roleId;
++    }
++
+     private String userIdByUsername(String username) {
+         return db.sql("SELECT id FROM app_user WHERE username = :username")
+                 .bind("username", username)
+                 .map((row, meta) -> row.get("id", String.class))
+                 .one()
+                 .block();
+     }
+ 
+     private String passwordHash(String username) {
+         return db.sql("SELECT password_hash FROM app_user WHERE username = :username")
+@@ -533,20 +877,55 @@ class AccessControlUserTest {
+                         "SELECT r.code FROM access_role r"
+                                 + " JOIN access_user_role ur ON ur.role_id = r.id"
+                                 + " WHERE ur.user_id = :userId ORDER BY r.code")
+                 .bind("userId", userId)
+                 .map((row, meta) -> row.get("code", String.class))
+                 .all()
+                 .collectList()
+                 .block();
+     }
+ 
++    private String displayNameOf(String id) {
++        String value =
++                db.sql("SELECT COALESCE(display_name, '') AS dn FROM app_user WHERE id = :id")
++                        .bind("id", id)
++                        .map((row, meta) -> row.get("dn", String.class))
++                        .one()
++                        .block();
++        return value == null || value.isEmpty() ? null : value;
++    }
++
++    private void assignRoleDirectly(String userId, String roleId) {
++        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:u, :r, :now)")
++                .bind("u", userId)
++                .bind("r", roleId)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++    }
++
++    private List<String> auditDistinct(String action, String entityId, String result, String column) {
++        return db.sql(
++                        "SELECT DISTINCT " + column + " AS v FROM access_audit"
++                                + " WHERE actor_id = :actorId AND action = :action"
++                                + " AND entity_id = :entityId AND result = :result")
++                .bind("actorId", adminId)
++                .bind("action", action)
++                .bind("entityId", entityId)
++                .bind("result", result)
++                .map((row, meta) -> row.get("v", String.class))
++                .all()
++                .collectList()
++                .block();
++    }
++
+     private long auditRows(String action, String entityId, String result) {
+         Long count =
+                 db.sql(
+                                 "SELECT COUNT(*) AS n FROM access_audit"
+                                         + " WHERE actor_id = :actorId AND action = :action"
+                                         + " AND entity_id = :entityId AND result = :result")
+                         .bind("actorId", adminId)
+                         .bind("action", action)
+                         .bind("entityId", entityId)
+                         .bind("result", result)

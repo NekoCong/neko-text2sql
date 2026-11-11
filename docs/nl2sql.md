@@ -1,6 +1,6 @@
 # NL2SQL 架构说明（DB-GPT 精简实现）
 
-本文说明 `text2sql-backend` 如何把"自然语言 → SQL → 执行 → 结果"跑通，以及它与
+本文说明 `neko-text2sql-backend` 如何把"自然语言 → SQL → 执行 → 结果"跑通，以及它与
 [DB-GPT](https://github.com/eosphoros-ai/DB-GPT) 的对应关系和后续扩展点。
 
 ## 1. 设计取向

@@ -2,9 +2,9 @@
 
 ## 1. Access-control schema and seed
 
-- [x] 1.1 Add `access_role`, `access_permission`, `access_role_permission`, `access_user_role`, `access_role_datasource`, `access_data_scope`, and `access_audit` to `text2sql-backend/src/main/resources/db/app-schema.sql` with the indexes needed by the resolver (user, role, datasource/table). Verify a fresh schema applies cleanly and `SHOW TABLES` lists all seven.
+- [x] 1.1 Add `access_role`, `access_permission`, `access_role_permission`, `access_user_role`, `access_role_datasource`, `access_data_scope`, and `access_audit` to `neko-text2sql-backend/src/main/resources/db/app-schema.sql` with the indexes needed by the resolver (user, role, datasource/table). Verify a fresh schema applies cleanly and `SHOW TABLES` lists all seven.
 - [x] 1.2 Seed the built-in `admin`, `student`, and `counselor` roles, the permission catalog (including `user.read` and `user.manage`), role-permission mappings, datasource grants, and data-scope policies equivalent to today's `TablePolicy` in `db/app-data.sql` using idempotent inserts. Verify a fresh DB has exactly one built-in admin role and the expected permission/scope counts.
-- [x] 1.3 Add an idempotent migration script under `text2sql-backend/src/main/resources/db/migration/` that creates the new tables if absent and backfills `access_user_role` from `app_user.role`, `access_role_datasource` from `datasource_access`, and `access_data_scope` from the current role behavior. Verify running it twice produces no duplicate rows and leaves the legacy tables untouched.
+- [x] 1.3 Add an idempotent migration script under `neko-text2sql-backend/src/main/resources/db/migration/` that creates the new tables if absent and backfills `access_user_role` from `app_user.role`, `access_role_datasource` from `datasource_access`, and `access_data_scope` from the current role behavior. Verify running it twice produces no duplicate rows and leaves the legacy tables untouched.
 - [x] 1.4 Add `enabled BOOLEAN NOT NULL DEFAULT TRUE` and `token_version INTEGER NOT NULL DEFAULT 0` to `app_user` (schema + idempotent migration for existing volumes). Verify a fresh schema has both columns, existing rows backfill with `TRUE`/`0`, and the migration adds them to an existing table.
 
 ## 2. Access-control domain and resolution
@@ -58,7 +58,7 @@
 ## 8. Integration verification
 
 - [x] 8.1 Run the backend test suite with JDK 25 (`.\mvnw.cmd test` or the project's documented command) and verify all tests pass, including the new access-control/CTE tests.
-- [x] 8.2 Run `npm test` and `npm run build` in `text2sql-frontend`; both must exit 0.
+- [x] 8.2 Run `npm test` and `npm run build` in `neko-text2sql-frontend`; both must exit 0.
 - [x] 8.3 Apply the migration to a copy of the seed database and compare effective access for `admin`, `student01`, and `counselor01` with the pre-change behavior. Verify `student01` still sees only own rows, `counselor01` sees only managed classes, and `admin` is unrestricted.
 - [x] 8.4 End-to-end check: create a custom role, grant `chat.use` plus a filtered `score` policy, create a user with that role, and verify both the pipeline and AgentScope path return the filtered result; revoke the role and verify the next request is denied.
 - [x] 8.5 Run the CTE regression and confirm a restricted user cannot read a protected table via a same-name CTE, including a schema-qualified body.

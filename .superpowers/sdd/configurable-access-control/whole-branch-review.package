@@ -1,0 +1,383 @@
+﻿## Commits
+dc657bf chore(openspec): mark schema, docs and verification tasks complete
+3ad8e23 fix(ui): load chat history only for users allowed to chat
+6c32e7d fix(security): enforce module permissions on API routes
+df265f2 feat(frontend): add permission-aware navigation and guards
+bb513f7 chore(openspec): mark access-control UI tasks complete
+e88f49d fix(access-control): sort schema metadata by name
+81f238d fix(access-control): address management UI review findings
+2a43be1 refactor(ui): split data-scope and user dialogs out of the tab components
+ba674cb feat(access-control): add permission-management UI with six tabs
+84b0ffb feat(access-control): add read-only datasource schema endpoint
+db8bec9 chore(openspec): mark access-control API client task complete
+4009b2e docs(deploy): document configurable access control and wire its migration
+2115003 feat(access-control): enrich profile with effective roles/permissions + typed access-control API client
+822a9e4 chore(openspec): mark audit read API task complete
+0d8be55 Add read-only audit API (task 5.6)
+ed5bbfe chore(openspec): mark anti-escalation task complete
+da9c9d5 feat(access-control): anti-escalation and lockout protection (task 5.7)
+8867def chore(openspec): mark datasource matrix task complete
+4b8d669 feat(access): role-record datasource matrix (task 5.5)
+dac528b chore(openspec): mark user lifecycle API task complete
+8824a7b feat(access): gate user routes by user.read/user.manage, paginate list, add display-name edit/detail
+d00eaac fix(access): cover role-change token-version test and close 5.4 review minors
+7479728 feat(access): add user lifecycle admin API (task 5.4)
+f0a94dc chore(openspec): mark data-scope policy API task complete
+e7b118c fix(access): reuse resolved datasource, close data-scope review minors
+f384d38 fix(access): data-scope identifier rejection 422 + audited, canonical names, pre-transaction validation
+50520ba feat(access): data-scope policy admin API (task 5.3)
+99439db chore(openspec): mark permission matrix task complete
+7a8bc9e fix(access-control): require permission body and make the escalation seam usable (task 5.2)
+4c9ba62 feat(access-control): permission catalog and role-permission matrix (task 5.2)
+ccb973f chore(openspec): mark role admin API task complete
+eeb8471 ﻿fix(access): remove the global ResponseStatusException handler
+f8d8033 fix(access): make role mutations transactional and close review gaps
+8f6b8d9 feat(access): add role catalog admin API with audit trail
+7684793 chore(openspec): mark CTE hardening tasks complete
+4bf9cf8 fix(sql): address review of CTE scoping and predicate hardening
+5702818 fix(sql): scope CTE visibility and reject protected-table shadowing
+87cf616 chore(openspec): mark permission-route task complete
+7b6b076 feat(security): gate management routes by permission instead of JWT role
+239cb5a chore(openspec): mark access-control enforcement tasks complete
+6c671ac fix(security): pass token version everywhere and thread the resolved datasource into enforcement
+4e17c7b fix(security): fail closed on missing data scope and bridge datasource grants
+64cf9ac feat(security): enforce database-configured data policies in the pipeline
+9818fd0 chore(openspec): mark access-control auth task complete
+d82aa85 fix(auth): register access filter once and harden error handling
+a4b3a1c feat(auth): enforce account status and session version
+03efc62 feat(access): add configurable RBAC schema and effective-access resolver
+
+## Stat
+ .../task-3.1-fix-report.md                         | 195 ++++
+ .../task-4.1-fix-report.md                         |  92 ++
+ .../task-5.1-fix-report.md                         | 237 +++++
+ .../task-5.2-fix-report.md                         |  77 ++
+ .../task-5.3-fix-report.md                         |  77 ++
+ .../task-5.4-fix-report.md                         |  92 ++
+ README.md                                          |  76 +-
+ deploy/bootstrap.sh                                |  10 +-
+ deploy/docker-compose.prod.yml                     |   3 +
+ docs/deploy.md                                     |  74 +-
+ docs/nl2sql.md                                     |  61 +-
+ .../changes/configurable-access-control/design.md  | 162 +++-
+ .../configurable-access-control/proposal.md        |  15 +-
+ .../specs/access-control/spec.md                   |  86 +-
+ .../changes/configurable-access-control/tasks.md   |  75 +-
+ .../text2sql/access/AccessAdminRepository.java     | 349 ++++++++
+ .../text2sql/access/AccessAdminService.java        | 729 +++++++++++++++
+ .../com/nekocong/text2sql/access/AccessAudit.java  |  31 +
+ .../text2sql/access/AccessContextResolver.java     | 223 +++++
+ .../text2sql/access/AccessControlRepository.java   |  99 ++
+ .../text2sql/access/AccessEscalationService.java   | 156 ++++
+ .../text2sql/access/AccessLockoutService.java      | 187 ++++
+ .../nekocong/text2sql/access/AccessPermission.java |  25 +
+ .../com/nekocong/text2sql/access/AccessRole.java   |  23 +
+ .../com/nekocong/text2sql/access/AccessUser.java   |  32 +
+ .../nekocong/text2sql/access/AccountStatus.java    |  14 +
+ .../com/nekocong/text2sql/access/AuditQuery.java   |  23 +
+ .../text2sql/access/AuditQueryService.java         | 204 +++++
+ .../nekocong/text2sql/access/DataScopePolicy.java  |  11 +
+ .../text2sql/access/DataScopePolicyEngine.java     | 110 +++
+ .../nekocong/text2sql/access/DataScopeRule.java    |  22 +
+ .../nekocong/text2sql/access/DataScopeService.java | 856 ++++++++++++++++++
+ .../text2sql/access/DatasourceSchemaService.java   | 114 +++
+ .../access/DefaultPermissionEscalationGuard.java   |  39 +
+ .../nekocong/text2sql/access/EffectiveAccess.java  |  56 ++
+ .../text2sql/access/PermissionEscalationGuard.java |  49 +
+ .../com/nekocong/text2sql/access/Permissions.java  |  34 +
+ .../nekocong/text2sql/access/PolicyDecision.java   |  62 ++
+ .../text2sql/access/PrincipalAttribute.java        |  49 +
+ .../text2sql/access/PrincipalAttributes.java       |  21 +
+ .../access/R2dbcAccessAdminRepository.java         | 739 +++++++++++++++
+ .../access/R2dbcAccessControlRepository.java       | 290 ++++++
+ .../nekocong/text2sql/access/RoleDatasource.java   |  12 +
+ .../text2sql/access/RoleDatasourceService.java     | 460 ++++++++++
+ .../text2sql/access/RolePermissionLink.java        |  11 +
+ .../text2sql/access/RolePermissionService.java     | 518 +++++++++++
+ .../com/nekocong/text2sql/access/RowPredicate.java |  13 +
+ .../nekocong/text2sql/access/UserAdminService.java | 984 ++++++++++++++++++++
+ .../com/nekocong/text2sql/access/UserRoleLink.java |  11 +
+ .../access/api/AccessControlController.java        | 495 ++++++++++
+ .../access/api/dto/AccessAuditPageView.java        |  20 +
+ .../text2sql/access/api/dto/AccessAuditView.java   |  35 +
+ .../access/api/dto/AccessPermissionView.java       |  38 +
+ .../api/dto/AccessRolePermissionsRequest.java      |  15 +
+ .../access/api/dto/AccessRolePermissionsView.java  |  20 +
+ .../text2sql/access/api/dto/AccessRoleRequest.java |  20 +
+ .../text2sql/access/api/dto/AccessRoleView.java    |  41 +
+ .../access/api/dto/AccessUserCreateRequest.java    |  18 +
+ .../api/dto/AccessUserDisplayNameRequest.java      |  11 +
+ .../text2sql/access/api/dto/AccessUserPage.java    |  34 +
+ .../access/api/dto/AccessUserPasswordRequest.java  |   8 +
+ .../access/api/dto/AccessUserRoleView.java         |  11 +
+ .../access/api/dto/AccessUserRolesRequest.java     |  14 +
+ .../access/api/dto/AccessUserStatusRequest.java    |   8 +
+ .../text2sql/access/api/dto/AccessUserView.java    |  50 ++
+ .../text2sql/access/api/dto/DataScopeRequest.java  |  34 +
+ .../text2sql/access/api/dto/DataScopeView.java     |  42 +
+ .../api/dto/DatasourceMatrixDatasourceView.java    |  14 +
+ .../access/api/dto/DatasourceMatrixRoleView.java   |  27 +
+ .../access/api/dto/DatasourceMatrixView.java       |  20 +
+ .../access/api/dto/DatasourceSchemaColumnView.java |  13 +
+ .../access/api/dto/DatasourceSchemaTableView.java  |  17 +
+ .../access/api/dto/DatasourceSchemaView.java       |  21 +
+ .../access/api/dto/RoleDatasourcesRequest.java     |  14 +
+ .../access/api/dto/RoleDatasourcesView.java        |  20 +
+ .../text2sql/config/AccessStatusWebFilter.java     | 163 ++++
+ .../nekocong/text2sql/config/SecurityConfig.java   | 155 +++-
+ .../text2sql/controller/AuthController.java        |  37 +-
+ .../text2sql/controller/DataSourceController.java  |   3 +-
+ .../controller/DatasourceAccessController.java     |   7 +-
+ .../text2sql/controller/Text2SqlController.java    |   7 +-
+ .../nekocong/text2sql/controller/dto/UserView.java |  23 +-
+ .../knowledge/api/KnowledgeCitationController.java |  16 +-
+ .../api/KnowledgeRetrievalController.java          |   6 +-
+ .../knowledge/service/KnowledgeSearchService.java  |   4 +-
+ .../text2sql/repository/AccessRepository.java      |  11 +
+ .../text2sql/repository/UserRepository.java        |  11 +-
+ .../text2sql/schema/FullSchemaProvider.java        |   2 +-
+ .../text2sql/schema/RagSchemaProvider.java         |   2 +-
+ .../com/nekocong/text2sql/security/DataScope.java  |  79 +-
+ .../text2sql/security/DataScopeResolver.java       | 127 +--
+ .../com/nekocong/text2sql/security/JwtService.java |  12 +-
+ .../security/PermissionAuthorizationManager.java   |  83 ++
+ .../nekocong/text2sql/security/TablePolicy.java    | 205 +++--
+ .../nekocong/text2sql/security/TokenClaims.java    |  41 +
+ .../com/nekocong/text2sql/service/AuthService.java |  57 +-
+ .../text2sql/service/DatasourceAccessService.java  |  24 +-
+ .../text2sql/service/Text2SqlPipelineService.java  |  89 +-
+ .../nekocong/text2sql/sql/DataScopeRewriter.java   | 338 ++++++-
+ .../java/com/nekocong/text2sql/tool/SqlTools.java  |   2 +-
+ .../java/com/nekocong/text2sql/user/AppUser.java   |  12 +-
+ .../src/main/resources/db/app-data.sql             |  62 ++
+ .../src/main/resources/db/app-schema.sql           |  90 ++
+ .../db/migration/2026-11-09-access-control.sql     | 297 ++++++
+ .../text2sql/Nl2SqlCoreIntegrationTest.java        |   3 +-
+ .../access/AccessAdminServiceTransactionTest.java  | 363 ++++++++
+ .../text2sql/access/AccessContextResolverTest.java | 161 ++++
+ .../text2sql/access/DataScopePolicyEngineTest.java | 135 +++
+ .../access/R2dbcAccessControlRepositoryTest.java   |  88 ++
+ .../RolePermissionServiceTransactionTest.java      | 360 ++++++++
+ .../datasource/DatasourceAccessGuardTest.java      |   9 +-
+ .../service/KnowledgeSearchServiceTest.java        |  50 +-
+ .../text2sql/schema/RagSchemaProviderTest.java     |   7 +-
+ .../text2sql/schema/SchemaTrimmingTest.java        |  29 +-
+ .../nekocong/text2sql/security/AccessFixtures.java | 146 +++
+ .../text2sql/security/DataScopeResolverTest.java   | 244 ++++-
+ .../text2sql/security/TablePolicyTest.java         | 182 +++-
+ .../nekocong/text2sql/service/AuthServiceTest.java | 224 +++++
+ .../service/Text2SqlPipelineServiceTest.java       |   8 +-
+ .../service/Text2SqlPolicyEnforcementTest.java     | 248 +++++
+ .../sql/DataPermissionIntegrationTest.java         |  28 +-
+ .../text2sql/sql/DataScopeRewriterTest.java        | 498 ++++++++++-
+ .../com/nekocong/text2sql/tool/SqlToolsTest.java   |  23 +-
+ .../text2sql/web/AccessControlAuditTest.java       | 585 ++++++++++++
+ .../text2sql/web/AccessControlDataScopeTest.java   | 890 ++++++++++++++++++
+ .../web/AccessControlDatasourceMatrixTest.java     | 529 +++++++++++
+ .../text2sql/web/AccessControlEscalationTest.java  | 549 ++++++++++++
+ .../text2sql/web/AccessControlPermissionTest.java  | 542 +++++++++++
+ .../text2sql/web/AccessControlRoleTest.java        | 608 +++++++++++++
+ .../text2sql/web/AccessControlSchemaTest.java      | 153 ++++
+ .../text2sql/web/AccessControlUserTest.java        | 996 +++++++++++++++++++++
+ .../text2sql/web/AccessStatusIntegrationTest.java  | 148 +++
+ .../nekocong/text2sql/web/AuthControllerTest.java  | 126 ++-
+ .../text2sql/web/ConversationControllerTest.java   |  32 +
+ .../text2sql/web/ConversationRoleAccessTest.java   |   8 +-
+ .../web/DatasourceAccessControllerTest.java        |  21 +-
+ .../text2sql/web/ModelConfigControllerTest.java    |  24 +-
+ .../text2sql/web/PermissionAuthorizationTest.java  | 196 ++++
+ .../text2sql/web/PermissionRouteGatingTest.java    | 222 +++++
+ .../web/Text2SqlControllerPersistenceTest.java     |  21 +-
+ .../text2sql/web/Text2SqlControllerScopeTest.java  |  92 +-
+ .../src/test/resources/application-test.yaml       |  12 +
+ .../src/test/resources/db/test-access-data.sql     | 131 +++
+ text2sql-frontend/src/App.vue                      |  44 +-
+ text2sql-frontend/src/api/accessControl.ts         | 266 ++++++
+ .../src/components/access-control/AuditTab.vue     | 367 ++++++++
+ .../access-control/DataScopeRuleDialog.vue         | 384 ++++++++
+ .../src/components/access-control/DataScopeTab.vue | 263 ++++++
+ .../access-control/DatasourceAccessTab.vue         | 199 ++++
+ .../components/access-control/PermissionsTab.vue   | 366 ++++++++
+ .../src/components/access-control/RolesTab.vue     | 383 ++++++++
+ .../src/components/access-control/UserDialogs.vue  | 443 +++++++++
+ .../src/components/access-control/UsersTab.vue     | 359 ++++++++
+ text2sql-frontend/src/router/index.ts              |  57 +-
+ text2sql-frontend/src/stores/auth.ts               |  58 ++
+ text2sql-frontend/src/types.ts                     | 202 ++++-
+ text2sql-frontend/src/utils/navigation.ts          |  63 ++
+ text2sql-frontend/src/utils/permissions.ts         |  28 +
+ text2sql-frontend/src/views/AccessControlView.vue  |  66 ++
+ text2sql-frontend/src/views/ChatView.vue           |  34 +-
+ text2sql-frontend/src/views/DataSourcesView.vue    |  20 +-
+ text2sql-frontend/src/views/KnowledgeView.vue      |  12 +-
+ text2sql-frontend/src/views/NoPermissionView.vue   |  54 ++
+ text2sql-frontend/tests/navigation.test.mjs        |  69 ++
+ text2sql-frontend/tests/permissions.test.mjs       |  35 +
+ 165 files changed, 22815 insertions(+), 561 deletions(-)
+
+## Name-status
+A	.superpowers/sdd/configurable-access-control/task-3.1-fix-report.md
+A	.superpowers/sdd/configurable-access-control/task-4.1-fix-report.md
+A	.superpowers/sdd/configurable-access-control/task-5.1-fix-report.md
+A	.superpowers/sdd/configurable-access-control/task-5.2-fix-report.md
+A	.superpowers/sdd/configurable-access-control/task-5.3-fix-report.md
+A	.superpowers/sdd/configurable-access-control/task-5.4-fix-report.md
+M	README.md
+M	deploy/bootstrap.sh
+M	deploy/docker-compose.prod.yml
+M	docs/deploy.md
+M	docs/nl2sql.md
+M	openspec/changes/configurable-access-control/design.md
+M	openspec/changes/configurable-access-control/proposal.md
+M	openspec/changes/configurable-access-control/specs/access-control/spec.md
+M	openspec/changes/configurable-access-control/tasks.md
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminRepository.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAdminService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessAudit.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessContextResolver.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessControlRepository.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessEscalationService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessLockoutService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessPermission.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessRole.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccessUser.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AccountStatus.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQuery.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/AuditQueryService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopePolicy.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopePolicyEngine.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopeRule.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopeService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/DatasourceSchemaService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/DefaultPermissionEscalationGuard.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/EffectiveAccess.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/PermissionEscalationGuard.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/Permissions.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/PolicyDecision.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/PrincipalAttribute.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/PrincipalAttributes.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessAdminRepository.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/R2dbcAccessControlRepository.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasource.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/RoleDatasourceService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/RolePermissionLink.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/RolePermissionService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/RowPredicate.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/UserAdminService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/UserRoleLink.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditPageView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessAuditView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessPermissionView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRolePermissionsView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRoleRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessRoleView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserCreateRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserDisplayNameRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserPage.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserPasswordRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserRoleView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserRolesRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserStatusRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/AccessUserView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DataScopeRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DataScopeView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixDatasourceView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixRoleView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceMatrixView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaColumnView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaTableView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DatasourceSchemaView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesRequest.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/RoleDatasourcesView.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/config/AccessStatusWebFilter.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/controller/AuthController.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DataSourceController.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DatasourceAccessController.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/controller/dto/UserView.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeCitationController.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/api/KnowledgeRetrievalController.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/knowledge/service/KnowledgeSearchService.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/repository/AccessRepository.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/repository/UserRepository.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/schema/FullSchemaProvider.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/schema/RagSchemaProvider.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScope.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeResolver.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/security/JwtService.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/security/PermissionAuthorizationManager.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/security/TablePolicy.java
+A	text2sql-backend/src/main/java/com/nekocong/text2sql/security/TokenClaims.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/service/AuthService.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/service/DatasourceAccessService.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/sql/DataScopeRewriter.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java
+M	text2sql-backend/src/main/java/com/nekocong/text2sql/user/AppUser.java
+M	text2sql-backend/src/main/resources/db/app-data.sql
+M	text2sql-backend/src/main/resources/db/app-schema.sql
+A	text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/Nl2SqlCoreIntegrationTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessAdminServiceTransactionTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/access/AccessContextResolverTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/access/DataScopePolicyEngineTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/access/R2dbcAccessControlRepositoryTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/access/RolePermissionServiceTransactionTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/datasource/DatasourceAccessGuardTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/knowledge/service/KnowledgeSearchServiceTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/schema/RagSchemaProviderTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/schema/SchemaTrimmingTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/security/AccessFixtures.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeResolverTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/security/TablePolicyTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/service/AuthServiceTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPolicyEnforcementTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataPermissionIntegrationTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/sql/DataScopeRewriterTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlAuditTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDataScopeTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDatasourceMatrixTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlEscalationTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlPermissionTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlRoleTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlSchemaTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlUserTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessStatusIntegrationTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/AuthControllerTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationControllerTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/ConversationRoleAccessTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/DatasourceAccessControllerTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/ModelConfigControllerTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionAuthorizationTest.java
+A	text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionRouteGatingTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/Text2SqlControllerPersistenceTest.java
+M	text2sql-backend/src/test/java/com/nekocong/text2sql/web/Text2SqlControllerScopeTest.java
+M	text2sql-backend/src/test/resources/application-test.yaml
+A	text2sql-backend/src/test/resources/db/test-access-data.sql
+M	text2sql-frontend/src/App.vue
+A	text2sql-frontend/src/api/accessControl.ts
+A	text2sql-frontend/src/components/access-control/AuditTab.vue
+A	text2sql-frontend/src/components/access-control/DataScopeRuleDialog.vue
+A	text2sql-frontend/src/components/access-control/DataScopeTab.vue
+A	text2sql-frontend/src/components/access-control/DatasourceAccessTab.vue
+A	text2sql-frontend/src/components/access-control/PermissionsTab.vue
+A	text2sql-frontend/src/components/access-control/RolesTab.vue
+A	text2sql-frontend/src/components/access-control/UserDialogs.vue
+A	text2sql-frontend/src/components/access-control/UsersTab.vue
+M	text2sql-frontend/src/router/index.ts
+M	text2sql-frontend/src/stores/auth.ts
+M	text2sql-frontend/src/types.ts
+A	text2sql-frontend/src/utils/navigation.ts
+A	text2sql-frontend/src/utils/permissions.ts
+A	text2sql-frontend/src/views/AccessControlView.vue
+M	text2sql-frontend/src/views/ChatView.vue
+M	text2sql-frontend/src/views/DataSourcesView.vue
+M	text2sql-frontend/src/views/KnowledgeView.vue
+A	text2sql-frontend/src/views/NoPermissionView.vue
+A	text2sql-frontend/tests/navigation.test.mjs
+A	text2sql-frontend/tests/permissions.test.mjs

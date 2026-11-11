@@ -1,0 +1,1352 @@
+﻿## Commits
+f384d38 fix(access): data-scope identifier rejection 422 + audited, canonical names, pre-transaction validation
+
+## Stat
+ .../task-5.3-fix-report.md                         |  77 ++++
+ .../nekocong/text2sql/access/DataScopeService.java | 504 ++++++++++++++-------
+ .../access/api/AccessControlController.java        |  17 +-
+ .../text2sql/access/api/dto/DataScopeRequest.java  |   8 +-
+ .../text2sql/web/AccessControlDataScopeTest.java   | 221 ++++++++-
+ 5 files changed, 661 insertions(+), 166 deletions(-)
+
+## Diff
+diff --git a/.superpowers/sdd/configurable-access-control/task-5.3-fix-report.md b/.superpowers/sdd/configurable-access-control/task-5.3-fix-report.md
+new file mode 100644
+index 0000000..7069139
+--- /dev/null
++++ b/.superpowers/sdd/configurable-access-control/task-5.3-fix-report.md
+@@ -0,0 +1,77 @@
++# Task 5.3 fix report — data-scope policy admin API
++
++Review outcome addressed: **Needs fixes** (1 Important + minors). All items below are in commit
++on `master`; covering class `AccessControlDataScopeTest` is now 20 tests.
++
++## Important
++
++1. **Identifier / raw-SQL rejection is now 422 and audited as DENIED.**
++   - `requireShape` no longer checks the table/column *syntax*; it only rejects structurally
++     malformed requests (missing body/fields, bad policy, FILTER without column+attribute,
++     ALL/DENY carrying one) with 400 and no audit row.
++   - The bare-identifier rule now lives in `checkIdentifiers`, which runs inside the blocking
++     metadata pass and returns a `Denial(422, "标识符不合法：<value>")`; it is persisted as a
++     DENIED `data_scope.upsert` row through the existing `REQUIRES_NEW` denial path.
++   - Unknown attribute (`未知主体属性：<value>`) moved to the same pass, so it is a 422 + DENIED
++     too (previously it was audited from a separate branch; behaviour unchanged, code unified).
++   - `AccessControlDataScopeTest.rawSqlOrQualifiedOrQuotedNamesAreUnprocessableAndAudited`
++     asserts 422 for `score WHERE 1=1`, `campus.score`, `"score"`, `student_id = 1 OR 1=1`,
++     `student-id`, and asserts exactly 5 DENIED rows, 0 SUCCESS, each reason prefixed
++     `标识符不合法`.
++
++## Minors
++
++- **Canonical table/column names**: `inspect` stores `TableSchema.name()` and
++  `ColumnSchema.name()`, and the attribute is stored as `PrincipalAttribute.code()`. Covered by
++  `aCaseVariantReUpsertKeepsTheRowAndStoresCanonicalNames` (`SCORE`/`Score`, `STUDENT_ID` →
++  single row, canonical spelling).
++- **No re-resolution in `findTable`**: `requireDatasource` returns the resolved `DataSource`;
++  `findTable(DataSource, …)` uses it directly. A registry removal after validation therefore
++  fails as an introspection error rather than a second 404/500 ambiguity.
++- **Metadata validated outside the transaction**: `upsert` validates (role, datasource,
++  attribute, table, column, type) first, then `store(...)` wraps only the upsert + SUCCESS audit
++  in `transactions::transactional`. `delete` likewise loads the row outside and wraps only
++  `deleteAndAudit` (delete + SUCCESS audit). No app-DB connection is held across JDBC metadata
++  work.
++- **Error-shape symmetry**: controller takes `@RequestBody(required = false)` and
++  `@RequestParam(required = false) String roleId`, returning a `ResponseStatusException` so the
++  local handler renders `{status,message}`. Covered by
++  `aMissingBodyOrRequiredParameterKeepsTheStatusMessageShape` (empty body → `请求体不能为空`;
++  `{}` and missing/empty `roleId` → `角色标识不能为空`).
++- **Unknown stored policy**: `anUnknownStoredPolicyIsListedAsDeny` inserts `policy='BOGUS'` and
++  asserts list maps it to `DENY` and the policy engine denies the table (repository
++  `parsePolicy` already failed closed).
++- **Dead branch removed**: the old `resolveAttribute(…).then(Mono.empty())` chain is gone; the
++  attribute is resolved (or rejected) inside `inspect`.
++- **Datasource id pattern relaxed**: `DATASOURCE_ID_PATTERN = [A-Za-z0-9._-]{1,64}`, matching the
++  registry's id space (ids are only bound, never interpolated; `DataSourceDefinition.setId` does
++  not constrain the form). Documented on the constant. Covered by
++  `aDatasourceIdWithRegistryCharactersIsAccepted` (`no-such-ds` → 404, not 400).
++- **Type compatibility**: documented on `DataScopeRequest`. `studentId` (rendered as a bare
++  number) must target a numeric column; a known text type (`VARCHAR`/`CHAR`/`TEXT`/`CLOB`/…,
++  including H2's `CHARACTER VARYING`) is rejected with 422 `列类型与主体属性不匹配：…`.
++  `classIds` is an `IN` list and `userId`/`username`/`studentNo` compare as text, so all three
++  accept any column. Unknown type names are not rejected (left to the policy engine). Covered by
++  `aNumericAttributeOnATextColumnIsUnprocessableAndAudited` (rejects `student.name`, accepts
++  `student.id` and `student.student_no`).
++- **Test gaps**: `reUpsertPreservesTheCreatedAtTimestamp`, `aCaseVariantReUpsert…`,
++  `listIsOrderedByDatasourceThenTable` (ordered `class`, `score`, `student`; datasource filter),
++  `aMissingBodyOrRequiredParameterKeepsTheStatusMessageShape`,
++  `aDatasourceIdWithRegistryCharactersIsAccepted`, `anUnknownStoredPolicyIsListedAsDeny`.
++
++## Validation
++
++- `mvn -o test -Dtest=AccessControlDataScopeTest` — 20 run, 0 failures.
++- `mvn -o test` (no `DASHSCOPE_API_KEY`) — **BUILD SUCCESS**, Tests run: **314**, Failures: 0,
++  Errors: 0, Skipped: 0.
++
++## Notes / residual concerns
++
++- The type check is deliberately narrow: only a single-valued numeric attribute
++  (`studentId`) on a *known* text column is rejected. Widening it (e.g. `userId` on a numeric
++  column) risks false rejections on dialects that report unusual type names, so unknown types
++  pass through to the policy engine.
++- Identifier case is canonicalised at write time, but the unique key `(role_id, datasource_id,
++  table_name)` is case-sensitive in MySQL's default collation on H2; a pre-existing row stored
++  with a non-canonical spelling (only possible from a manual insert) is not normalised by this
++  change.
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopeService.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopeService.java
+index b5f1a51..2868b7a 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopeService.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/DataScopeService.java
+@@ -3,23 +3,26 @@ package com.nekocong.text2sql.access;
+ import com.fasterxml.jackson.core.JsonProcessingException;
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.nekocong.text2sql.access.api.dto.DataScopeRequest;
+ import com.nekocong.text2sql.access.api.dto.DataScopeView;
+ import com.nekocong.text2sql.config.BlockingSchedulerConfig;
+ import com.nekocong.text2sql.datasource.DataSourceRegistry;
+ import com.nekocong.text2sql.schema.SchemaIntrospector;
+ import com.nekocong.text2sql.schema.model.ColumnSchema;
+ import com.nekocong.text2sql.schema.model.TableSchema;
+ import java.util.List;
++import java.util.Locale;
+ import java.util.NoSuchElementException;
+ import java.util.Optional;
++import java.util.Set;
+ import java.util.regex.Pattern;
++import javax.sql.DataSource;
+ import org.slf4j.Logger;
+ import org.slf4j.LoggerFactory;
+ import org.springframework.beans.factory.annotation.Qualifier;
+ import org.springframework.http.HttpStatus;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.ReactiveTransactionManager;
+ import org.springframework.transaction.TransactionDefinition;
+ import org.springframework.transaction.reactive.TransactionalOperator;
+ import org.springframework.transaction.support.DefaultTransactionDefinition;
+ import org.springframework.web.server.ResponseStatusException;
+@@ -30,86 +33,107 @@ import reactor.core.scheduler.Scheduler;
+  * The data-scope admin API: list, upsert and delete the per-role, per-datasource, per-table
+  * policies ({@code ALL} / {@code FILTER} / {@code DENY}).
+  *
+  * <p>Kept separate from {@link AccessAdminService} (roles) and {@link RolePermissionService}
+  * (permission matrix) so each stays focused. The transaction and audit patterns are the same:
+  *
+  * <ul>
+  *   <li>An upsert or delete runs in one reactive transaction: the row change and its {@code
+  *       data_scope.upsert} / {@code data_scope.delete} {@code SUCCESS} audit row commit together or
+  *       not at all, so a failed audit insert also rolls the change back.
+- *   <li>A rejection decided against loaded data (unknown role, unknown datasource, unknown table or
+- *       column, unknown attribute) writes exactly one {@code DENIED} row in its own {@code
+- *       REQUIRES_NEW} transaction, then fails with the mapped status ({@code 404} / {@code 422}).
+- *   <li>Shape validation (missing or malformed identifiers, a bad policy, a {@code FILTER} without a
+- *       column/attribute, an {@code ALL}/{@code DENY} carrying one) fails with {@code 400} before
+- *       anything is loaded and writes no row: there is no entity to attribute the attempt to.
++ *   <li>A rejection decided against the request or loaded data (a non-identifier name, unknown
++ *       role, unknown datasource, unknown table or column, unknown attribute, a type mismatch) writes
++ *       exactly one {@code DENIED} row in its own {@code REQUIRES_NEW} transaction, then fails with the
++ *       mapped status ({@code 404} / {@code 422}).
++ *   <li>Only a structurally malformed request (a missing body, missing fields, a bad policy, a {@code
++ *       FILTER} without a column/attribute, an {@code ALL}/{@code DENY} carrying one) answers {@code
++ *       400} without auditing: there is no identifiable change to attribute the attempt to.
+  * </ul>
+  *
+- * <p>Fail closed, and never trust the body as SQL: the only names that can reach a later predicate
+- * are a table and column validated against the datasource's <em>live</em> metadata and an attribute
+- * validated against the closed {@link PrincipalAttribute} catalog. The live metadata is blocking JDBC
+- * ({@link SchemaIntrospector#introspect}), so it is read on the {@code blockingScheduler}, never on
+- * the event loop.
++ * <p>Fail closed, and never trust the body as SQL: the only names that can reach a later predicate are
++ * a table and column validated (and canonicalised) against the datasource's <em>live</em> metadata and
++ * an attribute validated against the closed {@link PrincipalAttribute} catalog. The live metadata is
++ * blocking JDBC ({@link SchemaIntrospector#introspect}), so it is read on the {@code blockingScheduler},
++ * never on the event loop — and validated <em>before</em> the mutation transaction opens, so no
++ * application-database connection is held across that work.
+  */
+ @Service
+ public class DataScopeService {
+ 
+     private static final Logger log = LoggerFactory.getLogger(DataScopeService.class);
+ 
+     /** A bare, unqualified SQL identifier: what a table or column name may be. */
+     static final String IDENTIFIER_PATTERN_DESCRIPTION = "[A-Za-z_][A-Za-z0-9_]*";
+ 
+     private static final Pattern IDENTIFIER_PATTERN =
+             Pattern.compile("^" + IDENTIFIER_PATTERN_DESCRIPTION + "$");
+ 
+-    /** The alphabet ids are generated from (UUIDs and the deterministic seed ids). */
++    /**
++     * The datasource id space. Deliberately wider than a SQL identifier and narrower than "anything":
++     * ids come from configuration or the management API and may contain dots, dashes and slashes
++     * (e.g. {@code campus}, {@code erp-prod}, {@code tenant.a}), and they are only ever bound as
++     * parameters, never interpolated. {@link DataSourceDefinition#setId} does not constrain the form.
++     */
++    private static final Pattern DATASOURCE_ID_PATTERN = Pattern.compile("^[A-Za-z0-9._-]{1,64}$");
++
++    /** The alphabet app-generated ids use (rule ids, role ids, UUIDs and the seed ids). */
+     private static final Pattern ID_PATTERN = Pattern.compile("^[A-Za-z0-9_-]{1,64}$");
+ 
++    /** SQL type names that hold text. */
++    private static final Set<String> TEXT_TYPES =
++            Set.of("CHAR", "VARCHAR", "VARCHAR2", "NCHAR", "NVARCHAR", "NVARCHAR2", "TEXT", "CLOB",
++                    "MEDIUMTEXT", "LONGTEXT", "TINYTEXT", "STRING");
++
++    /** Matches the multi-valued {@code classIds} attribute (rendered as an {@code IN} list). */
++    private static final PrincipalAttribute MULTIVALUED_ATTRIBUTE = PrincipalAttribute.CLASS_IDS;
++
+     /** Matches {@code access_audit.reason VARCHAR(512)}. */
+     private static final int MAX_REASON_LENGTH = 512;
+ 
+     /** How much of an echoed name to include in a rejection message. */
+     private static final int MAX_ECHOED_LENGTH = 64;
+ 
+     private static final String ENTITY_TYPE = "DATA_SCOPE";
+     private static final String ACTION_UPSERT = "data_scope.upsert";
+     private static final String ACTION_DELETE = "data_scope.delete";
+ 
+     private static final String RESULT_SUCCESS = "SUCCESS";
+     private static final String RESULT_DENIED = "DENIED";
+ 
++    private static final String REASON_BODY_MISSING = "请求体不能为空";
+     private static final String REASON_ROLE_MISSING = "角色不存在";
+     private static final String REASON_DATASOURCE_MISSING = "数据源不存在";
+     private static final String REASON_SCOPE_MISSING = "数据范围不存在";
+     private static final String REASON_POLICY_INVALID = "策略类型无效";
+     private static final String REASON_FILTER_INCOMPLETE = "FILTER 策略必须指定过滤列和主体属性";
+     private static final String REASON_NON_FILTER_HAS_COLUMN = "ALL/DENY 策略不能指定过滤列或主体属性";
++    private static final String REASON_IDENTIFIER_INVALID = "标识符不合法";
+     private static final String REASON_TABLE_MISSING = "表不存在：";
+     private static final String REASON_COLUMN_MISSING = "列不存在：";
+     private static final String REASON_UNKNOWN_ATTRIBUTE = "未知主体属性：";
++    private static final String REASON_TYPE_MISMATCH = "列类型与主体属性不匹配：";
+ 
+     private final AccessAdminRepository repository;
+     private final TransactionalOperator transactions;
+     private final TransactionalOperator newTransactions;
+     private final ObjectMapper objectMapper;
+     private final DataSourceRegistry datasources;
+     private final SchemaIntrospector introspector;
+     private final Scheduler blockingScheduler;
+ 
+     /**
+      * Creates the service.
+      *
+      * @param repository the admin repository
+      * @param transactionManager the R2DBC reactive transaction manager
+      * @param objectMapper the shared Jackson mapper, used for the audit JSON payloads
+-     * @param datasources the target-datasource registry, to validate the datasource id
++     * @param datasources the target-datasource registry, to validate and resolve the datasource
+      * @param introspector the live metadata reader (blocking JDBC)
+      * @param blockingScheduler the scheduler blocking metadata reads are offloaded to
+      */
+     public DataScopeService(
+             AccessAdminRepository repository,
+             ReactiveTransactionManager transactionManager,
+             ObjectMapper objectMapper,
+             DataSourceRegistry datasources,
+             SchemaIntrospector introspector,
+             @Qualifier(BlockingSchedulerConfig.BLOCKING_SCHEDULER) Scheduler blockingScheduler) {
+@@ -122,21 +146,22 @@ public class DataScopeService {
+                                 TransactionDefinition.PROPAGATION_REQUIRES_NEW));
+         this.objectMapper = objectMapper;
+         this.datasources = datasources;
+         this.introspector = introspector;
+         this.blockingScheduler = blockingScheduler;
+     }
+ 
+     /**
+      * Lists one role's data-scope rules, ordered by datasource then table.
+      *
+-     * <p>An unknown role is a {@code 404}; reads are not audited.
++     * <p>An unknown role is a {@code 404}; reads are not audited. A stored rule whose policy cannot be
++     * parsed is mapped to {@code DENY} by the repository (fail closed).
+      *
+      * @param roleId the role id
+      * @param datasourceId the datasource to filter by, or {@code null}/blank for all
+      * @return the rules
+      */
+     public Mono<List<DataScopeView>> list(String roleId, String datasourceId) {
+         return Mono.defer(
+                 () -> {
+                     requireId(roleId, "角色标识无效");
+                     String datasource = blankToNull(datasourceId);
+@@ -147,43 +172,46 @@ public class DataScopeService {
+                             .role(roleId)
+                             .switchIfEmpty(Mono.error(notFound(REASON_ROLE_MISSING)))
+                             .then(Mono.defer(() -> repository.dataScopesOf(roleId, datasource)))
+                             .map(rules -> rules.stream().map(DataScopeView::of).toList());
+                 });
+     }
+ 
+     /**
+      * Inserts or updates the rule for ({@code roleId}, {@code datasourceId}, {@code tableName}).
+      *
+-     * <p>An existing rule keeps its id; only the policy, column and attribute change.
++     * <p>An existing rule keeps its id and creation time; only the policy, column and attribute
++     * change. The table and column are stored under their canonical (introspected) spelling, so a
++     * case variant of the same name updates the same row rather than creating a second one.
++     *
++     * <p>Validation runs first, outside any transaction: the role, datasource, attribute, table,
++     * column and type are all checked before the mutation transaction opens, so a JDBC metadata read
++     * never holds an application-database connection.
+      *
+      * @param actorId the acting user id
+      * @param request the rule
+      * @return the stored rule
+      */
+     public Mono<DataScopeView> upsert(String actorId, DataScopeRequest request) {
+         return Mono.defer(
+                         () -> {
+                             requireShape(request);
+                             DataScopeRule candidate = candidate(request);
+                             return requireRole(actorId, candidate)
+                                     .then(Mono.defer(() -> requireDatasource(actorId, candidate)))
+-                                    .then(Mono.defer(() -> resolveAttribute(actorId, request, candidate)))
+-                                    .flatMap(
+-                                            rule ->
+-                                                    requireTableAndColumn(actorId, rule)
+-                                                            .then(
+-                                                                    Mono.defer(
+-                                                                            () -> apply(actorId, rule))));
++                                    .then(
++                                            Mono.defer(
++                                                    () ->
++                                                            requireTableAndColumnAndType(
++                                                                    actorId, request, candidate)))
++                                    .flatMap(rule -> store(actorId, rule));
+                         })
+-                .as(transactions::transactional)
+-                // A denial (audited in its own transaction) maps to its status here.
+                 .onErrorMap(Denial.class, Denial::toException)
+                 .map(DataScopeView::of);
+     }
+ 
+     /**
+      * Deletes one rule.
+      *
+      * <p>An unknown id is a {@code 404}, audited as {@code DENIED}: the attempt is attributable to
+      * the id.
+      *
+@@ -200,138 +228,91 @@ public class DataScopeService {
+                                     .switchIfEmpty(
+                                             Mono.defer(
+                                                     () ->
+                                                             deny(
+                                                                     actorId,
+                                                                     ACTION_DELETE,
+                                                                     id,
+                                                                     null,
+                                                                     null,
+                                                                     missing())))
+-                                    .flatMap(before -> deleteAndAudit(actorId, id, before))
++                                    // Only the mutation and its audit run in the transaction.
++                                    .flatMap(
++                                            before ->
++                                                    Mono.defer(
++                                                                    () ->
++                                                                            deleteAndAudit(
++                                                                                    actorId,
++                                                                                    id,
++                                                                                    before))
++                                                            .as(transactions::transactional))
+                                     .then();
+                         })
+-                .as(transactions::transactional)
+                 .onErrorMap(Denial.class, Denial::toException);
+     }
+ 
+-    /**
+-     * Deletes the rule and records its SUCCESS row, both in the caller's transaction.
+-     *
+-     * <p>The row was loaded just above, but a concurrent delete can still win the race; the reported
+-     * row count turns that into the same {@code 404} rather than a silent, unaudited success.
+-     */
+-    private Mono<DataScopeRule> deleteAndAudit(String actorId, String id, DataScopeRule before) {
+-        return repository
+-                .deleteDataScope(id)
+-                .flatMap(
+-                        deleted ->
+-                                deleted != null && deleted > 0
+-                                        ? audit(actorId, ACTION_DELETE, before, null).thenReturn(before)
+-                                        : deny(actorId, ACTION_DELETE, id, before, null, missing()));
+-    }
+-
+-    private static Denial missing() {
+-        return new Denial(REASON_SCOPE_MISSING, HttpStatus.NOT_FOUND);
+-    }
+-
+     // --- shape validation (400, not audited) ------------------------------------------------
+ 
+     /**
+-     * Applies the checks that need no stored entity. These are the only rejections that answer
+-     * {@code 400} without auditing: they run before anything is loaded, so there is no entity to
+-     * attribute the attempt to.
++     * Applies the checks that reject a structurally malformed request before anything is loaded and
++     * without auditing: there is no identifiable change to attribute the attempt to.
+      *
+-     * <p>Every identifier that can later reach SQL (the table and column) must be a bare
+-     * {@code [A-Za-z_][A-Za-z0-9_]*} name — no quotes, dots, spaces or expressions, so a raw
+-     * predicate has no way in. The role and datasource ids use the wider generated-id alphabet; they
+-     * are only ever bound as parameters.
++     * <p>The table and column <em>syntax</em> is not checked here: a name that fails the bare-identifier
++     * rule (raw SQL, a qualified or quoted name, an expression) is rejected with {@code 422} and audited
++     * by {@link #checkIdentifiers}, matching the "reject anything else (422)" contract for identifier
++     * input.
+      *
+      * @param request the body
+      */
+     private static void requireShape(DataScopeRequest request) {
+         if (request == null) {
+-            throw badRequest("请求体不能为空");
++            throw badRequest(REASON_BODY_MISSING);
++        }
++        if (blankToNull(request.roleId()) == null) {
++            throw badRequest("角色标识不能为空");
++        }
++        if (blankToNull(request.datasourceId()) == null) {
++            throw badRequest("数据源标识不能为空");
++        }
++        if (blankToNull(request.tableName()) == null) {
++            throw badRequest("表标识不能为空");
+         }
+-        requireId(request.roleId(), "角色标识无效");
+-        requireId(request.datasourceId(), "数据源标识无效");
+-        requireIdentifier(request.tableName());
+         DataScopePolicy policy = parsePolicy(request.policy());
+         String columnName = blankToNull(request.columnName());
+         String attribute = blankToNull(request.principalAttribute());
+         if (policy == DataScopePolicy.FILTER) {
+             if (columnName == null || attribute == null) {
+                 throw badRequest(REASON_FILTER_INCOMPLETE);
+             }
+         } else if (columnName != null || attribute != null) {
+             // ALL/DENY carry no predicate: a stray column must not be silently dropped, or a client
+             // could believe it configured a filter that is not stored.
+             throw badRequest(REASON_NON_FILTER_HAS_COLUMN);
+         }
+-        if (columnName != null) {
+-            requireIdentifier(columnName);
+-        }
++        requireId(request.roleId(), "角色标识无效");
++        requireDatasourceId(request.datasourceId());
+     }
+ 
+-    /** Builds the requested rule (no id, attribute canonicalised later) from a shape-valid body. */
++    /** Builds the requested rule (no id, names not yet canonical) from a shape-valid body. */
+     private static DataScopeRule candidate(DataScopeRequest request) {
+         return new DataScopeRule(
+                 null,
+-                request.roleId(),
+-                request.datasourceId(),
+-                request.tableName(),
++                blankToNull(request.roleId()),
++                blankToNull(request.datasourceId()),
++                blankToNull(request.tableName()),
+                 parsePolicy(request.policy()),
+                 blankToNull(request.columnName()),
+-                null);
++                blankToNull(request.principalAttribute()));
+     }
+ 
+     // --- referenced-data validation (audited denials) ---------------------------------------
+ 
+-    /**
+-     * Validates the principal attribute against the closed catalog and returns the rule carrying its
+-     * canonical code.
+-     *
+-     * <p>This answers {@code 422} rather than {@code 400} on purpose: the value is well-formed but
+-     * references something outside the catalog, so it is a denial decided against the closed set, not a
+-     * malformed request. It is audited accordingly.
+-     */
+-    private Mono<DataScopeRule> resolveAttribute(
+-            String actorId, DataScopeRequest request, DataScopeRule candidate) {
+-        String attribute = blankToNull(request.principalAttribute());
+-        if (attribute == null) {
+-            return Mono.just(candidate);
+-        }
+-        Optional<PrincipalAttribute> resolved = PrincipalAttribute.fromCode(attribute);
+-        if (resolved.isPresent()) {
+-            String code = resolved.get().code();
+-            return Mono.just(
+-                    new DataScopeRule(
+-                            candidate.id(),
+-                            candidate.roleId(),
+-                            candidate.datasourceId(),
+-                            candidate.tableName(),
+-                            candidate.policy(),
+-                            candidate.columnName(),
+-                            code));
+-        }
+-        return deny(
+-                        actorId,
+-                        ACTION_UPSERT,
+-                        null,
+-                        null,
+-                        candidate,
+-                        new Denial(
+-                                REASON_UNKNOWN_ATTRIBUTE + echo(attribute),
+-                                HttpStatus.UNPROCESSABLE_ENTITY))
+-                .then(Mono.empty());
+-    }
+-
+     /**
+      * Requires the role to exist. An unknown role is audited as {@code DENIED} with the requested
+      * rule as the after state.
+      */
+     private Mono<Void> requireRole(String actorId, DataScopeRule requested) {
+         return repository
+                 .role(requested.roleId())
+                 .map(role -> Boolean.TRUE)
+                 .defaultIfEmpty(Boolean.FALSE)
+                 .flatMap(
+@@ -344,120 +325,309 @@ public class DataScopeService {
+                                                 null,
+                                                 null,
+                                                 requested,
+                                                 new Denial(
+                                                         REASON_ROLE_MISSING,
+                                                         HttpStatus.NOT_FOUND))
+                                                 .then());
+     }
+ 
+     /**
+-     * Requires the datasource to exist in the registry. A registry miss is a {@code 404}, audited.
++     * Requires the datasource to exist in the registry, and returns the resolved pool, so later
++     * metadata work reuses it instead of resolving again (a registry removal in between would
++     * otherwise turn a {@code 404} into a server error).
+      *
+      * <p>Resolution is offloaded to the blocking scheduler: {@code resolve} is {@code synchronized}
+      * over the pool map, so it can wait behind a concurrent registration.
+      */
+-    private Mono<Void> requireDatasource(String actorId, DataScopeRule requested) {
+-        return Mono.<Void>fromRunnable(() -> datasources.resolve(requested.datasourceId()))
++    private Mono<DataSource> requireDatasource(String actorId, DataScopeRule requested) {
++        return Mono.fromCallable(() -> datasources.resolve(requested.datasourceId()))
+                 .subscribeOn(blockingScheduler)
++                .<Optional<DataSource>>map(Optional::of)
+                 .onErrorResume(
+                         NoSuchElementException.class,
+                         error ->
+                                 deny(
+                                                 actorId,
+                                                 ACTION_UPSERT,
+                                                 null,
+                                                 null,
+                                                 requested,
+                                                 new Denial(
+                                                         REASON_DATASOURCE_MISSING,
+                                                         HttpStatus.NOT_FOUND))
+-                                        .then());
++                                        .then(Mono.just(Optional.<DataSource>empty())))
++                .<DataSource>flatMap(
++                        resolved ->
++                                resolved.map(Mono::just)
++                                        .orElseGet(Mono::empty));
+     }
+ 
+     /**
+-     * Requires the table (and, for {@code FILTER}, the column) to exist in the datasource's live
+-     * metadata. Failures are {@code 422}, audited.
++     * Validates the name syntax, the table, the column, the attribute and the attribute/column type
++     * compatibility against the live metadata, and returns the rule with canonical names.
++     *
++     * <p>One introspection pass answers every metadata check, because it is the expensive part.
++     * Introspection is blocking JDBC, so it runs on the blocking scheduler; an introspection failure
++     * propagates (fail closed) rather than storing a policy against unverified metadata.
+      *
+-     * <p>One introspection pass answers both checks, because it is the expensive part. Introspection
+-     * is blocking JDBC, so it runs on the blocking scheduler; an introspection failure propagates
+-     * (fail closed) rather than storing a policy against unverified metadata.
++     * @param actorId the acting user id
++     * @param request the body (for the raw table/column/attribute spellings)
++     * @param candidate the candidate rule
++     * @return the rule ready to store, with canonical table and column names
+      */
+-    private Mono<Void> requireTableAndColumn(String actorId, DataScopeRule requested) {
+-        return Mono.fromCallable(() -> inspect(requested))
++    private Mono<DataScopeRule> requireTableAndColumnAndType(
++            String actorId, DataScopeRequest request, DataScopeRule candidate) {
++        return Mono.fromCallable(
++                        () -> {
++                            Optional<Denial> syntax = checkIdentifiers(request);
++                            if (syntax.isPresent()) {
++                                return Inspection.reject(syntax.get());
++                            }
++                            return inspect(resolveDatasource(candidate.datasourceId()), candidate);
++                        })
+                 .subscribeOn(blockingScheduler)
+                 .flatMap(
+-                        denial ->
+-                                denial.<Mono<Void>>map(
+-                                                rejected ->
+-                                                        deny(
+-                                                                        actorId,
+-                                                                        ACTION_UPSERT,
+-                                                                        null,
+-                                                                        null,
+-                                                                        requested,
+-                                                                        rejected)
+-                                                                .then())
+-                                        .orElseGet(Mono::empty));
++                        inspection ->
++                                inspection.rejected()
++                                        ? deny(
++                                                        actorId,
++                                                        ACTION_UPSERT,
++                                                        null,
++                                                        null,
++                                                        candidate,
++                                                        inspection.denial())
++                                                .then(Mono.<DataScopeRule>empty())
++                                        : Mono.just(inspection.rule()));
+     }
+ 
+     /**
+-     * Reads the datasource's live metadata and reports why the rule is invalid, if it is.
++     * The result of one validation pass: either the canonical rule to store, or the rejection.
+      *
+-     * @param requested the requested rule
+-     * @return the rejection, or empty when the table and column exist
++     * @param rule the canonical rule, or {@code null} when rejected
++     * @param denial the rejection, or {@code null} when valid
+      */
+-    private Optional<Denial> inspect(DataScopeRule requested) {
+-        TableSchema table = findTable(requested.datasourceId(), requested.tableName());
+-        if (table == null) {
++    private record Inspection(DataScopeRule rule, Denial denial) {
++
++        private static Inspection of(DataScopeRule rule) {
++            return new Inspection(rule, null);
++        }
++
++        private static Inspection reject(Denial denial) {
++            return new Inspection(null, denial);
++        }
++
++        private boolean rejected() {
++            return denial != null;
++        }
++    }
++
++    /**
++     * Rejects a table, column or attribute value that is not a bare
++     * {@code [A-Za-z_][A-Za-z0-9_]*} identifier (or, for the attribute, a catalog code).
++     *
++     * @param request the body
++     * @return the rejection, or empty when every name is acceptable
++     */
++    private static Optional<Denial> checkIdentifiers(DataScopeRequest request) {
++        if (!isIdentifier(request.tableName())) {
+             return Optional.of(
+                     new Denial(
+-                            REASON_TABLE_MISSING + echo(requested.tableName()),
++                            REASON_IDENTIFIER_INVALID + "：" + echo(request.tableName()),
+                             HttpStatus.UNPROCESSABLE_ENTITY));
+         }
+-        if (requested.columnName() != null && !hasColumn(table, requested.columnName())) {
++        String columnName = blankToNull(request.columnName());
++        if (columnName != null && !isIdentifier(columnName)) {
+             return Optional.of(
+                     new Denial(
+-                            REASON_COLUMN_MISSING + echo(requested.columnName()),
++                            REASON_IDENTIFIER_INVALID + "：" + echo(columnName),
++                            HttpStatus.UNPROCESSABLE_ENTITY));
++        }
++        String attribute = blankToNull(request.principalAttribute());
++        Optional<PrincipalAttribute> resolved = PrincipalAttribute.fromCode(attribute);
++        if (attribute != null && resolved.isEmpty()) {
++            return Optional.of(
++                    new Denial(
++                            REASON_UNKNOWN_ATTRIBUTE + echo(attribute),
+                             HttpStatus.UNPROCESSABLE_ENTITY));
+         }
+         return Optional.empty();
+     }
+ 
++    /**
++     * Checks the canonical table, column and type against the live metadata.
++     *
++     * @param dataSource the already-resolved datasource
++     * @param candidate the candidate rule
++     * @return the canonical rule, or the rejection
++     */
++    private Inspection inspect(DataSource dataSource, DataScopeRule candidate) {
++        String canonicalAttribute =
++                PrincipalAttribute.fromCode(candidate.principalAttribute())
++                        .map(PrincipalAttribute::code)
++                        .orElse(null);
++        if (candidate.principalAttribute() != null && canonicalAttribute == null) {
++            return Inspection.reject(
++                    new Denial(
++                            REASON_UNKNOWN_ATTRIBUTE + echo(candidate.principalAttribute()),
++                            HttpStatus.UNPROCESSABLE_ENTITY));
++        }
++        TableSchema table = findTable(dataSource, candidate.tableName());
++        if (table == null) {
++            return Inspection.reject(
++                    new Denial(
++                            REASON_TABLE_MISSING + echo(candidate.tableName()),
++                            HttpStatus.UNPROCESSABLE_ENTITY));
++        }
++        String canonicalTable = table.name();
++        if (candidate.columnName() == null) {
++            return Inspection.of(
++                    withNames(candidate, canonicalTable, null, canonicalAttribute));
++        }
++        Optional<ColumnSchema> column = findColumn(table, candidate.columnName());
++        if (column.isEmpty()) {
++            return Inspection.reject(
++                    new Denial(
++                            REASON_COLUMN_MISSING + echo(candidate.columnName()),
++                            HttpStatus.UNPROCESSABLE_ENTITY));
++        }
++        ColumnSchema found = column.get();
++        PrincipalAttribute attribute =
++                canonicalAttribute == null ? null : PrincipalAttribute.fromCode(canonicalAttribute).get();
++        if (attribute != null && !typeCompatible(found.typeName(), attribute)) {
++            return Inspection.reject(
++                    new Denial(
++                            REASON_TYPE_MISMATCH
++                                    + canonicalTable
++                                    + "."
++                                    + found.name()
++                                    + "（"
++                                    + found.typeDisplay()
++                                    + "）与 "
++                                    + attribute.code(),
++                            HttpStatus.UNPROCESSABLE_ENTITY));
++        }
++        return Inspection.of(
++                withNames(candidate, canonicalTable, found.name(), canonicalAttribute));
++    }
++
+     /**
+      * Reads the datasource's live metadata and finds one table, case-insensitively.
+      *
+-     * @param datasourceId the datasource id (already validated against the registry)
+-     * @param tableName the table name (already a bare identifier)
++     * @param dataSource the already-resolved datasource
++     * @param tableName the table name
+      * @return the table, or {@code null} when absent
+      */
+-    private TableSchema findTable(String datasourceId, String tableName) {
+-        List<TableSchema> tables = introspector.introspect(datasources.resolve(datasourceId));
++    private TableSchema findTable(DataSource dataSource, String tableName) {
++        List<TableSchema> tables = introspector.introspect(dataSource);
+         for (TableSchema table : tables) {
+             if (table.name() != null && table.name().equalsIgnoreCase(tableName)) {
+                 return table;
+             }
+         }
+         return null;
+     }
+ 
+-    private static boolean hasColumn(TableSchema table, String columnName) {
++    private static Optional<ColumnSchema> findColumn(TableSchema table, String columnName) {
+         for (ColumnSchema column : table.columns()) {
+             if (column.name() != null && column.name().equalsIgnoreCase(columnName)) {
+-                return true;
++                return Optional.of(column);
+             }
+         }
++        return Optional.empty();
++    }
++
++    /**
++     * Reports whether a column type can hold the attribute's value.
++     *
++     * <p>{@link PrincipalAttribute#USER_ID user id}, {@code username}, {@code studentNo} and the id
++     * values inside {@code classIds} are compared as text, so any type renders (the database coerces
++     * or compares textually); only the single-valued numeric attributes, which are rendered as a bare
++     * number, must target a numeric column. A type outside both known sets is not rejected: unknown
++     * dialects are left to the policy engine rather than blocked here.
++     *
++     * @param typeName the introspected type name
++     * @param attribute the attribute
++     * @return {@code false} only for a known numeric attribute on a known text column
++     */
++    static boolean typeCompatible(String typeName, PrincipalAttribute attribute) {
++        if (attribute == null || attribute == MULTIVALUED_ATTRIBUTE) {
++            // classIds is an IN list of values, rendered textually.
++            return true;
++        }
++        boolean numericAttribute =
++                attribute == PrincipalAttribute.STUDENT_ID;
++        if (!numericAttribute) {
++            return true;
++        }
++        String type = normalizeType(typeName);
++        if (!TEXT_TYPES.contains(type)) {
++            return true;
++        }
+         return false;
+     }
+ 
++    /** Strips a size/precision suffix and upper-cases the type name. */
++    private static String normalizeType(String typeName) {
++        if (typeName == null) {
++            return "";
++        }
++        String upper = typeName.trim().toUpperCase(Locale.ROOT);
++        int paren = upper.indexOf('(');
++        if (paren > 0) {
++            upper = upper.substring(0, paren);
++        }
++        // H2 and SQL-standard drivers report VARCHAR as CHARACTER VARYING (and CHAR as CHARACTER).
++        if (upper.equals("CHARACTER VARYING") || upper.equals("CHAR VARYING")) {
++            return "VARCHAR";
++        }
++        if (upper.equals("CHARACTER")) {
++            return "CHAR";
++        }
++        if (upper.equals("NATIONAL CHARACTER VARYING")) {
++            return "NVARCHAR";
++        }
++        return upper;
++    }
++
++    private static DataScopeRule withNames(
++            DataScopeRule rule, String tableName, String columnName, String principalAttribute) {
++        return new DataScopeRule(
++                rule.id(),
++                rule.roleId(),
++                rule.datasourceId(),
++                tableName,
++                rule.policy(),
++                columnName,
++                principalAttribute);
++    }
++
++    /**
++     * Resolves the datasource pool for the introspection pass.
++     *
++     * <p>The datasource was validated a moment earlier; a removal in between fails the change closed
++     * as an introspection error rather than silently storing a rule.
++     *
++     * @param datasourceId the datasource id
++     * @return the pool
++     */
++    private DataSource resolveDatasource(String datasourceId) {
++        return datasources.resolve(datasourceId);
++    }
++
+     // --- mutation ---------------------------------------------------------------------------
+ 
++    /** Runs the upsert and its SUCCESS audit in one transaction, after validation. */
++    private Mono<DataScopeRule> store(String actorId, DataScopeRule rule) {
++        return Mono.defer(() -> apply(actorId, rule)).as(transactions::transactional);
++    }
++
+     /** Inserts or updates the rule and records the SUCCESS row, in the caller's transaction. */
+     private Mono<DataScopeRule> apply(String actorId, DataScopeRule requested) {
+         return repository
+                 .dataScope(requested.roleId(), requested.datasourceId(), requested.tableName())
+                 .flatMap(before -> upsertAndAudit(actorId, before, requested))
+                 .switchIfEmpty(Mono.defer(() -> upsertAndAudit(actorId, null, requested)));
+     }
+ 
+     private Mono<DataScopeRule> upsertAndAudit(
+             String actorId, DataScopeRule before, DataScopeRule requested) {
+@@ -466,58 +636,82 @@ public class DataScopeService {
+                                 repository.upsertDataScope(
+                                         requested.roleId(),
+                                         requested.datasourceId(),
+                                         requested.tableName(),
+                                         requested.policy(),
+                                         requested.columnName(),
+                                         requested.principalAttribute()))
+                 .flatMap(after -> audit(actorId, ACTION_UPSERT, before, after).thenReturn(after));
+     }
+ 
++    /**
++     * Deletes the rule and records its SUCCESS row, both in the caller's transaction.
++     *
++     * <p>The row was loaded just before, but a concurrent delete can still win the race; the reported
++     * row count turns that into the same {@code 404} rather than a silent, unaudited success.
++     */
++    private Mono<DataScopeRule> deleteAndAudit(String actorId, String id, DataScopeRule before) {
++        return repository
++                .deleteDataScope(id)
++                .flatMap(
++                        deleted ->
++                                deleted != null && deleted > 0
++                                        ? audit(actorId, ACTION_DELETE, before, null).thenReturn(before)
++                                        : deny(actorId, ACTION_DELETE, id, before, null, missing()));
++    }
++
++    private static Denial missing() {
++        return new Denial(REASON_SCOPE_MISSING, HttpStatus.NOT_FOUND);
++    }
++
+     // --- parsing and identifier checks -------------------------------------------------------
+ 
+     /**
+      * Parses the policy, rejecting anything outside {@code ALL}/{@code FILTER}/{@code DENY}.
+      *
+      * @param policy the requested policy
+      * @return the policy
+      */
+     private static DataScopePolicy parsePolicy(String policy) {
+         String value = policy == null ? null : policy.trim();
+         if (value != null) {
+             for (DataScopePolicy candidate : DataScopePolicy.values()) {
+                 if (candidate.name().equalsIgnoreCase(value)) {
+                     return candidate;
+                 }
+             }
+         }
+         throw badRequest(REASON_POLICY_INVALID);
+     }
+ 
+-    /**
+-     * Rejects anything that is not a bare, unqualified identifier. This is the gate between the body
+-     * and a name that may later be rendered into SQL, so it is deliberately strict: no quotes, no
+-     * dots, no spaces, no expressions.
+-     */
+-    private static void requireIdentifier(String value) {
+-        if (value == null || !IDENTIFIER_PATTERN.matcher(value).matches()) {
+-            throw badRequest("标识无效：" + echo(value));
+-        }
++    /** Reports whether a value is a bare, unqualified SQL identifier. */
++    private static boolean isIdentifier(String value) {
++        return value != null && IDENTIFIER_PATTERN.matcher(value).matches();
+     }
+ 
+-    /** Validates an id field (role, datasource, path) against the wider id alphabet. */
++    /** Validates an id field (the role id or the rule path id). */
+     private static void requireId(String value, String message) {
+         if (value == null || value.isBlank() || !ID_PATTERN.matcher(value).matches()) {
+             throw badRequest(message);
+         }
+     }
+ 
++    /**
++     * Validates a datasource id against the (wider) registry id space. The id is only bound as a
++     * parameter; it is never interpolated into SQL.
++     */
++    private static void requireDatasourceId(String value) {
++        if (value == null || !DATASOURCE_ID_PATTERN.matcher(value).matches()) {
++            throw badRequest("数据源标识无效");
++        }
++    }
++
+     // --- audit ------------------------------------------------------------------------------
+ 
+     /**
+      * Appends the SUCCESS row for a completed mutation.
+      *
+      * <p>An audit-insert failure is <em>not</em> swallowed: it propagates so the enclosing
+      * transaction rolls the mutation back. Callers only see a failed request, never a silently
+      * unaudited change.
+      */
+     private Mono<Void> audit(
+@@ -530,23 +724,23 @@ public class DataScopeService {
+                 entityId,
+                 json(before),
+                 json(after),
+                 RESULT_SUCCESS,
+                 null);
+     }
+ 
+     /**
+      * Appends a DENIED row for a rejected mutation, then fails with that rejection.
+      *
+-     * <p>Runs in its own nested transaction so the row survives the outer mutation transaction
+-     * rolling back with the rejection. Best effort: a rejection must still reach the caller with its
+-     * status, so an audit failure is logged rather than replacing the denial.
++     * <p>Runs in its own nested transaction so the row survives any outer transaction rolling back
++     * with the rejection. Best effort: a rejection must still reach the caller with its status, so an
++     * audit failure is logged rather than replacing the denial.
+      */
+     private Mono<DataScopeRule> deny(
+             String actorId,
+             String action,
+             String entityId,
+             DataScopeRule before,
+             DataScopeRule requested,
+             Denial denial) {
+         Mono<Void> record =
+                 repository
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+index 1ba8560..2bb770b 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/AccessControlController.java
+@@ -158,42 +158,53 @@ public class AccessControlController {
+             @RequestBody(required = false) AccessRolePermissionsRequest request) {
+         return actorId()
+                 .flatMap(actor ->
+                         permissions.replacePermissions(
+                                 actor, id, request == null ? null : request.permissions()));
+     }
+ 
+     /**
+      * Lists a role's data-scope rules, ordered by datasource then table.
+      *
+-     * @param roleId the role id (required)
++     * @param roleId the role id (required; a missing one is a {@code 400})
+      * @param datasourceId the datasource to filter by, or omitted for all
+      * @return the rules
+      */
+     @GetMapping(path = DATA_SCOPES)
+     public Mono<List<DataScopeView>> listDataScopes(
+-            @RequestParam String roleId,
++            @RequestParam(required = false) String roleId,
+             @RequestParam(required = false) String datasourceId) {
++        if (roleId == null || roleId.isBlank()) {
++            // A missing required parameter is a client error; route it through the local handler so the
++            // body keeps the {status,message} shape like every other failure here.
++            return Mono.error(
++                    new ResponseStatusException(HttpStatus.BAD_REQUEST, "角色标识不能为空"));
++        }
+         return dataScopes.list(roleId, datasourceId);
+     }
+ 
+     /**
+      * Inserts or updates the rule for a role, datasource and table.
+      *
+      * <p>There is no raw predicate: a {@code FILTER} rule names a validated column and one entry of
+      * the closed principal-attribute catalog.
+      *
+      * @param request the rule
+      * @return the stored rule
+      */
+     @PutMapping(path = DATA_SCOPES)
+-    public Mono<DataScopeView> upsertDataScope(@RequestBody DataScopeRequest request) {
++    public Mono<DataScopeView> upsertDataScope(
++            @RequestBody(required = false) DataScopeRequest request) {
++        if (request == null) {
++            // An empty body must not fall through to Spring's error shape: the service answers it.
++            return Mono.error(new ResponseStatusException(HttpStatus.BAD_REQUEST, "请求体不能为空"));
++        }
+         return actorId().flatMap(actor -> dataScopes.upsert(actor, request));
+     }
+ 
+     /**
+      * Deletes one data-scope rule.
+      *
+      * @param id the rule id
+      * @return no content
+      */
+     @DeleteMapping(path = DATA_SCOPES + "/{id}")
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DataScopeRequest.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DataScopeRequest.java
+index ae90293..a6d14c4 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DataScopeRequest.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/access/api/dto/DataScopeRequest.java
+@@ -2,21 +2,27 @@ package com.nekocong.text2sql.access.api.dto;
+ 
+ /**
+  * Request body for upserting one data-scope rule.
+  *
+  * <p>The rule is identified by ({@code roleId}, {@code datasourceId}, {@code tableName}): sending it
+  * again updates that table's policy instead of creating a second row. There is deliberately no
+  * predicate field — a policy can only reference a validated column and one entry of the closed
+  * {@code PrincipalAttribute} catalog, never raw SQL.
+  *
+  * <p>{@code FILTER} requires both {@code columnName} and {@code principalAttribute}; {@code ALL} and
+- * {@code DENY} must carry neither.
++ * {@code DENY} must carry neither. The table and column must be bare identifiers present in the
++ * datasource's live metadata (the stored values are the canonical, introspected spellings).
++ *
++ * <p>Type compatibility: {@code studentId} is rendered as a bare number, so it must target a numeric
++ * column; {@code classIds} is rendered as an {@code IN} list; {@code userId}, {@code username} and
++ * {@code studentNo} are compared as text. A single-valued numeric attribute on a known text column is
++ * rejected as a {@code 422}.
+  *
+  * @param roleId the owning role id (required)
+  * @param datasourceId the datasource id (required; must exist in the registry)
+  * @param tableName the table name (required; must exist in the datasource's live metadata)
+  * @param policy one of {@code ALL}, {@code FILTER}, {@code DENY} (required)
+  * @param columnName the filtered column, required for {@code FILTER} and forbidden otherwise
+  * @param principalAttribute the principal attribute code, required for {@code FILTER} and forbidden
+  *     otherwise
+  */
+ public record DataScopeRequest(
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDataScopeTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDataScopeTest.java
+index 1e893a9..7d44378 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDataScopeTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/AccessControlDataScopeTest.java
+@@ -147,50 +147,221 @@ class AccessControlDataScopeTest {
+ 
+     @Test
+     void anAllOrDenyPolicyThatCarriesAColumnIsRejected() {
+         expectedError("score", "ALL", "student_id", null, 400);
+         expectedError("score", "DENY", null, "studentId", 400);
+         expectedError("score", "ALL", "student_id", "studentId", 400);
+         assertThat(listRules()).isEmpty();
+     }
+ 
+     @Test
+-    void anInvalidPolicyOrRawSqlIsRejected() {
++    void anInvalidPolicyIsRejectedWithoutAudit() {
+         expectedError("score", "EVERYTHING", null, null, 400);
+         expectedError("score", null, null, null, 400);
++        assertThat(listRules()).isEmpty();
++        assertThat(auditRows("data_scope.upsert", null, "DENIED")).isZero();
++    }
++
++    @Test
++    void rawSqlOrQualifiedOrQuotedNamesAreUnprocessableAndAudited() {
++        // A raw predicate, a qualified name or a quoted identifier never reaches the database. The
++        // identifier rule is a 422 rejection (not a 400 shape error) and is audited as DENIED.
++        assertThat(error("score WHERE 1=1", "ALL", null, null, 422))
++                .startsWith("标识符不合法");
++        assertThat(error("campus.score", "ALL", null, null, 422))
++                .isEqualTo("标识符不合法：campus.score");
++        assertThat(error("\"score\"", "ALL", null, null, 422))
++                .isEqualTo("标识符不合法：\"score\"");
++        assertThat(error("score", "FILTER", "student_id = 1 OR 1=1", "studentId", 422))
++                .isEqualTo("标识符不合法：student_id = 1 OR 1=1");
++        assertThat(error("score", "FILTER", "student-id", "studentId", 422))
++                .isEqualTo("标识符不合法：student-id");
+ 
+-        // A raw predicate, a qualified name or a quoted identifier never reaches the database.
+-        expectedError("score WHERE 1=1", "ALL", null, null, 400);
+-        expectedError("campus.score", "ALL", null, null, 400);
+-        expectedError("\"score\"", "ALL", null, null, 400);
+-        expectedError("score", "FILTER", "student_id = 1 OR 1=1", "studentId", 400);
+-        expectedError("score", "FILTER", "student-id", "studentId", 400);
+         assertThat(listRules()).isEmpty();
++        assertThat(auditRows("data_scope.upsert", null, "DENIED")).isEqualTo(5);
++        assertThat(auditRows("data_scope.upsert", null, "SUCCESS")).isZero();
++        assertThat(auditDistinct("data_scope.upsert", "DENIED", "reason"))
++                .allSatisfy(reason -> assertThat(reason).startsWith("标识符不合法"));
+     }
+ 
+     @Test
+     void anUnknownTableOrColumnOrAttributeIsUnprocessableAndAudited() {
+         assertThat(error("no_such_table", "ALL", null, null, 422))
+                 .isEqualTo("表不存在：no_such_table");
+         assertThat(error("score", "FILTER", "no_such_column", "studentId", 422))
+                 .isEqualTo("列不存在：no_such_column");
+         assertThat(error("score", "FILTER", "student_id", "departmentId", 422))
+                 .isEqualTo("未知主体属性：departmentId");
+         // The column is validated against the requested table, not against any table of the schema.
+         assertThat(error("class", "FILTER", "student_id", "studentId", 422))
+                 .isEqualTo("列不存在：student_id");
+ 
+         assertThat(listRules()).isEmpty();
+         assertThat(auditRows("data_scope.upsert", null, "DENIED")).isEqualTo(4);
+         assertThat(auditRows("data_scope.upsert", null, "SUCCESS")).isZero();
+     }
+ 
++    @Test
++    void aNumericAttributeOnATextColumnIsUnprocessableAndAudited() {
++        // student_id is BIGINT and studentNo is text: fine. student.name is text and studentId is
++        // rendered as a bare number: rejected rather than left to fail at query time.
++        assertThat(error("student", "FILTER", "name", "studentId", 422))
++                .startsWith("列类型与主体属性不匹配：student.name");
++
++        assertThat(upsertRule("student", "FILTER", "id", "studentId").get("policy"))
++                .isEqualTo("FILTER");
++        assertThat(upsertRule("student", "FILTER", "student_no", "studentNo").get("policy"))
++                .isEqualTo("FILTER");
++
++        assertThat(auditRows("data_scope.upsert", null, "DENIED")).isEqualTo(1);
++    }
++
++    @Test
++    void aCaseVariantReUpsertKeepsTheRowAndStoresCanonicalNames() {
++        String id =
++                String.valueOf(upsertRule("score", "FILTER", "STUDENT_ID", "studentId").get("id"));
++
++        Map<String, Object> variant = upsertRule("SCORE", "DENY", null, null);
++        assertThat(variant.get("id"))
++                .as("a different case is the same table: one row, updated in place")
++                .isEqualTo(id);
++        assertThat(variant.get("tableName")).isEqualTo("score");
++
++        assertThat(listRules()).hasSize(1);
++        assertThat(listRules().get(0).get("tableName")).isEqualTo("score");
++
++        // The stored column is the introspected spelling, not the client's.
++        Map<String, Object> filter = upsertRule("Score", "FILTER", "STUDENT_ID", "studentId");
++        assertThat(filter.get("id")).isEqualTo(id);
++        assertThat(filter.get("tableName")).isEqualTo("score");
++        assertThat(filter.get("columnName")).isEqualTo("student_id");
++    }
++
++    @Test
++    void reUpsertPreservesTheCreatedAtTimestamp() {
++        String id = String.valueOf(upsertRule("score", "ALL", null, null).get("id"));
++        Long createdAt = createdAt(id);
++        assertThat(createdAt).isNotNull();
++
++        upsertRule("score", "FILTER", "student_id", "studentId");
++
++        assertThat(createdAt(id))
++                .as("the upsert updates in place; it never recreates the row")
++                .isEqualTo(createdAt);
++        assertThat(listRules()).hasSize(1);
++    }
++
++    @Test
++    void anUnknownStoredPolicyIsListedAsDeny() {
++        // A value the service would never write (a bad migration, a manual edit): reads fail closed.
++        String id = UUID.randomUUID().toString();
++        db.sql(
++                        "INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy,"
++                                + " column_name, principal_attribute, created_at, updated_at)"
++                                + " VALUES (:id, :role, :ds, 'score', 'BOGUS', NULL, NULL, :now, :now)")
++                .bind("id", id)
++                .bind("role", customRoleId)
++                .bind("ds", DATASOURCE)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++
++        List<Map<String, Object>> rules = listRules();
++        assertThat(rules).hasSize(1);
++        assertThat(rules.get(0).get("id")).isEqualTo(id);
++        assertThat(rules.get(0).get("policy")).isEqualTo("DENY");
++
++        // The policy engine agrees: the table is denied.
++        AppUser user =
++                users.insert(unique("u"), passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT)
++                        .block();
++        assign(user.id(), customRoleId);
++        assertThat(engine.decide(resolve(user.id()), DATASOURCE, "score").denied()).isTrue();
++    }
++
++    @Test
++    void listIsOrderedByDatasourceThenTable() {
++        upsertRule("student", "ALL", null, null);
++        upsertRule("class", "DENY", null, null);
++        upsertRule("score", "FILTER", "student_id", "studentId");
++
++        assertThat(listRules()).extracting(rule -> rule.get("tableName"))
++                .containsExactly("class", "score", "student");
++
++        // The explicit datasource filter returns only that datasource's rows.
++        assertThat(listRules("campus")).hasSize(3);
++        assertThat(listRules("elsewhere")).isEmpty();
++    }
++
++    @Test
++    void aMissingBodyOrRequiredParameterKeepsTheStatusMessageShape() {
++        client.put()
++                .uri(DATA_SCOPES)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .exchange()
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.status")
++                .isEqualTo(400)
++                .jsonPath("$.message")
++                .isEqualTo("请求体不能为空");
++
++        client.put()
++                .uri(DATA_SCOPES)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue("{}")
++                .exchange()
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.status")
++                .isEqualTo(400)
++                .jsonPath("$.message")
++                .isEqualTo("角色标识不能为空");
++
++        client.get()
++                .uri(DATA_SCOPES)
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.status")
++                .isEqualTo(400)
++                .jsonPath("$.message")
++                .isEqualTo("角色标识不能为空");
++
++        client.get()
++                .uri(uri -> uri.path(DATA_SCOPES).queryParam("roleId", "").build())
++                .header(HttpHeaders.AUTHORIZATION, bearer())
++                .exchange()
++                .expectStatus()
++                .isBadRequest()
++                .expectBody()
++                .jsonPath("$.message")
++                .isEqualTo("角色标识不能为空");
++
++        assertThat(listRules()).isEmpty();
++    }
++
++    @Test
++    void aDatasourceIdWithRegistryCharactersIsAccepted() {
++        // The datasource id space is wider than a SQL identifier (dots, dashes); such an id is still
++        // bound, never interpolated, and an unknown one is a 404 rather than a 400.
++        assertThat(error("no-such-ds", "score", "ALL", null, null, 404))
++                .isEqualTo("数据源不存在");
++    }
++
+     @Test
+     void anUnknownRoleOrDatasourceIsNotFound() {
+         String missingRole = UUID.randomUUID().toString();
+ 
+         client.put()
+                 .uri(DATA_SCOPES)
+                 .header(HttpHeaders.AUTHORIZATION, bearer())
+                 .contentType(MediaType.APPLICATION_JSON)
+                 .bodyValue(body(missingRole, DATASOURCE, "score", "ALL", null, null))
+                 .exchange()
+@@ -442,20 +613,56 @@ class AccessControlDataScopeTest {
+ 
+     private void expectedError(
+             String tableName,
+             String policy,
+             String columnName,
+             String principalAttribute,
+             int status) {
+         error(tableName, policy, columnName, principalAttribute, status);
+     }
+ 
++    /** Sends an {@code ALL} rule against {@code datasourceId} (exercises the datasource id space). */
++    private String error(
++            String datasourceId, String tableName, String policy, String columnName,
++            String principalAttribute, int status) {
++        Map<String, Object> response =
++                client.put()
++                        .uri(DATA_SCOPES)
++                        .header(HttpHeaders.AUTHORIZATION, bearer())
++                        .contentType(MediaType.APPLICATION_JSON)
++                        .bodyValue(
++                                body(
++                                        customRoleId,
++                                        datasourceId,
++                                        tableName,
++                                        policy,
++                                        columnName,
++                                        principalAttribute))
++                        .exchange()
++                        .expectStatus()
++                        .isEqualTo(status)
++                        .expectBody(new ParameterizedTypeReference<Map<String, Object>>() {})
++                        .returnResult()
++                        .getResponseBody();
++        assertThat(response).isNotNull();
++        assertThat(response.get("status")).isEqualTo(status);
++        return String.valueOf(response.get("message"));
++    }
++
++    private Long createdAt(String id) {
++        return db.sql("SELECT created_at FROM access_data_scope WHERE id = :id")
++                .bind("id", id)
++                .map((row, meta) -> row.get("created_at", Long.class))
++                .one()
++                .block();
++    }
++
+     private String error(
+             String tableName,
+             String policy,
+             String columnName,
+             String principalAttribute,
+             int status) {
+         Map<String, Object> response =
+                 client.put()
+                         .uri(DATA_SCOPES)
+                         .header(HttpHeaders.AUTHORIZATION, bearer())

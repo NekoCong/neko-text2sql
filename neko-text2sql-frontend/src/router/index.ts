@@ -109,7 +109,7 @@ router.beforeEach(async (to) => {
 
 router.afterEach((to) => {
   const title = to.meta.title
-  document.title = title ? `${title} · Text2SQL` : 'Text2SQL'
+  document.title = title ? `${title} · neko-text2sql` : 'neko-text2sql'
 })
 
 export default router

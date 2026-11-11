@@ -142,7 +142,7 @@ done
 # inode it was created with, so after `git pull` replaces a file the container would still execute the
 # old copy.
 for script in "$REPO_DIR/deploy/app-migrate.sql" \
-              "$REPO_DIR/text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql"; do
+              "$REPO_DIR/neko-text2sql-backend/src/main/resources/db/migration/2026-11-09-access-control.sql"; do
     [[ -f "$script" ]] || fail "Cannot find migration $script"
     docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" exec -T mysql \
         sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --default-character-set=utf8mb4 "$MYSQL_DATABASE"' \

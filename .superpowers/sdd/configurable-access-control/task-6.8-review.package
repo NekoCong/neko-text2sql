@@ -1,0 +1,1265 @@
+﻿## Commits
+6c32e7d fix(security): enforce module permissions on API routes
+df265f2 feat(frontend): add permission-aware navigation and guards
+
+## Stat
+ .../nekocong/text2sql/config/SecurityConfig.java   |  38 ++++
+ .../text2sql/web/ModelConfigControllerTest.java    |  24 ++-
+ .../text2sql/web/PermissionRouteGatingTest.java    | 222 +++++++++++++++++++++
+ text2sql-frontend/src/App.vue                      |  32 +--
+ text2sql-frontend/src/router/index.ts              |  53 +++--
+ text2sql-frontend/src/utils/navigation.ts          |  63 ++++++
+ text2sql-frontend/src/views/ChatView.vue           |  34 +++-
+ text2sql-frontend/src/views/DataSourcesView.vue    |  20 +-
+ text2sql-frontend/src/views/KnowledgeView.vue      |  12 +-
+ text2sql-frontend/src/views/NoPermissionView.vue   |  54 +++++
+ text2sql-frontend/tests/navigation.test.mjs        |  69 +++++++
+ 11 files changed, 575 insertions(+), 46 deletions(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+index 7722c6d..38e057d 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+@@ -130,20 +130,31 @@ public class SecurityConfig {
+                                         .access(accessManage())
+                                         .pathMatchers(
+                                                 HttpMethod.POST,
+                                                 "/api/text2sql/datasources",
+                                                 "/api/text2sql/datasources/**")
+                                         .access(datasourceWrite())
+                                         .pathMatchers(HttpMethod.PUT, "/api/text2sql/datasources/**")
+                                         .access(datasourceWrite())
+                                         .pathMatchers(HttpMethod.DELETE, "/api/text2sql/datasources/**")
+                                         .access(datasourceWrite())
++                                        .pathMatchers(
++                                                HttpMethod.GET,
++                                                "/api/text2sql/datasources",
++                                                "/api/text2sql/datasources/**")
++                                        .access(datasourceRead())
++                                        .pathMatchers("/api/model-configs/**")
++                                        .access(modelManage())
++                                        .pathMatchers("/api/text2sql/**")
++                                        .access(chatUse())
++                                        .pathMatchers("/api/conversations/**")
++                                        .access(chatUse())
+                                         .anyExchange()
+                                         .authenticated())
+                 .oauth2ResourceServer(
+                         oauth2 ->
+                                 oauth2.bearerTokenConverter(bearerTokenConverter)
+                                         .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())))
+                 // Re-checks the account (enabled, token version) and publishes the resolved
+                 // EffectiveAccess on the exchange. It must run before AUTHORIZATION so the
+                 // permission-based route checks above can read the attribute.
+                 .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHENTICATION);
+@@ -152,29 +163,56 @@ public class SecurityConfig {
+ 
+     /**
+      * Requires the {@code access.manage} permission (administration of roles and access control).
+      *
+      * @return the authorization manager
+      */
+     static ReactiveAuthorizationManager<AuthorizationContext> accessManage() {
+         return PermissionAuthorizationManager.permission(Permissions.ACCESS_MANAGE);
+     }
+ 
++    /**
++     * Requires the {@code datasource.read} permission.
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> datasourceRead() {
++        return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_READ);
++    }
++
+     /**
+      * Requires the {@code datasource.write} permission.
+      *
+      * @return the authorization manager
+      */
+     static ReactiveAuthorizationManager<AuthorizationContext> datasourceWrite() {
+         return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_WRITE);
+     }
+ 
++    /**
++     * Requires the {@code chat.use} permission.
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> chatUse() {
++        return PermissionAuthorizationManager.permission(Permissions.CHAT_USE);
++    }
++
++    /**
++     * Requires the {@code model.manage} permission.
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> modelManage() {
++        return PermissionAuthorizationManager.permission(Permissions.MODEL_MANAGE);
++    }
++
+     /**
+      * Requires the {@code user.read} permission (list/detail user routes).
+      *
+      * @return the authorization manager
+      */
+     static ReactiveAuthorizationManager<AuthorizationContext> userRead() {
+         return PermissionAuthorizationManager.permission(Permissions.USER_READ);
+     }
+ 
+     /**
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ModelConfigControllerTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ModelConfigControllerTest.java
+index 5d37c0a..503a8be 100644
+--- a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ModelConfigControllerTest.java
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/ModelConfigControllerTest.java
+@@ -1,43 +1,65 @@
+ package com.nekocong.text2sql.web;
+ 
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.ObjectMapper;
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
+ import java.util.Map;
++import java.util.UUID;
+ import org.junit.jupiter.api.BeforeEach;
+ import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
+ import org.springframework.boot.test.context.SpringBootTest;
+ import org.springframework.boot.test.web.server.LocalServerPort;
+ import org.springframework.http.HttpHeaders;
+ import org.springframework.http.MediaType;
++import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.test.web.reactive.server.WebTestClient;
+ 
+ import static org.assertj.core.api.Assertions.assertThat;
+ 
+ /**
+  * Web-layer tests for per-user model configuration (CRUD; the API key is never returned).
+  */
+ @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+ class ModelConfigControllerTest {
+ 
+     private static final ObjectMapper MAPPER = new ObjectMapper();
+ 
++    private static final String PASSWORD = "secret123";
++
+     @LocalServerPort
+     private int port;
+ 
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
+     private WebTestClient client;
+     private String token;
+ 
+     @BeforeEach
+     void setUp() {
+         client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
+-        token = TestAuth.registerAndLogin(client);
++        String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++        token = TestAuth.login(client, username, PASSWORD);
+     }
+ 
+     @Test
+     void managesModelConfigs() {
+         String body =
+                 client.post()
+                         .uri("/api/model-configs")
+                         .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+                         .contentType(MediaType.APPLICATION_JSON)
+                         .bodyValue(
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionRouteGatingTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionRouteGatingTest.java
+new file mode 100644
+index 0000000..7137384
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionRouteGatingTest.java
+@@ -0,0 +1,222 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.access.Permissions;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/** Verifies that module permissions are enforced by the server routes, independently of the UI. */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class PermissionRouteGatingTest {
++
++    private static final String PASSWORD = "secret123";
++
++    private static final String CONVERSATIONS = "/api/conversations";
++
++    private static final String DATASOURCES = "/api/text2sql/datasources";
++
++    private static final String MODEL_CONFIGS = "/api/model-configs";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
++    @Autowired
++    private DatabaseClient db;
++
++    private WebTestClient client;
++
++    @BeforeEach
++    void setUp() {
++        client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++    }
++
++    @Test
++    void chatUseOnlyAllowsConversations() {
++        String token = tokenWithPermissions(Permissions.CHAT_USE);
++
++        get(token, CONVERSATIONS).expectStatus().isOk();
++        get(token, DATASOURCES).expectStatus().isForbidden();
++        get(token, MODEL_CONFIGS).expectStatus().isForbidden();
++    }
++
++    @Test
++    void datasourceReadOnlyAllowsDatasourceReads() {
++        String token = datasourceReadToken();
++
++        get(token, DATASOURCES).expectStatus().isOk();
++        get(token, CONVERSATIONS).expectStatus().isForbidden();
++        get(token, MODEL_CONFIGS).expectStatus().isForbidden();
++    }
++
++    @Test
++    void modelManageOnlyAllowsModelConfigs() {
++        String token = tokenWithPermissions(Permissions.MODEL_MANAGE);
++
++        get(token, MODEL_CONFIGS).expectStatus().isOk();
++        get(token, CONVERSATIONS).expectStatus().isForbidden();
++        get(token, DATASOURCES).expectStatus().isForbidden();
++    }
++
++    @Test
++    void datasourceReadDoesNotAllowDatasourceWrites() {
++        String token = datasourceReadToken();
++        String id = "route-ds-" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++
++        client.post()
++                .uri(DATASOURCES)
++                .header(HttpHeaders.AUTHORIZATION, bearer(token))
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(definition(id))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++        client.put()
++                .uri(DATASOURCES + "/" + id)
++                .header(HttpHeaders.AUTHORIZATION, bearer(token))
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(definition(id))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++        client.delete()
++                .uri(DATASOURCES + "/" + id)
++                .header(HttpHeaders.AUTHORIZATION, bearer(token))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    @Test
++    void adminCanUseEveryModule() {
++        String username = unique("route-admin");
++        AppUser admin =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Admin", Roles.ADMIN).block();
++        access.assignRoleByCode(admin.id(), Roles.ADMIN).block();
++        String token = TestAuth.login(client, username, PASSWORD);
++
++        get(token, CONVERSATIONS).expectStatus().isOk();
++        get(token, DATASOURCES).expectStatus().isOk();
++        get(token, MODEL_CONFIGS).expectStatus().isOk();
++    }
++
++    private WebTestClient.ResponseSpec get(String token, String uri) {
++        return client.get()
++                .uri(uri)
++                .header(HttpHeaders.AUTHORIZATION, bearer(token))
++                .exchange();
++    }
++
++    private String datasourceReadToken() {
++        String username = unique("route-user");
++        AppUser user =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT)
++                        .block();
++        String roleId = createRole(Permissions.DATASOURCE_READ);
++        // The list controller resolves a data scope after the route check. An explicit DENY rule
++        // supplies a valid empty scope without adding a permission or a datasource grant.
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_data_scope (id, role_id, datasource_id, table_name, policy,"
++                                + " column_name, principal_attribute, created_at, updated_at)"
++                                + " VALUES (:id, :role, 'campus', 'course', 'DENY', NULL, NULL, :now, :now)")
++                .bind("id", roleId.replace("test-role-route", "test-scope-route"))
++                .bind("role", roleId)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++        assign(user.id(), roleId);
++        return TestAuth.login(client, username, PASSWORD);
++    }
++
++    private String tokenWithPermissions(String... permissionKeys) {
++        String username = unique("route-user");
++        AppUser user =
++                users.insert(username, passwordEncoder.encode(PASSWORD), "Tester", Roles.STUDENT)
++                        .block();
++        assign(user.id(), createRole(permissionKeys));
++        return TestAuth.login(client, username, PASSWORD);
++    }
++
++    /** Creates a fresh role holding exactly the supplied permissions. */
++    private String createRole(String... permissionKeys) {
++        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String roleId = "test-role-route-" + suffix;
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_role (id, code, name, description, parent_id, built_in,"
++                                + " enabled, created_at, updated_at)"
++                                + " VALUES (:id, :code, :name, NULL, NULL, FALSE, TRUE, :now, :now)")
++                .bind("id", roleId)
++                .bind("code", "route-" + suffix)
++                .bind("name", "Route " + suffix)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++
++        for (String key : permissionKeys) {
++            String permissionId =
++                    db.sql("SELECT id FROM access_permission WHERE permission_key = :key")
++                            .bind("key", key)
++                            .map((row, meta) -> row.get("id", String.class))
++                            .one()
++                            .block();
++            assertThat(permissionId).as("seeded permission " + key).isNotNull();
++            db.sql("INSERT INTO access_role_permission (role_id, permission_id) VALUES (:role, :perm)")
++                    .bind("role", roleId)
++                    .bind("perm", permissionId)
++                    .fetch()
++                    .rowsUpdated()
++                    .block();
++        }
++        return roleId;
++    }
++
++    private void assign(String userId, String roleId) {
++        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:user, :role, :now)")
++                .bind("user", userId)
++                .bind("role", roleId)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++    }
++
++    private static String definition(String id) {
++        return "{\"id\":\"" + id + "\",\"name\":\"Route gate\",\"driver\":\"org.h2.Driver\","
++                + "\"url\":\"jdbc:h2:mem:" + id + "\",\"username\":\"sa\",\"password\":\"\","
++                + "\"dialect\":\"H2\"}";
++    }
++
++    private static String bearer(String token) {
++        return "Bearer " + token;
++    }
++
++    private static String unique(String prefix) {
++        return prefix + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++    }
++}
+diff --git a/text2sql-frontend/src/App.vue b/text2sql-frontend/src/App.vue
+index 398af4f..860999f 100644
+--- a/text2sql-frontend/src/App.vue
++++ b/text2sql-frontend/src/App.vue
+@@ -1,31 +1,45 @@
+ <script setup lang="ts">
+ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+ import type { ComponentPublicInstance } from 'vue'
+ import { useRoute, useRouter } from 'vue-router'
+ import { ArrowDown, Expand, Fold, User } from '@element-plus/icons-vue'
+ import ConversationSidebar from '@/components/ConversationSidebar.vue'
+ import { useAuthStore } from '@/stores/auth'
+ import { useChatStore } from '@/stores/chat'
+ import { useConversationStore } from '@/stores/conversation'
++import { visibleNavigationEntries } from '@/utils/navigation'
+ 
+ const route = useRoute()
+ const router = useRouter()
+ const auth = useAuthStore()
+ const chat = useChatStore()
+ const conversation = useConversationStore()
+ 
+ /** Public routes (login) render bare, without the app chrome. */
+ const showChrome = computed(() => route.meta.public !== true)
+ 
+-/** The history sidebar belongs to the chat screen. */
+-const showSidebar = computed(() => showChrome.value && route.name === 'chat')
++/** Navigation and the history sidebar follow the same effective permission set as the guard. */
++const navigationEntries = computed(() =>
++  visibleNavigationEntries((permission) => auth.can(permission)),
++)
++const menuEntries = computed(() =>
++  navigationEntries.value.filter((entry) => entry.placement === 'menu'),
++)
++const showModelSettings = computed(() =>
++  navigationEntries.value.some((entry) => entry.name === 'model-settings'),
++)
++
++/** The history sidebar belongs to the chat screen and is useless without chat permission. */
++const showSidebar = computed(
++  () => showChrome.value && route.name === 'chat' && auth.can('chat.use'),
++)
+ 
+ /** Desktop collapse state of the sidebar: 260px expanded, 0 collapsed. */
+ const collapsed = ref(false)
+ 
+ /** Below this width the sidebar turns into an off-canvas panel. */
+ const narrowQuery = window.matchMedia('(max-width: 767px)')
+ const isNarrow = ref(narrowQuery.matches)
+ 
+ /** Off-canvas visibility. The panel starts closed on narrow viewports. */
+ const mobileOpen = ref(false)
+@@ -207,41 +221,35 @@ watch(
+         @click="toggleSidebar"
+       />
+ 
+       <el-menu
+         :default-active="route.path"
+         mode="horizontal"
+         router
+         :ellipsis="false"
+         class="layout__menu"
+       >
+-        <el-menu-item index="/">对话</el-menu-item>
+-        <el-menu-item index="/datasources">数据源</el-menu-item>
+-        <el-menu-item v-if="auth.user?.role === 'admin'" index="/admin/datasource-access">
+-          数据源权限
+-        </el-menu-item>
+-        <el-menu-item v-if="auth.can('access.manage')" index="/admin/access-control">
+-          权限管理
++        <el-menu-item v-for="entry in menuEntries" :key="entry.name" :index="entry.path">
++          {{ entry.label }}
+         </el-menu-item>
+-        <el-menu-item v-if="auth.user?.role === 'admin'" index="/knowledge">知识库</el-menu-item>
+       </el-menu>
+ 
+       <el-dropdown class="layout__user" trigger="click" @command="onUserCommand">
+         <span class="layout__user-trigger">
+           <el-icon class="layout__user-icon"><User /></el-icon>
+           <span class="layout__user-name">{{ userName }}</span>
+           <el-icon class="layout__user-caret"><ArrowDown /></el-icon>
+         </span>
+         <template #dropdown>
+           <el-dropdown-menu>
+-            <el-dropdown-item command="models">模型配置</el-dropdown-item>
+-            <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
++            <el-dropdown-item v-if="showModelSettings" command="models">模型配置</el-dropdown-item>
++            <el-dropdown-item command="logout" :divided="showModelSettings">退出登录</el-dropdown-item>
+           </el-dropdown-menu>
+         </template>
+       </el-dropdown>
+     </el-header>
+ 
+     <el-container class="layout__body">
+       <div
+         v-if="showSidebar && isNarrow && mobileOpen"
+         class="layout__backdrop"
+         aria-hidden="true"
+diff --git a/text2sql-frontend/src/router/index.ts b/text2sql-frontend/src/router/index.ts
+index c714d07..2957b1d 100644
+--- a/text2sql-frontend/src/router/index.ts
++++ b/text2sql-frontend/src/router/index.ts
+@@ -1,96 +1,115 @@
+ import { createRouter, createWebHistory } from 'vue-router'
+ import { useAuthStore } from '@/stores/auth'
++import { firstPermittedRoute } from '@/utils/navigation'
+ 
+ declare module 'vue-router' {
+   interface RouteMeta {
+     title?: string
+     /** Routes reachable without a session (the login page). */
+     public?: boolean
+-    /** Routes only administrators may open. */
++    /** @deprecated Legacy alias for `permission: 'access.manage'`. */
+     admin?: boolean
+     /** Routes gated by a specific permission key, checked via `auth.can(...)`. */
+     permission?: string
+   }
+ }
+ 
+ const router = createRouter({
+   history: createWebHistory(),
+   routes: [
+     {
+       path: '/login',
+       name: 'login',
+       component: () => import('@/views/LoginView.vue'),
+       meta: { title: '登录', public: true },
+     },
+     {
+       path: '/',
+       name: 'chat',
+       component: () => import('@/views/ChatView.vue'),
+-      meta: { title: '对话' },
++      meta: { title: '对话', permission: 'chat.use' },
+     },
+     {
+       path: '/datasources',
+       name: 'datasources',
+       component: () => import('@/views/DataSourcesView.vue'),
+-      meta: { title: '数据源' },
++      meta: { title: '数据源', permission: 'datasource.read' },
+     },
+     {
+       path: '/settings/models',
+       name: 'model-settings',
+       component: () => import('@/views/ModelSettingsView.vue'),
+-      meta: { title: '模型配置' },
++      meta: { title: '模型配置', permission: 'model.manage' },
+     },
+     {
+       path: '/admin/datasource-access',
+       name: 'datasource-access',
+       component: () => import('@/views/DataSourceAccessView.vue'),
+-      meta: { title: '数据源权限', admin: true },
++      meta: { title: '数据源权限', permission: 'access.manage' },
+     },
+     {
+       path: '/admin/access-control',
+       name: 'access-control',
+       component: () => import('@/views/AccessControlView.vue'),
+       meta: { title: '权限管理', permission: 'access.manage' },
+     },
+     {
+       path: '/knowledge',
+       name: 'knowledge',
+       component: () => import('@/views/KnowledgeView.vue'),
+-      meta: { title: '知识库', admin: true },
++      meta: { title: '知识库', permission: 'access.manage' },
++    },
++    {
++      path: '/no-permission',
++      name: 'no-permission',
++      component: () => import('@/views/NoPermissionView.vue'),
++      meta: { title: '暂无可用功能' },
+     },
+     // The About page was removed; keep old links and bookmarks working.
+     { path: '/about', redirect: '/' },
+   ],
+ })
+ 
+-// Session guard: rehydrate the auth store (so a page refresh keeps the session), send
+-// guests to /login and keep signed-in users out of it. A route carrying `meta.permission`
+-// refreshes the profile first, so a stale localStorage snapshot can never grant (or deny)
+-// access against the server's current permission set.
++// Session guard: rehydrate the auth store, send guests to /login and keep signed-in users out of
++// it. Every gated route refreshes the effective profile before its permission is checked. Denied
++// destinations fall through to the first permitted page, or to a stable page when none is available.
+ router.beforeEach(async (to) => {
+   const auth = useAuthStore()
+   await auth.restore()
++
+   if (to.meta.public !== true && !auth.isAuthenticated) {
+     return { name: 'login' }
+   }
++
++  const firstAvailableDestination = () => {
++    const path = firstPermittedRoute((permission) => auth.can(permission))
++    // The path check is a final loop guard in case a route and the navigation map ever drift apart.
++    return path !== null && path !== to.path ? { path } : { name: 'no-permission' }
++  }
++
+   if (to.meta.public === true && auth.isAuthenticated) {
+-    return { name: 'chat' }
++    return firstAvailableDestination()
+   }
+-  if (to.meta.permission) {
++
++  // `admin` remains a backwards-compatible alias, but it is permission-based too: the display-only
++  // role claim is never consulted by this guard.
++  const requiredPermission =
++    to.meta.permission ?? (to.meta.admin === true ? 'access.manage' : undefined)
++  if (requiredPermission) {
+     await auth.refreshProfile()
+-    if (!auth.can(to.meta.permission)) {
+-      return { name: 'chat' }
++    if (!auth.isAuthenticated) {
++      return { name: 'login' }
++    }
++    if (!auth.can(requiredPermission)) {
++      return firstAvailableDestination()
+     }
+-  }
+-  if (to.meta.admin === true && auth.user?.role !== 'admin') {
+-    return { name: 'chat' }
+   }
+   return true
+ })
+ 
+ router.afterEach((to) => {
+   const title = to.meta.title
+   document.title = title ? `${title} · Text2SQL` : 'Text2SQL'
+ })
+ 
+ export default router
+diff --git a/text2sql-frontend/src/utils/navigation.ts b/text2sql-frontend/src/utils/navigation.ts
+new file mode 100644
+index 0000000..fc984ba
+--- /dev/null
++++ b/text2sql-frontend/src/utils/navigation.ts
+@@ -0,0 +1,63 @@
++/**
++ * Permission-gated application destinations, in landing-page priority order.
++ *
++ * This module deliberately has no Vue, Router or Pinia imports so the navigation mapping and
++ * fallback selection can be tested directly with the Node test runner.
++ */
++export type NavigationPlacement = 'menu' | 'dropdown'
++
++export interface AppNavigationEntry {
++  name: string
++  path: string
++  label: string
++  permission: string
++  placement: NavigationPlacement
++}
++
++export type PermissionChecker = (permission: string) => boolean
++
++/**
++ * Every user-facing destination exposed by the shell. The legacy datasource-access route is
++ * intentionally absent: it remains routable for old bookmarks but is no longer a navigation item.
++ */
++export const APP_NAVIGATION_ENTRIES: readonly AppNavigationEntry[] = [
++  { name: 'chat', path: '/', label: '对话', permission: 'chat.use', placement: 'menu' },
++  {
++    name: 'datasources',
++    path: '/datasources',
++    label: '数据源',
++    permission: 'datasource.read',
++    placement: 'menu',
++  },
++  {
++    name: 'model-settings',
++    path: '/settings/models',
++    label: '模型配置',
++    permission: 'model.manage',
++    placement: 'dropdown',
++  },
++  {
++    name: 'knowledge',
++    path: '/knowledge',
++    label: '知识库',
++    permission: 'access.manage',
++    placement: 'menu',
++  },
++  {
++    name: 'access-control',
++    path: '/admin/access-control',
++    label: '权限管理',
++    permission: 'access.manage',
++    placement: 'menu',
++  },
++]
++
++/** Returns the entries whose permission is granted by the supplied effective-permission check. */
++export function visibleNavigationEntries(can: PermissionChecker): AppNavigationEntry[] {
++  return APP_NAVIGATION_ENTRIES.filter((entry) => can(entry.permission))
++}
++
++/** Returns the highest-priority permitted path, or `null` when no app feature is available. */
++export function firstPermittedRoute(can: PermissionChecker): string | null {
++  return APP_NAVIGATION_ENTRIES.find((entry) => can(entry.permission))?.path ?? null
++}
+diff --git a/text2sql-frontend/src/views/ChatView.vue b/text2sql-frontend/src/views/ChatView.vue
+index fa2ddaf..4c4fdba 100644
+--- a/text2sql-frontend/src/views/ChatView.vue
++++ b/text2sql-frontend/src/views/ChatView.vue
+@@ -1,34 +1,37 @@
+ <script setup lang="ts">
+ import { computed, nextTick, onMounted, ref, watch } from 'vue'
+ import { DocumentCopy, Plus, Promotion, VideoPlay } from '@element-plus/icons-vue'
+ import { ElMessage } from 'element-plus'
+ import { conversationErrorMessage } from '@/api/conversations'
+ import type { Citation } from '@/api/knowledge'
+ import { useChatStore } from '@/stores/chat'
+ import { useConversationStore } from '@/stores/conversation'
++import { useAuthStore } from '@/stores/auth'
+ import CitationBadge from '@/components/CitationBadge.vue'
+ import CitationDrawer from '@/components/CitationDrawer.vue'
+ import ResultChart from '@/components/ResultChart.vue'
+ import type {
+   ChartSpec,
+   ChatMessage,
+   ConversationEvent,
+   HistoryMessage,
+   QueryResult,
+   ChatStep,
+ } from '@/types'
+ import { copyText } from '@/utils/clipboard'
+ import { parseSegments } from '@/utils/markdown'
+ 
++const auth = useAuthStore()
+ const chat = useChatStore()
+ const conversation = useConversationStore()
++const canUseChat = computed(() => auth.can('chat.use'))
+ const draft = ref('')
+ const scrollRef = ref<HTMLElement | null>(null)
+ /** True while a stored conversation history is being fetched. */
+ const loadingHistory = ref(false)
+ /** Conversation the live stream attached; keeps its `activeId` watcher idle. */
+ const streamedConversationId = ref<string | null>(null)
+ 
+ /** Citation preview state shared by every answer in the transcript. */
+ const citationDrawerVisible = ref(false)
+ const activeCitation = ref<Citation | null>(null)
+@@ -58,38 +61,46 @@ function onCitationNavigate(index: number): void {
+     activeCitation.value = citation
+   }
+ }
+ 
+ const examples = [
+   '1班和2班的数学平均分分别是多少',
+   '我的各科成绩',
+   '统计每个班的考勤异常次数',
+ ]
+ 
+-const canSend = computed(() => draft.value.trim().length > 0 && !chat.streaming)
++const canSend = computed(
++  () => canUseChat.value && draft.value.trim().length > 0 && !chat.streaming,
++)
+ 
+ const selectedDatasource = computed(
+   () => chat.datasources.find((item) => item.id === chat.datasourceId) ?? null,
+ )
+ 
+ onMounted(() => {
++  if (!canUseChat.value) {
++    return
++  }
+   void chat.loadDatasources()
+   if (conversation.activeId && !chat.streaming) {
+     void loadConversation(conversation.activeId)
+   }
+ })
+ 
+ // Switching conversations swaps the visible messages: load the stored history, or
+ // clear the pane for a fresh conversation.
+ watch(
+   () => conversation.activeId,
+   (id) => {
++    if (!canUseChat.value) {
++      return
++    }
+     if (id === null) {
+       chat.stop()
+       chat.reset()
+       return
+     }
+     if (chat.streaming && id === streamedConversationId.value) {
+       // The running stream persisted this conversation; the live view is already correct.
+       return
+     }
+     void loadConversation(id)
+@@ -293,21 +304,21 @@ watch(
+ 
+ <template>
+   <div class="chat">
+     <section class="chat__panel" aria-label="数据问答工作区">
+       <header class="chat__header">
+         <div class="chat__heading">
+           <h1 class="chat__title">数据问答</h1>
+           <p class="chat__subtitle">用自然语言描述问题，自动生成 SQL、执行并返回结果。</p>
+         </div>
+ 
+-        <div class="chat__controls">
++        <div v-if="canUseChat" class="chat__controls">
+           <el-select
+             v-model="chat.datasourceId"
+             class="chat__datasource"
+             placeholder="选择数据源"
+             :disabled="chat.datasources.length === 0"
+           >
+             <el-option
+               v-for="datasource in chat.datasources"
+               :key="datasource.id"
+               :label="datasource.name"
+@@ -348,22 +359,24 @@ watch(
+       <div
+         ref="scrollRef"
+         v-loading="loadingHistory"
+         class="chat__messages"
+         aria-label="对话记录"
+         :aria-busy="chat.streaming"
+       >
+         <div v-if="chat.messages.length === 0" class="empty">
+           <span class="empty__mark" aria-hidden="true">T2S</span>
+           <h2 class="empty__title">今天想了解校园里的哪些数据？</h2>
+-          <p class="empty__text">选择一个示例，或直接输入你的问题。</p>
+-          <div class="empty__chips">
++          <p class="empty__text">
++            {{ canUseChat ? '选择一个示例，或直接输入你的问题。' : '当前账号仅可查看已有对话内容。' }}
++          </p>
++          <div v-if="canUseChat" class="empty__chips">
+             <button
+               v-for="example in examples"
+               :key="example"
+               type="button"
+               class="chip"
+               @click="useExample(example)"
+             >
+               {{ example }}
+             </button>
+           </div>
+@@ -482,33 +495,33 @@ watch(
+                 </el-tag>
+               </div>
+             </div>
+ 
+             <span v-if="message.streaming" class="msg__cursor" aria-hidden="true" />
+           </div>
+         </article>
+       </div>
+ 
+       <footer class="chat__composer">
+-        <div v-if="chat.messages.length > 0" class="chat__examples">
++        <div v-if="canUseChat && chat.messages.length > 0" class="chat__examples">
+           <button
+             v-for="example in examples"
+             :key="example"
+             type="button"
+             class="chip"
+             @click="useExample(example)"
+           >
+             {{ example }}
+           </button>
+         </div>
+ 
+-        <div class="composer" :class="{ 'composer--busy': chat.streaming }">
++        <div v-if="canUseChat" class="composer" :class="{ 'composer--busy': chat.streaming }">
+           <el-input
+             v-model="draft"
+             class="composer__input"
+             type="textarea"
+             :rows="3"
+             resize="none"
+             placeholder="例如：查询每个月的订单数量"
+             @keydown="onKeydown"
+           />
+           <div class="composer__bar">
+@@ -516,20 +529,29 @@ watch(
+               {{ chat.streaming ? '正在生成答案…' : 'Enter 发送 · Shift+Enter 换行' }}
+             </span>
+             <div class="composer__actions">
+               <el-button v-if="chat.streaming" :icon="VideoPlay" @click="chat.stop()">停止</el-button>
+               <el-button type="primary" :icon="Promotion" :disabled="!canSend" @click="onSend">
+                 发送
+               </el-button>
+             </div>
+           </div>
+         </div>
++        <el-alert
++          v-else
++          class="chat__permission"
++          type="info"
++          :closable="false"
++          show-icon
++          title="当前账号没有对话权限"
++          description="你可以查看已有内容，但不能发送问题或新建查询。如需使用对话，请联系管理员。"
++        />
+       </footer>
+     </section>
+ 
+     <CitationDrawer
+       v-model="citationDrawerVisible"
+       :citation="activeCitation"
+       :citations="activeCitationList"
+       @navigate="onCitationNavigate"
+     />
+   </div>
+diff --git a/text2sql-frontend/src/views/DataSourcesView.vue b/text2sql-frontend/src/views/DataSourcesView.vue
+index 9a4a2ec..ff44b85 100644
+--- a/text2sql-frontend/src/views/DataSourcesView.vue
++++ b/text2sql-frontend/src/views/DataSourcesView.vue
+@@ -6,20 +6,25 @@ import type { FormInstance, FormRules } from 'element-plus'
+ import {
+   createDatasource,
+   datasourceErrorMessage,
+   deleteDatasource,
+   listDatasources,
+   testCandidateDatasource,
+   testDatasource,
+   updateDatasource,
+ } from '@/api/datasources'
+ import type { ConnectionTestResult, DatasourceDetail, DatasourcePayload } from '@/types'
++import { useAuthStore } from '@/stores/auth'
++
++const auth = useAuthStore()
++/** Read access is route-gated; every credential-bearing/write control also requires this key. */
++const canWrite = computed(() => auth.can('datasource.write'))
+ 
+ const DIALECTS = ['H2', 'MySQL', 'PostgreSQL', 'SQLite', 'OTHER']
+ 
+ type TagType = 'primary' | 'success' | 'info' | 'warning' | 'danger'
+ 
+ const DIALECT_TAG_TYPES: Record<string, TagType> = {
+   H2: 'success',
+   MYSQL: 'primary',
+   POSTGRESQL: 'warning',
+   SQLITE: 'info',
+@@ -194,26 +199,28 @@ onMounted(() => {
+   void load()
+ })
+ </script>
+ 
+ <template>
+   <section class="ac-page datasources">
+     <header class="ac-page-header">
+       <div>
+         <h1 class="ac-page-title">数据源</h1>
+         <p class="ac-page-description">
+-          登记可供智能体查询的业务数据库，可在此测试连接、编辑配置或移除不再使用的数据源。
++          查看可供智能体查询的业务数据库；具备维护权限的账号可测试连接、编辑配置或移除数据源。
+         </p>
+       </div>
+       <div class="ac-action-bar">
+         <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
+-        <el-button type="primary" :icon="Plus" @click="openCreate">新增数据源</el-button>
++        <el-button v-if="canWrite" type="primary" :icon="Plus" @click="openCreate">
++          新增数据源
++        </el-button>
+       </div>
+     </header>
+ 
+     <div class="ac-table-wrapper">
+       <el-table v-loading="loading" :data="datasources" row-key="id" stripe>
+         <el-table-column prop="id" label="ID" min-width="120" />
+         <el-table-column prop="name" label="名称" min-width="140" />
+         <el-table-column label="方言" width="130">
+           <template #default="{ row }">
+             <el-tag size="small" effect="plain" :type="dialectTagType(row.dialect)">
+@@ -221,21 +228,21 @@ onMounted(() => {
+             </el-tag>
+           </template>
+         </el-table-column>
+         <el-table-column prop="url" label="JDBC URL" min-width="280" show-overflow-tooltip />
+         <el-table-column label="默认" width="80">
+           <template #default="{ row }">
+             <el-tag v-if="row.default" size="small" type="success">默认</el-tag>
+             <span v-else class="ac-muted">—</span>
+           </template>
+         </el-table-column>
+-        <el-table-column label="操作" width="250" fixed="right">
++        <el-table-column v-if="canWrite" label="操作" width="250" fixed="right">
+           <template #default="{ row }">
+             <el-button size="small" text :icon="Edit" @click="openEdit(row)">编辑</el-button>
+             <el-button
+               size="small"
+               text
+               :icon="Connection"
+               :loading="testingId === row.id"
+               @click="testRow(row)"
+             >
+               测试连接
+@@ -259,28 +266,33 @@ onMounted(() => {
+                 </el-button>
+               </template>
+             </el-popconfirm>
+           </template>
+         </el-table-column>
+ 
+         <template #empty>
+           <div class="ac-empty-state">
+             <span class="ac-empty-state__title">暂无数据源</span>
+             <span class="ac-empty-state__text">
+-              新增数据源后，具备权限的账号即可向该数据库提问。
++              {{
++                canWrite
++                  ? '新增数据源后，具备权限的账号即可向该数据库提问。'
++                  : '暂无已登记的数据源；如需新增，请联系具备维护权限的管理员。'
++              }}
+             </span>
+           </div>
+         </template>
+       </el-table>
+     </div>
+ 
+     <el-dialog
++      v-if="canWrite"
+       v-model="dialogVisible"
+       class="ac-dialog"
+       :title="dialogTitle"
+       width="min(560px, calc(100vw - 32px))"
+       :close-on-click-modal="false"
+     >
+       <el-form ref="formRef" :model="form" :rules="rules" label-width="104px">
+         <el-form-item label="ID" prop="id">
+           <el-input
+             v-model="form.id"
+diff --git a/text2sql-frontend/src/views/KnowledgeView.vue b/text2sql-frontend/src/views/KnowledgeView.vue
+index 7c6c65d..8495630 100644
+--- a/text2sql-frontend/src/views/KnowledgeView.vue
++++ b/text2sql-frontend/src/views/KnowledgeView.vue
+@@ -111,24 +111,24 @@ const parseStatusTagTypes: Record<ParseStatus, TagType> = {
+ 
+ const hitTagTypes: Record<KnowledgeType, TagType> = {
+   METADATA: 'info',
+   BUSINESS: 'primary',
+   AGENT: 'warning',
+ }
+ 
+ const auth = useAuthStore()
+ 
+ /**
+- * The route already carries `meta.admin` (the router guard redirects non-admins);
+- * this second check keeps the page itself from issuing any knowledge request.
++ * The route carries `meta.permission: access.manage`; this second check keeps the page from issuing
++ * knowledge requests if permissions change while it is open, without relying on the role claim.
+  */
+-const isAdmin = computed(() => auth.user?.role === 'admin')
++const canManageKnowledge = computed(() => auth.can('access.manage'))
+ 
+ const datasources = ref<DatasourceDetail[]>([])
+ /** Tab id is kept as a plain string because `el-tabs` emits string | number. */
+ const activeTab = ref<string>('METADATA')
+ const activeType = computed<KnowledgeType>(() => activeTab.value as KnowledgeType)
+ const activeTabLabel = computed(() => typeLabels[activeType.value])
+ const activeTabHint = computed(
+   () => tabs.find((tab) => tab.type === activeType.value)?.hint ?? '',
+ )
+ 
+@@ -741,32 +741,32 @@ function targetText(mapping: TermMappingView): string {
+ }
+ 
+ // ---------- Lifecycle -------------------------------------------------------
+ 
+ watch(activeTab, () => {
+   searchResult.value = null
+   void refresh()
+ })
+ 
+ onMounted(async () => {
+-  if (!isAdmin.value) {
++  if (!canManageKnowledge.value) {
+     return
+   }
+   await loadDatasources()
+   await refresh()
+ })
+ 
+ onBeforeUnmount(clearPollTimers)
+ </script>
+ 
+ <template>
+-  <section v-if="isAdmin" class="ac-page knowledge">
++  <section v-if="canManageKnowledge" class="ac-page knowledge">
+     <header class="ac-page-header">
+       <div>
+         <h1 class="ac-page-title">知识库</h1>
+         <p class="ac-page-description">
+           管理元数据、业务知识与智能体知识，查看文档解析状态，并用真实问题调试检索与选表效果。
+         </p>
+       </div>
+       <div class="ac-action-bar">
+         <el-button :icon="Refresh" :loading="loading" @click="refresh">刷新</el-button>
+         <el-button :icon="Search" @click="searchDrawerVisible = true">检索调试</el-button>
+@@ -1430,21 +1430,21 @@ onBeforeUnmount(clearPollTimers)
+       :citation="activeCitation"
+       :citations="activeCitationList"
+       @navigate="onCitationNavigate"
+     />
+   </section>
+ 
+   <section v-else class="ac-page">
+     <header class="ac-page-header">
+       <div>
+         <h1 class="ac-page-title">知识库</h1>
+-        <p class="ac-page-description">该页面仅管理员可见。</p>
++        <p class="ac-page-description">该页面需要知识库管理权限。</p>
+       </div>
+     </header>
+     <el-alert
+       type="warning"
+       :closable="false"
+       show-icon
+       title="没有权限访问知识库"
+       description="如需管理知识库，请联系管理员开通权限。"
+     />
+   </section>
+diff --git a/text2sql-frontend/src/views/NoPermissionView.vue b/text2sql-frontend/src/views/NoPermissionView.vue
+new file mode 100644
+index 0000000..0f67455
+--- /dev/null
++++ b/text2sql-frontend/src/views/NoPermissionView.vue
+@@ -0,0 +1,54 @@
++<template>
++  <section class="ac-page no-permission" aria-label="暂无可用功能">
++    <div class="no-permission__panel">
++      <el-result icon="warning" title="暂无可用功能" sub-title="当前账号没有可访问的功能，请联系管理员分配权限。">
++        <template #icon>
++          <span class="no-permission__mark" aria-hidden="true">!</span>
++        </template>
++      </el-result>
++      <p class="no-permission__note">
++        权限更新后，重新进入系统即可使用已开放的功能。
++      </p>
++    </div>
++  </section>
++</template>
++
++<style scoped>
++.no-permission {
++  display: grid;
++  min-height: 100%;
++  place-items: center;
++}
++
++.no-permission__panel {
++  width: min(560px, 100%);
++  padding: var(--ac-space-24);
++  text-align: center;
++  background: var(--ac-surface);
++  border: 1px solid var(--ac-border-soft);
++  border-radius: var(--ac-radius);
++  box-shadow: var(--ac-shadow-sm);
++}
++
++.no-permission__mark {
++  display: inline-flex;
++  align-items: center;
++  justify-content: center;
++  width: 56px;
++  height: 56px;
++  color: var(--el-color-warning-dark-2);
++  font-family: var(--ac-font-serif);
++  font-size: 30px;
++  font-weight: 600;
++  background: var(--el-color-warning-light-9);
++  border: 1px solid var(--el-color-warning-light-7);
++  border-radius: 50%;
++}
++
++.no-permission__note {
++  margin: calc(var(--ac-space-16) * -1) 0 var(--ac-space-8);
++  color: var(--ac-muted);
++  font-size: var(--ac-text-meta);
++  line-height: var(--ac-line-height);
++}
++</style>
+diff --git a/text2sql-frontend/tests/navigation.test.mjs b/text2sql-frontend/tests/navigation.test.mjs
+new file mode 100644
+index 0000000..944e47c
+--- /dev/null
++++ b/text2sql-frontend/tests/navigation.test.mjs
+@@ -0,0 +1,69 @@
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import {
++  APP_NAVIGATION_ENTRIES,
++  firstPermittedRoute,
++  visibleNavigationEntries,
++} from '../src/utils/navigation.ts'
++
++/** Builds the same kind of synchronous permission predicate exposed by `auth.can`. */
++function permissions(...granted) {
++  return (permission) => granted.includes(permission)
++}
++
++test('navigation entries use the expected permission keys and landing order', () => {
++  assert.deepEqual(
++    APP_NAVIGATION_ENTRIES.map(({ path, permission, placement }) => ({ path, permission, placement })),
++    [
++      { path: '/', permission: 'chat.use', placement: 'menu' },
++      { path: '/datasources', permission: 'datasource.read', placement: 'menu' },
++      { path: '/settings/models', permission: 'model.manage', placement: 'dropdown' },
++      { path: '/knowledge', permission: 'access.manage', placement: 'menu' },
++      { path: '/admin/access-control', permission: 'access.manage', placement: 'menu' },
++    ],
++  )
++  assert.equal(
++    APP_NAVIGATION_ENTRIES.some((entry) => entry.path === '/admin/datasource-access'),
++    false,
++    'the legacy datasource-access page must stay out of navigation',
++  )
++})
++
++test('visibleNavigationEntries exposes chat and datasource reading to student/counselor permissions', () => {
++  const entries = visibleNavigationEntries(permissions('chat.use', 'datasource.read'))
++
++  assert.deepEqual(
++    entries.map((entry) => entry.path),
++    ['/', '/datasources'],
++  )
++})
++
++test('visibleNavigationEntries uses access.manage instead of an administrator role claim', () => {
++  const entries = visibleNavigationEntries(permissions('access.manage'))
++
++  assert.deepEqual(
++    entries.map((entry) => entry.path),
++    ['/knowledge', '/admin/access-control'],
++  )
++})
++
++test('visibleNavigationEntries includes model settings only with model.manage', () => {
++  const entries = visibleNavigationEntries(permissions('datasource.read', 'model.manage'))
++
++  assert.deepEqual(
++    entries.map((entry) => entry.path),
++    ['/datasources', '/settings/models'],
++  )
++})
++
++test('firstPermittedRoute skips chat when chat.use is absent', () => {
++  assert.equal(firstPermittedRoute(permissions('datasource.read', 'model.manage')), '/datasources')
++  assert.equal(firstPermittedRoute(permissions('model.manage')), '/settings/models')
++  assert.equal(firstPermittedRoute(permissions('access.manage')), '/knowledge')
++})
++
++test('firstPermittedRoute fails closed when no destination is permitted', () => {
++  assert.equal(firstPermittedRoute(permissions()), null)
++  assert.equal(firstPermittedRoute(permissions('user.read')), null)
++  assert.deepEqual(visibleNavigationEntries(permissions()), [])
++})

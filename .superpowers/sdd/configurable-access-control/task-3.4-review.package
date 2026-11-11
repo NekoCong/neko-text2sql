@@ -1,0 +1,490 @@
+﻿## Commits
+7b6b076 feat(security): gate management routes by permission instead of JWT role
+
+## Stat
+ .../nekocong/text2sql/config/SecurityConfig.java   |  49 ++++--
+ .../controller/DatasourceAccessController.java     |   7 +-
+ .../security/PermissionAuthorizationManager.java   |  83 +++++++++
+ .../text2sql/web/PermissionAuthorizationTest.java  | 196 +++++++++++++++++++++
+ 4 files changed, 321 insertions(+), 14 deletions(-)
+
+## Diff
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+index 534dd1c..cc50257 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/config/SecurityConfig.java
+@@ -1,55 +1,61 @@
+ package com.nekocong.text2sql.config;
+ 
+ import com.fasterxml.jackson.databind.ObjectMapper;
+ import com.nimbusds.jose.jwk.source.ImmutableSecret;
+ import com.nekocong.text2sql.access.AccessContextResolver;
++import com.nekocong.text2sql.access.Permissions;
++import com.nekocong.text2sql.security.PermissionAuthorizationManager;
+ import com.nekocong.text2sql.security.Roles;
+ import java.nio.charset.StandardCharsets;
+ import java.util.Locale;
+ import javax.crypto.SecretKey;
+ import javax.crypto.spec.SecretKeySpec;
+ import org.springframework.context.annotation.Bean;
+ import org.springframework.context.annotation.Configuration;
+ import org.springframework.core.convert.converter.Converter;
+ import org.springframework.http.HttpMethod;
+ import org.springframework.security.authentication.AbstractAuthenticationToken;
++import org.springframework.security.authorization.ReactiveAuthorizationManager;
+ import org.springframework.security.config.Customizer;
+ import org.springframework.security.config.annotation.web.reactive.EnableWebFluxSecurity;
+ import org.springframework.security.config.web.server.SecurityWebFiltersOrder;
+ import org.springframework.security.config.web.server.ServerHttpSecurity;
+ import org.springframework.security.core.authority.SimpleGrantedAuthority;
+ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+ import org.springframework.security.crypto.password.PasswordEncoder;
+ import org.springframework.security.oauth2.jose.jws.MacAlgorithm;
+ import org.springframework.security.oauth2.jwt.Jwt;
+ import org.springframework.security.oauth2.jwt.JwtEncoder;
+ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
+ import org.springframework.security.oauth2.jwt.NimbusReactiveJwtDecoder;
+ import org.springframework.security.oauth2.jwt.ReactiveJwtDecoder;
+ import org.springframework.security.oauth2.server.resource.authentication.ReactiveJwtAuthenticationConverter;
+ import org.springframework.security.oauth2.server.resource.web.server.authentication.ServerBearerTokenAuthenticationConverter;
+ import org.springframework.security.web.server.SecurityWebFilterChain;
++import org.springframework.security.web.server.authorization.AuthorizationContext;
+ import reactor.core.publisher.Flux;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+  * Spring Security (WebFlux) configuration: stateless JWT bearer authentication.
+  *
+  * <p>Public endpoints: registration, login, the liveness probe and the Actuator endpoints.
+  * Everything else requires a valid JWT. The token is read from the {@code Authorization: Bearer ...}
+  * header, or from an {@code access_token} URI query parameter (needed because the browser
+  * {@code EventSource} used for SSE cannot set headers).
+  *
+  * <p>The {@code role} claim is mapped to a {@code ROLE_ADMIN} / {@code ROLE_USER} authority so the
+- * role is available on the {@code Authentication}. Row-level data scoping (who may read which
+- * conversation) is enforced in the service layer, which receives the role explicitly.
++ * role is available on the {@code Authentication}, but route authorization does not use it: the
++ * management routes are gated by the permissions resolved from the access-control tables (see
++ * {@link PermissionAuthorizationManager}). Row-level data scoping (who may read which conversation)
++ * is enforced in the service layer.
+  */
+ @Configuration
+ @EnableWebFluxSecurity
+ public class SecurityConfig {
+ 
+     /**
+      * The security filter chain.
+      *
+      * <p>The account-status filter is constructed here instead of being exposed as a bean: Spring
+      * Boot adds every {@code WebFilter} bean to the top-level handler chain as well, so a bean would
+@@ -83,56 +89,77 @@ public class SecurityConfig {
+                                 exchange
+                                         .pathMatchers(HttpMethod.OPTIONS)
+                                         .permitAll()
+                                         .pathMatchers(
+                                                 "/api/auth/register",
+                                                 "/api/auth/login",
+                                                 "/api/text2sql/health",
+                                                 "/actuator/**")
+                                         .permitAll()
+                                         .pathMatchers("/api/admin/**")
+-                                        .hasRole("ADMIN")
++                                        .access(accessManage())
+                                         // The three knowledge collections, their documents and the
+-                                        // retrieval debug endpoints are administrator-only.
++                                        // retrieval debug endpoints require the access-management
++                                        // permission.
+                                         // The legacy in-memory API stays open to any authenticated
+                                         // caller for backwards compatibility.
+                                         .pathMatchers("/api/text2sql/knowledge/legacy/**")
+                                         .authenticated()
+                                         .pathMatchers("/api/text2sql/knowledge/**")
+-                                        .hasRole("ADMIN")
++                                        .access(accessManage())
+                                         .pathMatchers(
+                                                 HttpMethod.POST,
+                                                 "/api/text2sql/datasources",
+                                                 "/api/text2sql/datasources/**")
+-                                        .hasRole("ADMIN")
++                                        .access(datasourceWrite())
+                                         .pathMatchers(HttpMethod.PUT, "/api/text2sql/datasources/**")
+-                                        .hasRole("ADMIN")
++                                        .access(datasourceWrite())
+                                         .pathMatchers(HttpMethod.DELETE, "/api/text2sql/datasources/**")
+-                                        .hasRole("ADMIN")
++                                        .access(datasourceWrite())
+                                         .anyExchange()
+                                         .authenticated())
+                 .oauth2ResourceServer(
+                         oauth2 ->
+                                 oauth2.bearerTokenConverter(bearerTokenConverter)
+                                         .jwt(jwt -> jwt.jwtAuthenticationConverter(roleAuthenticationConverter())))
+                 // Re-checks the account (enabled, token version) and publishes the resolved
+-                // EffectiveAccess on the exchange before the controller runs.
+-                .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHORIZATION);
++                // EffectiveAccess on the exchange. It must run before AUTHORIZATION so the
++                // permission-based route checks above can read the attribute.
++                .addFilterAfter(accessStatus, SecurityWebFiltersOrder.AUTHENTICATION);
+         return http.build();
+     }
+ 
++    /**
++     * Requires the {@code access.manage} permission (administration of roles and access control).
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> accessManage() {
++        return PermissionAuthorizationManager.permission(Permissions.ACCESS_MANAGE);
++    }
++
++    /**
++     * Requires the {@code datasource.write} permission.
++     *
++     * @return the authorization manager
++     */
++    static ReactiveAuthorizationManager<AuthorizationContext> datasourceWrite() {
++        return PermissionAuthorizationManager.permission(Permissions.DATASOURCE_WRITE);
++    }
++
+     /**
+      * Maps the JWT {@code role} claim to a single granted authority.
+      *
+      * <p>An unknown or missing role maps to {@code ROLE_NONE}: the caller stays authenticated but
+      * carries no role authority. The data-permission layer validates the resolved scope on every
+-     * query, and {@code /api/admin/**} plus datasource mutation endpoints require {@code ROLE_ADMIN}.
++     * query, and the management routes are gated by permissions resolved from the access-control
++     * tables, so this authority is informational only.
+      *
+      * @return the converter
+      */
+     @Bean
+     Converter<Jwt, Mono<AbstractAuthenticationToken>> roleAuthenticationConverter() {
+         ReactiveJwtAuthenticationConverter converter = new ReactiveJwtAuthenticationConverter();
+         converter.setJwtGrantedAuthoritiesConverter(
+                 jwt -> {
+                     String role = Roles.normalize(jwt.getClaimAsString(Roles.CLAIM));
+                     String authority = "ROLE_" + (role == null ? "NONE" : role.toUpperCase(Locale.ROOT));
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DatasourceAccessController.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DatasourceAccessController.java
+index fa788db..8d4987b 100644
+--- a/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DatasourceAccessController.java
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/controller/DatasourceAccessController.java
+@@ -4,24 +4,25 @@ import com.nekocong.text2sql.controller.dto.DatasourceAccessMatrix;
+ import com.nekocong.text2sql.service.DatasourceAccessService;
+ import org.springframework.web.bind.annotation.DeleteMapping;
+ import org.springframework.web.bind.annotation.GetMapping;
+ import org.springframework.web.bind.annotation.PathVariable;
+ import org.springframework.web.bind.annotation.PutMapping;
+ import org.springframework.web.bind.annotation.RequestMapping;
+ import org.springframework.web.bind.annotation.RestController;
+ import reactor.core.publisher.Mono;
+ 
+ /**
+- * Administrator endpoints for the role -> datasource whitelist.
++ * <p>Administrator endpoints for the role -> datasource whitelist.
+  *
+- * <p>Access is enforced by {@code SecurityConfig} ({@code /api/admin/**} requires the admin role), so
+- * a non-admin never reaches these handlers.
++ * <p>Access is enforced by {@code SecurityConfig} ({@code /api/admin/**} requires the {@code
++ * access.manage} permission resolved from the access-control tables), so an unauthorized caller
++ * never reaches these handlers.
+  */
+ @RestController
+ @RequestMapping("/api/admin/datasource-access")
+ public class DatasourceAccessController {
+ 
+     private final DatasourceAccessService service;
+ 
+     /**
+      * Creates the controller.
+      *
+diff --git a/text2sql-backend/src/main/java/com/nekocong/text2sql/security/PermissionAuthorizationManager.java b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/PermissionAuthorizationManager.java
+new file mode 100644
+index 0000000..80cb618
+--- /dev/null
++++ b/text2sql-backend/src/main/java/com/nekocong/text2sql/security/PermissionAuthorizationManager.java
+@@ -0,0 +1,83 @@
++package com.nekocong.text2sql.security;
++
++import com.nekocong.text2sql.access.EffectiveAccess;
++import org.springframework.security.authorization.AuthorizationDecision;
++import org.springframework.security.authorization.AuthorizationResult;
++import org.springframework.security.authorization.ReactiveAuthorizationManager;
++import org.springframework.security.core.Authentication;
++import org.springframework.security.web.server.authorization.AuthorizationContext;
++import reactor.core.publisher.Mono;
++
++/**
++ * Authorizes a request against one permission of the caller's configured effective access.
++ *
++ * <p>The decision is taken from the {@link EffectiveAccess} published on the exchange by {@code
++ * AccessStatusWebFilter}, never from the token's {@code role} claim: a custom role may hold {@code
++ * access.manage} without being named {@code admin}, and an account whose access role changed loses
++ * the capability on its next request even if its token still carries the old claim.
++ *
++ * <p>Fails closed. A missing authentication, a missing effective access (the filter did not run, or
++ * rejected the request) or a missing permission all deny the request.
++ */
++public class PermissionAuthorizationManager
++        implements ReactiveAuthorizationManager<AuthorizationContext> {
++
++    /** Exchange attribute under which {@code AccessStatusWebFilter} publishes the access. */
++    private static final String ACCESS = EffectiveAccess.class.getName();
++
++    private final String permission;
++
++    /**
++     * Creates the manager.
++     *
++     * @param permission the required permission key (see {@code Permissions})
++     */
++    public PermissionAuthorizationManager(String permission) {
++        if (permission == null || permission.isBlank()) {
++            throw new IllegalArgumentException("permission key is required");
++        }
++        this.permission = permission;
++    }
++
++    /**
++     * Creates a manager for one permission key.
++     *
++     * @param permission the required permission key
++     * @return the manager
++     */
++    public static PermissionAuthorizationManager permission(String permission) {
++        return new PermissionAuthorizationManager(permission);
++    }
++
++    @Override
++    public Mono<AuthorizationResult> authorize(
++            Mono<Authentication> authentication, AuthorizationContext context) {
++        return authentication
++                .filter(Authentication::isAuthenticated)
++                .map(authenticated -> (AuthorizationResult) new AuthorizationDecision(holds(access(context))))
++                .defaultIfEmpty(new AuthorizationDecision(false));
++    }
++
++    /**
++     * Reads the effective access from the exchange attributes.
++     *
++     * @param context the authorization context
++     * @return the access, or {@code null} when it was not published
++     */
++    private static EffectiveAccess access(AuthorizationContext context) {
++        if (context == null || context.getExchange() == null) {
++            return null;
++        }
++        Object attribute = context.getExchange().getAttributes().get(ACCESS);
++        return attribute instanceof EffectiveAccess access ? access : null;
++    }
++
++    private boolean holds(EffectiveAccess access) {
++        return access != null && access.hasPermission(permission);
++    }
++
++    @Override
++    public String toString() {
++        return getClass().getSimpleName() + "[" + permission + "]";
++    }
++}
+diff --git a/text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionAuthorizationTest.java b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionAuthorizationTest.java
+new file mode 100644
+index 0000000..0d81e0a
+--- /dev/null
++++ b/text2sql-backend/src/test/java/com/nekocong/text2sql/web/PermissionAuthorizationTest.java
+@@ -0,0 +1,196 @@
++package com.nekocong.text2sql.web;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import com.nekocong.text2sql.access.AccessControlRepository;
++import com.nekocong.text2sql.access.Permissions;
++import com.nekocong.text2sql.repository.UserRepository;
++import com.nekocong.text2sql.security.Roles;
++import com.nekocong.text2sql.user.AppUser;
++import java.util.UUID;
++import org.junit.jupiter.api.BeforeEach;
++import org.junit.jupiter.api.Test;
++import org.springframework.beans.factory.annotation.Autowired;
++import org.springframework.boot.test.context.SpringBootTest;
++import org.springframework.boot.test.web.server.LocalServerPort;
++import org.springframework.http.HttpHeaders;
++import org.springframework.http.MediaType;
++import org.springframework.r2dbc.core.DatabaseClient;
++import org.springframework.security.crypto.password.PasswordEncoder;
++import org.springframework.test.web.reactive.server.WebTestClient;
++
++/**
++ * Route authorization follows the permissions resolved from the access-control tables, not the JWT
++ * {@code role} claim.
++ *
++ * <p>A custom role can hold {@code access.manage} / {@code datasource.write} without being named
++ * {@code admin}, and an account whose token claims {@code admin} but whose configured role lacks the
++ * permission is rejected: the claim never grants a route.
++ */
++@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
++class PermissionAuthorizationTest {
++
++    private static final String PASSWORD = "secret123";
++
++    @LocalServerPort
++    private int port;
++
++    @Autowired
++    private UserRepository users;
++
++    @Autowired
++    private PasswordEncoder passwordEncoder;
++
++    @Autowired
++    private AccessControlRepository access;
++
++    @Autowired
++    private DatabaseClient db;
++
++    private WebTestClient client;
++
++    @BeforeEach
++    void setUp() {
++        client = WebTestClient.bindToServer().baseUrl("http://localhost:" + port).build();
++    }
++
++    @Test
++    void customRoleWithAccessManageMayReadTheAdminApiWithoutBeingAdmin() {
++        String roleId = createRole(Permissions.ACCESS_MANAGE);
++        AppUser user = createUser(Roles.STUDENT);
++        assign(user.id(), roleId);
++        String token = TestAuth.login(client, user.username(), PASSWORD);
++
++        client.get()
++                .uri("/api/admin/datasource-access")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isOk()
++                .expectBody()
++                .jsonPath("$.roles")
++                .exists();
++    }
++
++    @Test
++    void adminRoleClaimWithoutTheConfiguredPermissionIsRejected() {
++        AppUser user = createUser(Roles.ADMIN);
++        // The seeded student role holds chat.use + datasource.read only.
++        access.assignRoleByCode(user.id(), Roles.STUDENT).block();
++        String token = TestAuth.login(client, user.username(), PASSWORD);
++
++        // Sanity check: the token really does claim admin.
++        assertThat(TestAuth.currentUserId(client, token)).isEqualTo(user.id());
++
++        client.get()
++                .uri("/api/admin/datasource-access")
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    @Test
++    void customRoleWithDatasourceWriteMayMutateDatasourcesWhileChatOnlyIsRejected() {
++        String writerRole = createRole(Permissions.DATASOURCE_WRITE);
++        AppUser writer = createUser(Roles.STUDENT);
++        assign(writer.id(), writerRole);
++        String writerToken = TestAuth.login(client, writer.username(), PASSWORD);
++
++        String id = "ds" + UUID.randomUUID().toString().replace("-", "").substring(0, 10);
++        client.put()
++                .uri("/api/text2sql/datasources/" + id)
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + writerToken)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(definition(id, "chat-only-writer"))
++                .exchange()
++                // Reaches the controller: unknown id is the controller's 404, not a 403.
++                .expectStatus()
++                .isNotFound();
++
++        client.delete()
++                .uri("/api/text2sql/datasources/" + id)
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + writerToken)
++                .exchange()
++                .expectStatus()
++                .isNotFound();
++
++        String chatOnlyRole = createRole(Permissions.CHAT_USE);
++        AppUser chatOnly = createUser(Roles.STUDENT);
++        assign(chatOnly.id(), chatOnlyRole);
++        String chatOnlyToken = TestAuth.login(client, chatOnly.username(), PASSWORD);
++
++        client.put()
++                .uri("/api/text2sql/datasources/" + id)
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + chatOnlyToken)
++                .contentType(MediaType.APPLICATION_JSON)
++                .bodyValue(definition(id, "chat-only-writer"))
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++
++        client.delete()
++                .uri("/api/text2sql/datasources/" + id)
++                .header(HttpHeaders.AUTHORIZATION, "Bearer " + chatOnlyToken)
++                .exchange()
++                .expectStatus()
++                .isForbidden();
++    }
++
++    private static String definition(String id, String name) {
++        return "{\"id\":\"" + id + "\",\"name\":\"" + name + "\",\"driver\":\"org.h2.Driver\","
++                + "\"url\":\"jdbc:h2:mem:" + id + "\",\"username\":\"sa\",\"password\":\"\","
++                + "\"dialect\":\"H2\"}";
++    }
++
++    /** Creates a custom (non built-in) role holding exactly the given permission keys. */
++    private String createRole(String... permissionKeys) {
++        String suffix = UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        String roleId = "test-role-custom-" + suffix;
++        long now = System.currentTimeMillis();
++        db.sql(
++                        "INSERT INTO access_role (id, code, name, description, parent_id, built_in,"
++                                + " enabled, created_at, updated_at)"
++                                + " VALUES (:id, :code, :name, NULL, NULL, FALSE, TRUE, :now, :now)")
++                .bind("id", roleId)
++                .bind("code", "custom-" + suffix)
++                .bind("name", "Custom " + suffix)
++                .bind("now", now)
++                .fetch()
++                .rowsUpdated()
++                .block();
++
++        for (String key : permissionKeys) {
++            String permissionId = db.sql(
++                            "SELECT id FROM access_permission WHERE permission_key = :key")
++                    .bind("key", key)
++                    .map((row, meta) -> row.get("id", String.class))
++                    .one()
++                    .block();
++            assertThat(permissionId).as("seeded permission " + key).isNotNull();
++            db.sql("INSERT INTO access_role_permission (role_id, permission_id) VALUES (:role, :perm)")
++                    .bind("role", roleId)
++                    .bind("perm", permissionId)
++                    .fetch()
++                    .rowsUpdated()
++                    .block();
++        }
++        return roleId;
++    }
++
++    /** Creates a user with a unique username and the given legacy {@code app_user.role}. */
++    private AppUser createUser(String legacyRole) {
++        String username = "u" + UUID.randomUUID().toString().replace("-", "").substring(0, 12);
++        return users.insert(username, passwordEncoder.encode(PASSWORD), "Tester", legacyRole).block();
++    }
++
++    private void assign(String userId, String roleId) {
++        db.sql("INSERT INTO access_user_role (user_id, role_id, created_at) VALUES (:user, :role, :now)")
++                .bind("user", userId)
++                .bind("role", roleId)
++                .bind("now", System.currentTimeMillis())
++                .fetch()
++                .rowsUpdated()
++                .block();
++    }
++}

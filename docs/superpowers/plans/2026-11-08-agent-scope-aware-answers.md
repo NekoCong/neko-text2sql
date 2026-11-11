@@ -34,10 +34,10 @@
 
 **Create**
 
-- `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeDescriber.java` — canonical scope text (`summary`, `promptBlock`, `restricted`).
-- `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeView.java` — serializable scope metadata for tool results.
-- `text2sql-backend/src/main/java/com/nekocong/text2sql/security/ScopeAnswerGuard.java` — deterministic absence-claim clarification.
-- `text2sql-backend/src/main/java/com/nekocong/text2sql/tool/ScopedQueryResult.java` — `{ result, dataScope }` tool envelope.
+- `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeDescriber.java` — canonical scope text (`summary`, `promptBlock`, `restricted`).
+- `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeView.java` — serializable scope metadata for tool results.
+- `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/ScopeAnswerGuard.java` — deterministic absence-claim clarification.
+- `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool/ScopedQueryResult.java` — `{ result, dataScope }` tool envelope.
 - Tests: `security/DataScopeDescriberTest.java`, `security/ScopeAnswerGuardTest.java`, `config/HarnessAgentFactoryPromptTest.java`, `web/AgentScopeAnswerStreamTest.java`.
 
 **Modify**
@@ -56,8 +56,8 @@
 ### Task 1: Canonical scope describer
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeDescriber.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeDescriberTest.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeDescriber.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeDescriberTest.java`
 
 **Interfaces:**
 - Produces: `public static boolean restricted(DataScope)`, `public static String summary(DataScope)`, `public static String promptBlock(DataScope)`.
@@ -188,7 +188,7 @@ Expected: BUILD SUCCESS, 3 tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeDescriber.java text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeDescriberTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeDescriber.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/DataScopeDescriberTest.java
 git commit -m "feat(security): add a canonical data-scope describer"
 ```
 
@@ -197,8 +197,8 @@ git commit -m "feat(security): add a canonical data-scope describer"
 ### Task 2: Pipeline reuses the canonical wording
 
 **Files:**
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java`
 
 **Interfaces:**
 - Consumes: `DataScopeDescriber.promptBlock(DataScope)` from Task 1.
@@ -236,7 +236,7 @@ Expected: BUILD SUCCESS, all pipeline tests pass (the wording is unchanged).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlPipelineService.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/service/Text2SqlPipelineServiceTest.java
 git commit -m "refactor(security): share the scope wording with the pipeline"
 ```
 
@@ -245,8 +245,8 @@ git commit -m "refactor(security): share the scope wording with the pipeline"
 ### Task 3: Agent prompt carries the scope and answer rules
 
 **Files:**
-- Modify: `text2sql-backend/src/main/resources/prompts/agent-system.md`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/prompt/PromptCatalogTest.java`
+- Modify: `neko-text2sql-backend/src/main/resources/prompts/agent-system.md`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/prompt/PromptCatalogTest.java`
 
 **Interfaces:**
 - Produces: template placeholder `{{data_scope}}`; the factory in Task 4 fills it.
@@ -300,7 +300,7 @@ Expected: BUILD SUCCESS, including the existing agent-prompt test.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/resources/prompts/agent-system.md text2sql-backend/src/test/java/com/nekocong/text2sql/prompt/PromptCatalogTest.java
+git add neko-text2sql-backend/src/main/resources/prompts/agent-system.md neko-text2sql-backend/src/test/java/com/nekocong/text2sql/prompt/PromptCatalogTest.java
 git commit -m "feat(prompt): teach the agent its data scope and answer rules"
 ```
 
@@ -309,9 +309,9 @@ git commit -m "feat(prompt): teach the agent its data scope and answer rules"
 ### Task 4: Build the agent with the caller's scope
 
 **Files:**
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlAgentService.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactoryPromptTest.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlAgentService.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactoryPromptTest.java`
 
 **Interfaces:**
 - Consumes: `DataScopeDescriber.promptBlock`.
@@ -387,7 +387,7 @@ Expected: BUILD SUCCESS, 3 tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlAgentService.java text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactoryPromptTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/service/Text2SqlAgentService.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactoryPromptTest.java
 git commit -m "feat(agent): build the agent with the caller's data scope"
 ```
 
@@ -396,10 +396,10 @@ git commit -m "feat(agent): build the agent with the caller's data scope"
 ### Task 5: `query_database` returns the scope envelope
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeView.java`
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/tool/ScopedQueryResult.java`
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeView.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool/ScopedQueryResult.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java`
 
 **Interfaces:**
 - Produces: `DataScopeView.of(DataScope)` → `{ boolean restricted, String role, String summary }`; `ScopedQueryResult(Text2SqlResult result, DataScopeView dataScope)`.
@@ -457,7 +457,7 @@ Expected: BUILD SUCCESS, including the existing scope-passthrough and metadata t
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeView.java text2sql-backend/src/main/java/com/nekocong/text2sql/tool/ScopedQueryResult.java text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/DataScopeView.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool/ScopedQueryResult.java neko-text2sql-backend/src/main/java/com/nekocong/text2sql/tool/SqlTools.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/tool/SqlToolsTest.java
 git commit -m "feat(agent): include dataScope in query tool results"
 ```
 
@@ -466,8 +466,8 @@ git commit -m "feat(agent): include dataScope in query tool results"
 ### Task 6: Tell the `sql_runner` subagent about the envelope
 
 **Files:**
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactorySubagentsTest.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactorySubagentsTest.java`
 
 **Interfaces:**
 - Consumes: `ScopedQueryResult` shape from Task 5.
@@ -498,7 +498,7 @@ Expected: BUILD SUCCESS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactorySubagentsTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/config/HarnessAgentFactory.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/config/HarnessAgentFactorySubagentsTest.java
 git commit -m "docs(agent): describe the scoped tool envelope to sql_runner"
 ```
 
@@ -507,8 +507,8 @@ git commit -m "docs(agent): describe the scoped tool envelope to sql_runner"
 ### Task 7: Deterministic scope clarification
 
 **Files:**
-- Create: `text2sql-backend/src/main/java/com/nekocong/text2sql/security/ScopeAnswerGuard.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/security/ScopeAnswerGuardTest.java`
+- Create: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/ScopeAnswerGuard.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/ScopeAnswerGuardTest.java`
 
 **Interfaces:**
 - Produces: `public static Optional<String> clarification(DataScope scope, String answer)`.
@@ -575,7 +575,7 @@ Expected: BUILD SUCCESS, 3 tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/security/ScopeAnswerGuard.java text2sql-backend/src/test/java/com/nekocong/text2sql/security/ScopeAnswerGuardTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/security/ScopeAnswerGuard.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/security/ScopeAnswerGuardTest.java
 git commit -m "feat(security): add a deterministic data-scope clarification"
 ```
 
@@ -584,8 +584,8 @@ git commit -m "feat(security): add a deterministic data-scope clarification"
 ### Task 8: Append the clarification to the agent stream
 
 **Files:**
-- Modify: `text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java`
-- Test: `text2sql-backend/src/test/java/com/nekocong/text2sql/web/AgentScopeAnswerStreamTest.java`
+- Modify: `neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java`
+- Test: `neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AgentScopeAnswerStreamTest.java`
 
 **Interfaces:**
 - Consumes: `ScopeAnswerGuard.clarification` and `TextBlockDeltaEvent.getDelta()`.
@@ -698,7 +698,7 @@ Expected: BUILD SUCCESS, 2 tests pass; `done` is last.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java text2sql-backend/src/test/java/com/nekocong/text2sql/web/AgentScopeAnswerStreamTest.java
+git add neko-text2sql-backend/src/main/java/com/nekocong/text2sql/controller/Text2SqlController.java neko-text2sql-backend/src/test/java/com/nekocong/text2sql/web/AgentScopeAnswerStreamTest.java
 git commit -m "feat(agent): clarify scope-limited answers in the stream"
 ```
 

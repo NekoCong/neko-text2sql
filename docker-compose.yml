@@ -1,4 +1,4 @@
-# Local all-in-one stack for the Text2SQL demo.
+# Local all-in-one stack for the neko-text2sql.
 #
 #   Grafana UI : http://localhost:3000   (anonymous admin access, no login)
 #   OTLP HTTP  : http://localhost:4318   (v1/traces, v1/metrics -> matches application.yaml)
@@ -43,8 +43,8 @@ services:
       # (admin + student01/02/03 + counselor01 with their scopes and conversations) are provisioned
       # here, so the MySQL database is fully defined by docker-compose. Init scripts only run on an
       # empty data directory; to re-seed, `docker compose down -v` first.
-      - ./text2sql-backend/src/main/resources/db/app-schema.sql:/docker-entrypoint-initdb.d/01-app-schema.sql:ro
-      - ./text2sql-backend/src/main/resources/db/app-data.sql:/docker-entrypoint-initdb.d/02-app-data.sql:ro
+      - ./neko-text2sql-backend/src/main/resources/db/app-schema.sql:/docker-entrypoint-initdb.d/01-app-schema.sql:ro
+      - ./neko-text2sql-backend/src/main/resources/db/app-data.sql:/docker-entrypoint-initdb.d/02-app-data.sql:ro
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
       interval: 10s
@@ -65,7 +65,7 @@ services:
       - "5433:5432"
     volumes:
       - text2sql-pgvector-data:/var/lib/postgresql/data
-      - ./text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
+      - ./neko-text2sql-backend/src/main/resources/db/knowledge-schema.sql:/docker-entrypoint-initdb.d/01-knowledge.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d text2sql"]
       interval: 10s

@@ -12,7 +12,7 @@ public class SecurityProperties {
      * HMAC secret used to sign/verify JWTs. MUST be at least 32 bytes for HS256. Override in
      * production via the {@code TEXT2SQL_JWT_SECRET} environment variable.
      */
-    private String jwtSecret = "text2sql-demo-jwt-secret-change-me-please-32bytes+";
+    private String jwtSecret = "neko-text2sql-dev-jwt-secret-change-me-please-32b+";
 
     /** Access-token lifetime, in minutes. */
     private long tokenTtlMinutes = 720;
