@@ -7,7 +7,7 @@ Thumbs.db
 *.iws
 .vscode/
 
-# ── Java / Maven (text2sql-backend) ─────────────────────────
+# ── Java / Maven (neko-text2sql-backend) ─────────────────────────
 target/
 **/target/
 *.class

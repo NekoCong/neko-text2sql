@@ -1,4 +1,4 @@
-﻿# Tasks
+# Tasks
 
 ## 1. Access-control schema and seed
 
