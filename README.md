@@ -18,12 +18,12 @@
 
 ```
 neko-text2sql/                  # 仓库根
-├── neko-neko-text2sql-frontend/     # 前端：Vue 3 + Vite + TypeScript + Element Plus
+├── neko-text2sql-frontend/     # 前端：Vue 3 + Vite + TypeScript + Element Plus
 │   ├── src/api/                #   axios 封装 + SSE 流式客户端（step/sql/rows）
 │   ├── src/stores/             #   Pinia 会话状态 + 数据源
 │   ├── src/views/              #   ChatView / AboutView
 │   └── vite.config.ts          #   /api 代理到后端 :8080
-└── neko-neko-text2sql-backend/      # 后端：Java 25 + Spring Boot 4 (WebFlux) + AgentScope 2.0
+└── neko-text2sql-backend/      # 后端：Java 25 + Spring Boot 4 (WebFlux) + AgentScope 2.0
     ├── pom.xml
     ├── agentscope/workspace/   #   AgentScope 工作区：AGENTS.md
     └── src/main/
@@ -47,8 +47,8 @@ neko-text2sql/                  # 仓库根
 
 | 子工程 | 技术 |
 |--------|------|
-| neko-neko-text2sql-frontend | Vue 3、Vite、TypeScript、Pinia、Vue Router、Element Plus、Axios |
-| neko-neko-text2sql-backend  | Java 25、Spring Boot 4.1、Spring WebFlux、**Spring Data R2DBC（应用库，非阻塞）**、Spring JDBC（目标数据源，只读执行）、AgentScope 2.0（HarnessAgent）、DashScope 模型 |
+| neko-text2sql-frontend | Vue 3、Vite、TypeScript、Pinia、Vue Router、Element Plus、Axios |
+| neko-text2sql-backend  | Java 25、Spring Boot 4.1、Spring WebFlux、**Spring Data R2DBC（应用库，非阻塞）**、Spring JDBC（目标数据源，只读执行）、AgentScope 2.0（HarnessAgent）、DashScope 模型 |
 
 ## 前置条件
 
